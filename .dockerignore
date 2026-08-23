@@ -1,0 +1,48 @@
+# 与构建无关的元数据
+.git/
+.gitignore
+.cursor/
+.learnings/
+.claude/settings.local.json
+TODO.md
+README.md
+
+# 构建/测试缓存（绝不会进入镜像，但排除能减小构建上下文）
+build/
+dist/
+.eggs/
+*.egg-info/
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+
+# 非运行所需文档/研究资料（Dockerfile 只 COPY 源码与 pyproject）
+docs/
+study/
+experience/
+
+# 运行时产物
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.log
+logs/
+
+# 编辑器/系统垃圾
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# 本地部署覆盖
+deploy/config.local.toml
+.env
+.env.*

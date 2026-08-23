@@ -1,0 +1,34 @@
+services:
+  r-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: r-proxy:0.1.0
+    container_name: r-proxy
+    restart: unless-stopped
+    # host 网络而非端口发布：6060 的访问控制靠 firewalld 的源网段 rich rule，
+    # 而发布端口走 DNAT，不经过 INPUT 链，会把代理暴露给全网。host 模式还顺带
+    # 保住了请求日志里的客户端真实 IP，Web 界面也能继续只绑回环。
+    # 副作用：`docker ps`/`docker compose ps` 的 PORTS 列永远是空的——host 模式
+    # 不经 Docker 的端口发布机制，这不代表端口没开，用 `ss -ltnp` 看宿主监听。
+    network_mode: host
+    environment:
+      R_PROXY_CONFIG: /config/config.toml
+    volumes:
+      - /var/lib/r-proxy-docker/config:/config
+      - /var/lib/r-proxy-docker/data:/data
+      # slim 镜像默认 UTC，不挂时区的话日志时间和宿主差 8 小时。
+      - /etc/localtime:/etc/localtime:ro
+    # 容器默认 nofile 软限 1024，低于 max_client_connections 所需的余量，
+    # 启动时会报 W_NOFILE_LOW，高并发下表现为 accept 失败。
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    # 留足时间让写者线程把队列刷盘，默认 10s 在写队列积压时可能被强杀。
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

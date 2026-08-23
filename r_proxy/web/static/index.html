@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>r-proxy 管理界面</title>
+    <link rel="stylesheet" href="/static/css/app.css" />
+  </head>
+  <body>
+    <div class="layout">
+      <nav class="sidebar" aria-label="主导航">
+        <div class="brand">r-proxy</div>
+        <a class="nav-link" href="/" data-page="dashboard">监控看板</a>
+        <a class="nav-link" href="/upstreams" data-page="upstreams">上级代理</a>
+        <a class="nav-link" href="/sticky" data-page="sticky">粘性映射</a>
+        <a class="nav-link" href="/rules" data-page="rules">规则编辑</a>
+        <a class="nav-link" href="/settings" data-page="settings">全局设置</a>
+        <div class="sidebar-foot">
+          <label class="poll-toggle">
+            <input type="checkbox" id="poll-enabled" checked />
+            自动刷新（3 秒）
+          </label>
+          <button type="button" id="refresh-now" class="ghost">立即刷新</button>
+          <button type="button" id="forget-token" class="ghost">清除 token</button>
+          <span id="version" class="muted"></span>
+        </div>
+      </nav>
+      <main class="content">
+        <header class="topbar">
+          <h1 id="page-title">监控看板</h1>
+          <span id="poll-state" class="muted" role="status" aria-live="polite"></span>
+        </header>
+        <div id="banner" class="banner" hidden role="alert"></div>
+        <div id="page-root"></div>
+      </main>
+    </div>
+
+    <div id="token-dialog" class="modal" hidden>
+      <form class="modal-box" id="token-form">
+        <h2>需要访问令牌</h2>
+        <p class="muted">
+          该界面已启用认证。令牌保存在 sessionStorage 中，关闭标签页即失效。
+        </p>
+        <label for="token-input">访问令牌</label>
+        <input type="password" id="token-input" autocomplete="off" required />
+        <div class="modal-actions">
+          <button type="submit" class="primary">保存并重试</button>
+        </div>
+      </form>
+    </div>
+
+    <script type="module" src="/static/js/app.js"></script>
+  </body>
+</html>

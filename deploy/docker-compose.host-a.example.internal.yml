@@ -1,0 +1,41 @@
+services:
+  r-proxy:
+    build:
+      context: ./src
+      dockerfile: Dockerfile
+    image: r-proxy:0.1.0
+    container_name: r-proxy
+    restart: unless-stopped
+    # 这台机器没装 firewalld，§2/§5 选 host 网络是为了让 firewalld 源网段
+    # rich rule 生效，这个前提在这里不存在，因此改用 bridge + 显式端口发布。
+    # 代价：request_log 记的客户端地址会变成 Docker 网桥地址（如
+    # 172.16.0.1），不再是真实来源 IP；这台机器本就没有客户端 ACL，
+    # 不影响访问控制，只影响审计时定位来源。
+    # OpenStack 安全组只放行 10000-12000 段，6060/6061 从公网访问被拦截
+    # （见 DD_DEPLOY.md §10.2c），改用该段内端口，与原端口后两位对应方便记忆。
+    ports:
+      - "10060:10060"
+      - "10061:10061"
+    environment:
+      R_PROXY_CONFIG: /config/config.toml
+      # HEALTHCHECK 默认探 6060（见 Dockerfile），换端口后必须显式覆盖，
+      # 否则容器会一直卡在 unhealthy——健康检查连的是旧端口，永远连不上。
+      R_PROXY_HEALTH_PORT: "10060"
+    volumes:
+      - /var/lib/r-proxy/config:/config
+      - /var/lib/r-proxy/data:/data
+      # slim 镜像默认 UTC，不挂时区的话日志时间与宿主差 8 小时。
+      - /etc/localtime:/etc/localtime:ro
+    # 容器默认 nofile 软限 1024，低于 max_client_connections 所需余量，
+    # 启动时报 W_NOFILE_LOW，高并发下表现为 accept 失败。
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    # 留足时间让写者线程把队列刷盘，默认 10s 在写队列积压时可能被强杀。
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

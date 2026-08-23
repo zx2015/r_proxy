@@ -1,0 +1,91 @@
+# ===== Python 字节码与编译缓存 =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ===== 打包与构建产物 =====
+# 由 setuptools / pip install -e . 生成
+build/
+dist/
+.eggs/
+*.egg-info/
+*.egg
+
+# ===== 工具与检查器缓存 =====
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.pytest_tmp/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.nyc_output/
+
+# ===== 测试与本地制品 =====
+.tox/
+.cache/
+.cache_*/
+.mypy_hub/
+
+# ===== 虚拟环境 =====
+# 项目使用 /media/data/venv（仓库外），但若在仓库内临时创建也应忽略
+venv/
+.venv/
+env/
+ENV/
+.python-version
+
+# ===== 本地知识库与待办（项目规范强制不入库） =====
+# 见 CLAUDE.md §4.2：TODO.md 不入 Git；§1.1：.learnings/ 本地知识库不入库
+.learnings/
+TODO.md
+
+# ===== Claude / Cursor 个人配置 =====
+# settings.local.json 包含本机权限与本地路径，不应跨机器共享
+.claude/settings.local.json
+.cursor/
+
+# ===== 运行时数据：数据库、日志、PID、Socket =====
+# 状态库 state.db 不可丢失，但属于运行时产物；同样忽略 logs.db、规则副本
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+logs/
+*.log
+*.pid
+*.sock
+
+# ===== 编辑器与系统垃圾 =====
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ===== 部署/运行配置：本地化变体 =====
+# 部署模板 deploy/config.*.example.toml 入库
+# 含真实 token / 内网地址 / 凭据的本地副本不入库
+deploy/config.local.toml
+deploy/config.*.local.toml
+.env
+.env.*
+!.env.example
+secrets.toml
+*.secret
+credentials.json
+
+# ===== 杂项 =====
+*.bak
+*.tmp
+*.orig
+*.rej
+.pip-tools.txt

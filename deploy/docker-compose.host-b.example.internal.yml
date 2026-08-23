@@ -1,0 +1,36 @@
+services:
+  r-proxy:
+    build:
+      context: ./src
+      dockerfile: Dockerfile
+    image: r-proxy:0.1.0
+    container_name: r-proxy
+    restart: unless-stopped
+    # 这台机器也没有 firewalld/ufw（ufw inactive），用 bridge + 显式端口发布，
+    # 与本机其他业务容器（mcp-atlassian、collab-roster 等）风格一致。
+    # 8080/8081 是 OpenStack 安全组已放行、且外部实测可达的端口——原
+    # host-a.example.internal 上 6060/6061、10060/10061 均被安全组拦截（见 DD_DEPLOY.md
+    # §11.1/§11.2），故迁移到本机复用已放行端口。8081 原被 cp_checklist_frontend
+    # 占用，已按用户指示停用该服务腾出端口（cp_checklist compose 文件仍在
+    # /var/lib/cp_checklist，未删除，可按需恢复）。
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+    environment:
+      R_PROXY_CONFIG: /config/config.toml
+      # HEALTHCHECK 默认探 6060（见 Dockerfile），换端口后必须显式覆盖。
+      R_PROXY_HEALTH_PORT: "8080"
+    volumes:
+      - /var/lib/r-proxy/config:/config
+      - /var/lib/r-proxy/data:/data
+      - /etc/localtime:/etc/localtime:ro
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

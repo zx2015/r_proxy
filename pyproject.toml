@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "r-proxy"
+version = "0.1.0"
+description = "A lightweight HTTP/HTTPS forward proxy written in Python"
+readme = "README.md"
+requires-python = ">=3.12"
+# 代理核心零第三方运行时依赖：配置读取用标准库 tomllib。
+# 写回配置需要 tomlkit，属于 Web 界面能力，见 [web] extra。
+dependencies = []
+
+[project.optional-dependencies]
+web = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "tomlkit>=0.12",
+]
+dev = [
+    # Web 层测试用 httpx 的 ASGITransport 直接打应用，不必起真实端口。
+    "httpx>=0.27",
+    "mypy>=1.8",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    # 协议测试大量使用真实套接字，挂死时需要有界失败而不是卡住整个套件。
+    "pytest-timeout>=2.3",
+    "ruff>=0.3",
+]
+
+[project.scripts]
+r-proxy = "r_proxy.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["r_proxy*"]
+
+# 单页应用不是 Python 包，默认不会被打进 wheel。漏了它的表现是安装版界面
+# 全白而源码运行正常——最难联想到打包配置的一种故障。
+[tool.setuptools.package-data]
+"r_proxy.web" = ["static/*.html", "static/css/*.css", "static/js/*.js", "static/js/pages/*.js"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# ruff 0.16 起会格式化 Markdown 中的 Python 代码块。设计文档里的代码是
+# 带对齐注释的说明性片段，重排会破坏可读性。
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+timeout = 60

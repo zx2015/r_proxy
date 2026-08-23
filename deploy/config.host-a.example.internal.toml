@@ -1,0 +1,48 @@
+# r-proxy 部署配置 — r-proxy-host (192.0.2.10)
+#
+# 由 deploy/docker-compose.host-a.example.internal.yml 以 bind mount 挂到容器内
+# /config/config.toml。宿主上编辑此文件后热重载：
+#   kill -HUP "$(docker inspect r-proxy --format '{{.State.Pid}}')"
+# 不要用 `docker kill -s HUP r-proxy`——那会让 dockerd 放弃该容器的
+# restart-manager，之后真实崩溃也不会自动重启（见 DD_DEPLOY.md §10.5）。
+
+[listen]
+# 服务 192.0.2.0/24 与 VPN 的 198.51.100.0/24 两个网段，故绑 0.0.0.0。
+# 注意：本机 firewalld 未启用，r-proxy 自身也没有客户端 ACL，
+# 这个端口对上述两网段是完全开放的。
+# 端口选 10060 而非 6060：OpenStack 安全组只放行 10000-12000 段，
+# 6060/6061 从公网（浮动 IP）访问会被拦截，见 DD_DEPLOY.md §10.2c。
+host = "0.0.0.0"
+port = 10060
+
+[webui]
+enabled = true
+host = "0.0.0.0"
+port = 10061
+workers = 1
+# 非回环绑定时必填，缺失即拒绝启动。此文件权限 600，token 不写进单元文件。
+auth_token = "PUT-A-REAL-TOKEN-HERE"
+
+[database]
+# 容器内路径：/data 是宿主 /var/lib/r-proxy/data 的挂载点。
+state_path = "/data/state.db"
+logs_path = "/data/logs.db"
+rules_path = "/data/rules.db"
+retention_days = 30
+max_log_rows = 100000
+backup_keep = 10
+
+[rules]
+enabled = true
+
+[routing]
+connect_timeout = 10
+read_timeout = 30
+
+# 先只配 direct，上级代理经 Web 界面添加（POST /api/upstreams，带连通性测试）。
+# 本机可选的上级为 haproxy 127.0.0.1:3128（轮询 ssh 隧道）与 xray 127.0.0.1:8081。
+[[upstreams]]
+name = "direct"
+type = "direct"
+priority = 100
+enabled = true
