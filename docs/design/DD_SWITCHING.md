@@ -6,6 +6,7 @@
 | v1.1.0 | 2026-08-14 | M2 实现回填：明确限流配额与候选链剩余长度无关 | Agent |
 | v1.2.0 | 2026-08-15 | 修正缺陷：CONNECT 握手超时原记 `upstream_error`，导致被墙目标熔断健康出口；§3.2 补齐握手阶段的分界（有无可解析字节）与四条具体归类 | Agent |
 | v1.3.0 | 2026-08-16 | 依生产日志修正隧道早夭判定：新增「上游先关闭」条件，消除浏览器预连接造成的假标记（实测占负面记忆 45%）；§8.1 记录 `bytes_up` 方案为何不成立；§8.2 明确早夭走 stderr 而非 `request_log` 及其理由；§9 补失败尝试与候选链耗尽的日志 | Agent |
+| v1.4.0 | 2026-09-05 | 修正缺陷：判据一（`outcome.status is None`）此前无条件切换，未检查 `ctx.request_sent`/方法幂等性/`response_started`——请求（含非幂等 POST 的请求体）已完整发出后再遇到等响应超时、连接被对端悄悄断开等传输层失败，会被当作「字节没发出去」一样无条件重投到下一个出口，等价于让一次下单/扣款类调用被悄悄执行两次，与 AGENTS.md/CLAUDE.md 的红线「非幂等方法已发出后不得重试」矛盾。§3 判定链与伪代码补齐这一分支，检查顺序与判据三保持一致（`response_started` 优先于幂等门控）；`replayable` 不参与该分支（沿用既有测试 `test_transport_failure_ignores_replayability` 的既定语义：传输层失败时是否切换只看字节发没发出去、方法幂不幂等，不看能不能重放——重放缓冲只影响「切换后往新连接发什么」，不影响「该不该切换」这个决定） | Agent |
 
 **对应需求**：[PRD §4.3.1](../requirements/PRD_OVERVIEW.md)–[§4.3.5](../requirements/PRD_OVERVIEW.md)、[§4.3.11](../requirements/PRD_OVERVIEW.md)、[§4.3.13](../requirements/PRD_OVERVIEW.md)
 
@@ -91,7 +92,11 @@ class SwitchVerdict:
 ```mermaid
 flowchart TD
     A[AttemptOutcome] --> B{有 HTTP 状态码?}
-    B -->|否：超时/RST/DNS| SW1[切换<br/>TRANSPORT_FAILURE]
+    B -->|否：超时/RST/DNS| T1{已向客户端<br/>写出响应体?}
+    T1 -->|是| K0[不切换<br/>RESPONSE_STARTED]
+    T1 -->|否| T2{请求已发出<br/>且方法非幂等?}
+    T2 -->|是| K9[不切换<br/>NON_IDEMPOTENT]
+    T2 -->|否| SW1[切换<br/>TRANSPORT_FAILURE]
 
     B -->|是| C{408 且请求未发出?}
     C -->|是| R[重试同一出口<br/>IDLE_CONNECTION_RECYCLED<br/>不计失败]
@@ -121,8 +126,27 @@ flowchart TD
 
 ```python
 def should_switch(self, outcome, ctx, cfg, *, now) -> SwitchVerdict:
-    # 判据一：失败层次
+    # 判据一：失败层次。
+    #
+    # 「没有状态码」只说明分类与来源判定不适用，不代表可以无条件切换：
+    # 请求（含非幂等 POST 的请求体）一旦已经完整写到这个出口的 socket 上，
+    # 后续无论是等响应超时还是连接被悄悄断开，都不再是「字节没发出去」——
+    # 出口很可能已经收到并处理了这次调用，此时仍然切换等价于让一次
+    # 下单/扣款类调用被重复执行。检查顺序与判据三保持一致：
+    # response_started 是更强的约束，排在幂等门控之前。
     if outcome.status is None:
+        if ctx.response_started:
+            return SwitchVerdict(
+                switch=False,
+                keep_reason=KeepReason.RESPONSE_STARTED,
+                failure_kind=outcome.kind,
+            )
+        if ctx.request_sent and not ctx.method.idempotent:
+            return SwitchVerdict(
+                switch=False,
+                keep_reason=KeepReason.NON_IDEMPOTENT,
+                failure_kind=outcome.kind,
+            )
         return SwitchVerdict(
             switch=True,
             switch_reason=SwitchReason.TRANSPORT_FAILURE,
@@ -206,6 +230,8 @@ def should_switch(self, outcome, ctx, cfg, *, now) -> SwitchVerdict:
 | 上级代理返回 `503` | 是 | `ROUTE_ERROR`（代理活着） |
 | 上级代理返回 `407` | 是 | `UPSTREAM_ERROR`（凭据配错） |
 | 非幂等 POST 收到 `503` | **否** | `ROUTE_ERROR` |
+| 非幂等 POST 请求体已完整发出，等响应超时（无状态码） | **否**（`NON_IDEMPOTENT`） | 沿用 egress 层归类（通常 `ROUTE_ERROR`） |
+| 幂等 GET 请求已发出，等响应超时（无状态码） | 是 | 沿用 egress 层归类 |
 
 握手阶段的归类**不能一刀切**。分界是「有没有收到可解析的字节」：
 

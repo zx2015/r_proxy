@@ -16,6 +16,7 @@
 | v3.1.0 | 2026-08-16 | M5 实现完成：新增 `storage/rules_store.py` 作为 `rules.db` 的唯一写者门面（DD_STORAGE §2/§4.8/§7 回写，`rules.db` 不进只读连接池）；DD_RULES §6.1 的加载接口改为 `RulesSource` 协议 + 纯函数 `compile_rules`；DD_WEB §6.3/§10.7.1 回写；MIGRATION §7.2/§7.4 标注状态并新增 §7.5 偏差与 §7.6 测试 | Agent |
 | v3.6.0 | 2026-08-17 | DD_DEPLOY v1.6.0 新增 §11：实例 A（`host-a.example.internal`）因 OpenStack 安全组未放行入向端口（追加 10000–12000 段仍不可达，判定为源地址范围问题）而放弃，第三个实例迁移到已验证外网直通的实例 B（`host-b.example.internal`），端口复用其已放行的 8080/8081；记录数据库随配置一并迁移的必要性、属主权限踩坑、经公网真机验证的最终结果 | Agent |
 | v3.7.0 | 2026-08-18 | DD_DEPLOY v1.7.0 新增 §11.8：新增上级代理报 500 的根因是属主修复只 chown 文件未 chown 目录；诊断中修复代码级安全缺陷——`config_writer.py` 原子写会把含明文 `auth_token` 的 `config.toml` 权限从 600 重置为 644，配置备份同样受影响，已修复并补测试；记录 `DOCKER_BUILDKIT=0` 绕过 BuildKit DNS 解析失败的现象。DD_WEB v2.1.5 §6.1 同步补记原子写权限收紧的实现要点 | Agent |
+| v3.8.0 | 2026-09-05 | HTTP/HTTPS 协议处理专项代码评审，修复三处缺陷并回填文档：①DD_SWITCHING v1.4.0——传输层失败判据（`outcome.status is None`）此前无条件切换，未检查请求是否已发出与方法幂等性，非幂等 POST 请求体完整发出后遇超时/断连会被无脑重投到下一个出口，与「非幂等方法已发出后不得重试」的红线矛盾，现补齐 `response_started`/`request_sent`+幂等门控；②③DD_PROXY v1.5.0——`_attempt_http` 补齐 1xx（`100 Continue`/`103 Early Hints`）中间响应跳过逻辑（§5.2.1），此前会把 1xx 当最终响应转发、真正响应被当成其 body 混入客户端；`_send_body` 补齐读客户端请求体的超时兜底（§4.3），此前慢速/挂起客户端可让连接与出口 socket 一起永久挂起。DD_PROXY 新增 §11 记录两处评估后暂不修的已知限制（body 部分发出后失败重试的重放位置偏差、`OPTIONS *` asterisk-form 处理不完整）。三处修复均新增端到端/单元回归测试 | Agent |
 
 设计文档依据 [需求文档](../requirements/index.md) v1.5.0 编写。规则部分依据 [RULES_CONFIG.md](../requirements/RULES_CONFIG.md) v2.0.0 与 [WEBUI_SPEC.md](../requirements/WEBUI_SPEC.md) v2.0.0。
 

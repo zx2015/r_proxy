@@ -41,6 +41,10 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_HEAD_READ_TIMEOUT = 30.0
 
+# 1xx 中间响应的最大连续跳数。真实场景最多见到一次 100 Continue，
+# 上限只为防御性地拒绝行为异常（或恶意）的上游无限吐 1xx。
+MAX_INFORMATIONAL_HOPS = 8
+
 HTTP_REASON = {
     400: "Bad Request",
     408: "Request Timeout",
@@ -336,6 +340,30 @@ class ClientConnection:
 
             async with asyncio.timeout(read_timeout):
                 raw_head = await conn.reader.readuntil(b"\r\n\r\n")
+                status, headers = parse_response_head(raw_head)
+                # 1xx（100 Continue、103 Early Hints 等）是中间响应，不是这次
+                # 请求的最终结果。我们从不实现 Expect: 100-continue 握手优化
+                # ——请求体在 ``_send_body`` 里已经无条件全部发出——但上游仍可能
+                # 主动回一个 1xx。若把它当成最终响应转发，客户端会把紧随其后的
+                # 真正响应（状态行 + 头 + 体）整段误当成这次 1xx 响应的 body 收下：
+                # 表现为客户端看到的状态码是 100/103，body 里却混进一段 HTTP
+                # 头部文本——这是能被真实网站触发的协议正确性缺陷，而不是假设
+                # 场景。循环跳过所有 1xx 直到读到最终响应，全程仍受同一个
+                # ``read_timeout`` 约束，不会无界等待；异常多的 1xx 跳数本身
+                # 就说明上游不正常，超过上限直接判为失败而不是继续等。
+                hops = 0
+                while 100 <= status < 200:
+                    hops += 1
+                    if hops > MAX_INFORMATIONAL_HOPS:
+                        raise ValueError("上游连续返回过多 1xx 中间响应")
+                    logger.info(
+                        "请求 %s 收到出口 %s 的中间响应 %d，继续等待最终响应",
+                        self.request_id,
+                        upstream.name,
+                        status,
+                    )
+                    raw_head = await conn.reader.readuntil(b"\r\n\r\n")
+                    status, headers = parse_response_head(raw_head)
         except BadRequest:
             await conn.close()
             raise
@@ -351,7 +379,6 @@ class ClientConnection:
                 switch_context=self._switch_context(target, request_sent=self._request_sent),
             )
 
-        status, headers = parse_response_head(raw_head)
         return AttemptResult(
             # 2xx/3xx 无需判据介入；其余交给判据判断是否值得换个出口。
             outcome=AttemptOutcome(
@@ -365,7 +392,18 @@ class ClientConnection:
         )
 
     async def _send_body(self, conn: UpstreamConn, plan: BodyPlan) -> None:
-        """首次尝试边转发边缓存，重试时改从缓冲重放。"""
+        """首次尝试边转发边缓存，重试时改从缓冲重放。
+
+        读取客户端请求体的每一次阻塞读用 ``head_read_timeout`` 兜底：客户端
+        声明了 ``Content-Length``/chunked 之后却慢吞吞地发（或干脆不再发）
+        body，此前这里没有任何超时，会让本次连接与已经建立的出口 socket
+        一起挂到天荒地老——``max_client_connections`` 防的是连接数堆积，
+        防不了每个连接各自卡死在读 body 这一步，二者叠加就是一个慢速请求体
+        就能耗尽连接槽位的资源枯竭点（AGENTS §5.2「所有可增长资源都要有
+        上限」同样适用于「一个连接占用多久」）。超时按普通传输层失败处理：
+        请求还没读完自然也没能完整发往出口，``request_sent`` 保持 False，
+        候选链可以正常切到下一个出口重试。
+        """
         if self._body_consumed:
             self._replay.replay_into(conn.writer.write)
             await conn.writer.drain()
@@ -375,7 +413,16 @@ class ClientConnection:
             self._replay.append(chunk)
             conn.writer.write(chunk)
 
-        await stream_body(self._reader, sink, plan)
+        try:
+            async with asyncio.timeout(self._head_read_timeout):
+                await stream_body(self._reader, sink, plan)
+        except TimeoutError:
+            logger.warning(
+                "请求 %s 读取客户端请求体超时（>%.0fs），放弃该次尝试",
+                self.request_id,
+                self._head_read_timeout,
+            )
+            raise
         self._body_consumed = True
 
     def _switch_context(self, target: RequestTarget, *, request_sent: bool) -> SwitchContext:

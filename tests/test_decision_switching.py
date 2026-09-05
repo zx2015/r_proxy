@@ -126,6 +126,50 @@ class TestGateOneTransportFailure:
         verdict = decide(policy, limiter, outcome(error="TimeoutError"), context(replayable=False))
         assert verdict.switch is True
 
+    def test_non_idempotent_post_does_not_switch_after_bytes_are_sent(
+        self, policy: SwitchPolicy, limiter: SwitchRateLimiter
+    ) -> None:
+        """请求（含非幂等的 POST 请求体）已完整发出后再遇到传输层失败
+        （等响应超时、连接被对端悄悄断开等），不能再无条件切换——出口可能
+        已经收到并处理了这次调用，重投等价于让下单/扣款类调用被执行两次。
+
+        与 ``test_non_idempotent_post_still_switches_before_bytes_are_sent``
+        对照：区别只在 ``request_sent``，划清「安全重投」与「危险重投」的界线。
+        """
+        verdict = decide(
+            policy,
+            limiter,
+            outcome(error="TimeoutError"),
+            context(method=Method.POST, request_sent=True),
+        )
+        assert verdict.switch is False
+        assert verdict.keep_reason is KeepReason.NON_IDEMPOTENT
+
+    def test_transport_failure_after_response_started_never_switches(
+        self, policy: SwitchPolicy, limiter: SwitchRateLimiter
+    ) -> None:
+        """``response_started`` 比幂等门控更强：即便方法幂等也不能再切换。"""
+        verdict = decide(
+            policy,
+            limiter,
+            outcome(error="TimeoutError"),
+            context(method=Method.GET, request_sent=True, response_started=True),
+        )
+        assert verdict.switch is False
+        assert verdict.keep_reason is KeepReason.RESPONSE_STARTED
+
+    def test_transport_failure_before_send_still_switches_for_idempotent(
+        self, policy: SwitchPolicy, limiter: SwitchRateLimiter
+    ) -> None:
+        """请求已发出但方法幂等（如 GET）时，传输层失败仍可切换。"""
+        verdict = decide(
+            policy,
+            limiter,
+            outcome(error="TimeoutError"),
+            context(method=Method.GET, request_sent=True),
+        )
+        assert verdict.switch is True
+
 
 class TestGateTwoStatusAndOrigin:
     @pytest.mark.parametrize("status", [404, 500, 400, 401, 405, 410, 422, 501])

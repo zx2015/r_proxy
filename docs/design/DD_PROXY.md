@@ -6,6 +6,8 @@
 | v1.1.0 | 2026-08-14 | M2 实现回填：`classify_transport` 改为按连接对象（`is_direct`）区分 `route_error` 与 `upstream_error`，补 §7.2 | Agent |
 | v1.2.0 | 2026-08-21 | 代码评审整改：新增 §7.3，`_parse_handshake_response` 解码改用 `latin-1`（与 `parse_response_head` 统一）、两处状态行解析改用无参 `split()` 容忍多余空格 | Agent |
 | v1.3.0 | 2026-08-21 | 安全修复：新增 §3.1.1，`parse_head` 拒绝裸露 CR/LF——此前请求行 target 中嵌入的裸 `\n` 能一路活到 `RequestTarget.host`，被 `connector.py`/`connection.py` 原样拼进发往出口的请求，构成 HTTP 请求走私/头部注入 | Agent |
+| v1.4.0 | 2026-08-31 | Bug 修复：§3.4 更正——`transfer-encoding` 从 `HOP_BY_HOP` 固定摘除集合中移除。请求体（`body.py`）与响应体（`pump`）都只原样转发 `chunked` 编码的分块字节、从不解码重编码，若摘掉该头部会让对端收到的头部与线上实际字节框架自相矛盾（对端把分块长度行当成消息体内容），表现为经代理访问带 `Transfer-Encoding: chunked` 响应的接口时客户端解析失败（真实案例：内网 Web 应用某个 JSON 接口经代理后前端报「Failed to load this section」）。新增 `tests/test_protocol_chunked_response.py` 端到端复现 | Agent |
+| v1.5.0 | 2026-09-05 | 代码评审整改两处：①§4.3 补「读取客户端请求体」超时行——`_send_body` 此前读客户端 body 完全没有超时，慢速/挂起的客户端会让连接与已建立的出口 socket 一起永久挂起，`max_client_connections` 防不了这种单连接卡死，现复用 `head_read_timeout` 兜底；②§5.2 新增 §5.2.1「1xx 中间响应必须跳过」——`_attempt_http` 此前把上游的 `100 Continue`/`103 Early Hints` 当成最终响应转发，真正的响应被当成它的 body 混入客户端，现循环跳过 1xx 直至读到最终响应。新增 §11「已知限制与后续工作」记录评审中发现但暂未修的两处待观察点。两处修复均新增端到端回归测试（`tests/test_protocol_server.py`） | Agent |
 
 **对应需求**：[PRD §4.1](../requirements/PRD_OVERVIEW.md)、[§4.3.11](../requirements/PRD_OVERVIEW.md)、[§4.3.13](../requirements/PRD_OVERVIEW.md)、[§7.2](../requirements/PRD_OVERVIEW.md)
 
@@ -201,7 +203,7 @@ def _split_authority(authority: str, *, default_port: int | None
 ```python
 _HOP_BY_HOP = frozenset({
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "te", "trailer", "transfer-encoding", "upgrade", "proxy-connection",
+    "te", "trailer", "upgrade", "proxy-connection",
 })
 
 def strip_hop_by_hop(headers: Headers) -> Headers:
@@ -216,6 +218,12 @@ def strip_hop_by_hop(headers: Headers) -> Headers:
 `Connection: X-Custom-Thing` 声明 `X-Custom-Thing` 也是逐跳头部，必须一并移除。漏掉这条会把本应终止于代理的头部转发出去。
 
 `proxy-authorization` 在移除列表中，这同时满足了「不记录敏感头」的安全要求——它在解析后立即被丢弃，不会进入 `RequestTarget` 或日志。
+
+**`transfer-encoding` 不在固定摘除集合中**（v1.4.0 修正，此前误列入，是一个已确认的线上 bug）。它不是纯粹的连接元数据，而是描述消息体实际字节框架的头部：§3.5 与 §5.2 的响应体转发都是把 `chunked` 编码的分块长度行、数据、结尾 `0\r\n\r\n` **原样转发**，从不解码再重新编码。若转发头部时把它摘掉，对端收到的头部会说「定长消息」或「以连接关闭为界」，但线上字节仍然带着分块长度行——对端的 HTTP 解析器会把十六进制长度行当成消息体内容，产生的消息在语义上已经损坏。
+
+只要转发逻辑不解码分块编码，`Transfer-Encoding` 就必须与它描述的字节框架一起传递到下一跳；`Connection` 头中显式列出 `Transfer-Encoding`（罕见但合法）时仍会按上面第二条规则被摘除，这是请求方/上游自己声明该字段仅对当前这一跳有效，语义上不冲突。
+
+**真实故障案例**：经 r-proxy 访问某内网 Web 应用（`http://` 而非 `https://`，因此走的是本节的 HTTP 转发路径而非 CONNECT 隧道）时，其某个 JSON 接口用 `Transfer-Encoding: chunked` 返回动态长度的响应体（未知长度时常见做法）。修复前，代理把响应头里的 `Transfer-Encoding` 摘除、再补一个 `Connection: close`，客户端只能靠连接关闭判断消息边界，于是把分块长度行当成了 JSON 的一部分，前端 `JSON.parse()` 失败，页面报「Failed to load this section. Please try again.」一类的通用错误。端到端复现见 `tests/test_protocol_chunked_response.py`。
 
 ### 3.5 请求体的读取方式
 
@@ -300,6 +308,7 @@ async def handle(self) -> None:
 | 阶段 | 超时 | 来源 |
 |------|------|------|
 | 读取客户端请求头 | 30s 固定 | 防止慢速攻击 |
+| 读取客户端请求体（v1.5.0 新增） | 复用 `head_read_timeout`（30s 固定） | 见下方说明 |
 | 连接上游 | `connect_timeout` | 可按出口覆盖 |
 | 读取上游响应头 | `read_timeout` | 可按出口覆盖 |
 | 转发响应体 | **无整体超时** | 大文件下载可能持续很久 |
@@ -308,6 +317,8 @@ async def handle(self) -> None:
 响应体转发与隧道不设整体超时，但设**空闲超时**：连续 300 秒无任何字节流动则关闭。整体超时会误杀大文件下载与长轮询，空闲超时只杀真正卡死的连接。
 
 per-upstream 超时覆盖对应 [PRD §4.3.12](../requirements/PRD_OVERVIEW.md)：`direct` 配 3 秒可以让被墙站点快速失败并切换，而不是卡满 10 秒。
+
+**读取客户端请求体为何此前没有超时、又为何补上（v1.5.0 修复）**：`stream_body()` 从客户端读 body 时，早期实现只有响应阶段（`pump`）与读响应头阶段设了超时，`_send_body` 里对客户端的读取是裸的 `reader.read(...)`——客户端声明 `Content-Length`/chunked 之后慢吞吞地发、或干脆不再发，这个读取会无限期挂起。`max_client_connections` 限的是**同时存在多少个连接**，挡不住「每个连接各自卡死在读 body 这一步」——少量慢体请求就能把连接槽位占满，是一个真实的资源枯竭点。现在用 `head_read_timeout` 包一层：超时按普通传输层失败处理（`request_sent` 仍是 `False`，候选链可以正常切到下一个出口），并记一条 `WARNING`。之所以复用 `head_read_timeout` 而不新增一个专门的配置项：两者本质都是「愿意等客户端把这次请求交代清楚多久」，没有必要为同一语义拆两个旋钮。
 
 ---
 
@@ -380,6 +391,18 @@ async def pump(src: StreamReader, dst: StreamWriter, *,
 `await dst.drain()` 是全部所需的背压机制。客户端读得慢时，`drain()` 挂起当前任务直到写缓冲降到低水位，上游的读取自然随之减速（TCP 窗口收缩）。不需要手工 `pause_reading`。
 
 漏掉 `drain()` 会导致写缓冲无限增长——慢客户端下载大文件时内存被吃光。这是代理实现中最常见的内存问题。
+
+### 5.2.1 1xx 中间响应必须跳过（v1.5.0 修复）
+
+读上游响应头此前只做一次 `readuntil(b"\r\n\r\n")`：读到第一个以空行结尾的头部就当成了这次请求的最终响应。这个假设对绝大多数响应成立，但 HTTP/1.1 允许服务器在最终响应之前先回一个或多个 **1xx 信息性响应**（最常见的是客户端带 `Expect: 100-continue` 时服务器回的 `100 Continue`，其次是 `103 Early Hints`）——`Expect` 头不在 `HOP_BY_HOP` 剥离列表里，会原样转发给上游，因此上游完全可能按这个头的存在决定回一个 1xx。
+
+r-proxy 从不实现 `Expect: 100-continue` 的握手优化（`_send_body` 无条件把请求体全部发出去，不等上游确认），但这不妨碍上游仍然按标准礼节先回一个 `100 Continue`。此前的实现会把这个 `100 Continue` 当成最终响应转发给客户端，而紧随其后的真正响应（状态行 + 头 + body）会被当作这次「响应」的 body 一并转发出去——客户端看到的状态码是 `100`，body 里却混进一段 HTTP 头部文本，是一个能被真实站点触发的协议正确性缺陷，不是假设场景。
+
+修复：读到响应头后先判断状态码，若落在 `[100, 200)` 区间就继续读下一段头部，循环直到拿到真正的最终响应，全程仍在同一个 `read_timeout` 窗口内（不会因为多跳 1xx 而无界等待）；连续跳过的 1xx 超过 8 次视为上游行为异常，判为失败。跳过 1xx 时记一条 `INFO` 日志，便于观察这条路径是否被频繁触发（正常情况下应当很少见到）。
+
+### 5.3 请求体已发出后失败：为何不能无脑重投（v1.5.0 相关，判据见 [DD_SWITCHING.md](./DD_SWITCHING.md)）
+
+`_attempt_http` 把「连接失败」与「请求已发出但等响应失败（超时/对端悄悄断开）」归并成同一种 `outcome.status is None` 的传输层失败上报给判据层。这两者风险完全不同：前者字节没发出去，换个出口重投绝对安全；后者（尤其是非幂等的 POST/PATCH）请求体可能已经被出口完整收到并处理，无脑重投等价于让一次下单/扣款类调用被执行两次。DD_SWITCHING.md v1.4.0 已经在判据层补上 `request_sent`/方法幂等性的门控，本节记录这一约束对协议层的要求：`ClientConnection._request_sent` 必须严格在「请求行、头部、请求体全部写入 socket 且 `drain()` 成功」之后才置位，提前置位会让判据层误以为字节没发出去而放行本不该发生的重投；置位太晚（例如漏掉 `drain()` 失败的分支）则会让本可以安全重投的请求被误判为「已发出」而放弃重试。
 
 ---
 
@@ -631,3 +654,23 @@ def _send_error(self, status: int, message: str, request_id: str) -> None:
 | 大文件下载 20 分钟 | **不**被超时中断 | — |
 | 候选链耗尽的响应体 | 不含出口名称、地址、失败原因、链长 | ST-03 |
 | 服务关闭时有活跃连接 | 等待至多 10 秒后强制关闭 | — |
+| 上游先回 `100 Continue` 再回最终响应 | 客户端只看到最终响应，收不到 `100 Continue` | 见 `tests/test_protocol_server.py::TestHttpForwarding::test_1xx_interim_response_is_skipped` |
+| 客户端声明 `Content-Length` 却只发一部分就不再发送 | 不会永久挂起，最终收到 `502` | 见 `tests/test_protocol_server.py::TestHttpForwarding::test_slow_request_body_does_not_hang_forever` |
+
+---
+
+## 11. 已知限制与后续工作（2026-09-05 代码评审）
+
+以下两项在评审中一并发现，评估后判定优先级低于本次已修复的三处（详见 v1.5.0 修订说明与 [DD_SWITCHING.md](./DD_SWITCHING.md) v1.4.0），暂不改动，记录在此以便后续排期。
+
+### 11.1 请求体部分发出后失败重试，重放位置可能对不上
+
+`_send_body` 用 `self._body_consumed` 标记「客户端 body 是否已经完整读完」：完整读完之后的重试一律从 `ReplayBuffer` 回放，不再碰客户端连接。但如果**第一次转发在 body 读到一半时就失败**（例如写往出口的 socket 中途 `BrokenPipeError`，或本次新增的 body 读超时在 body 读了一部分之后触发），`self._body_consumed` 仍是 `False`；此时若判据允许重试（该场景下 `request_sent` 为 `False`，判据判定「字节没真正发出去」，允许切换），下一次尝试会再次调用 `stream_body(self._reader, sink, plan)`，但 `self._reader`（客户端连接）此刻已经被消费掉了一部分字节——对 `Content-Length` 定长 body 而言，第二次尝试会用完整的 `plan.length` 去读，实际能读到的字节比这个数小（客户端总共只发了那么多），造成第二次尝试挂起等待客户端不会再发的字节，或读到 EOF 提前判为失败；对 chunked body 而言，问题更直接——第二次尝试会从「客户端连接当前的字节位置」开始按 chunk 长度行解析，而这个位置很可能落在上一次尝试还没读完的某个 chunk 数据中间，不是一个合法的 chunk 长度行起点，直接解析失败。
+
+**影响范围与为什么暂不修**：只在「body 转发到一半时出口才失败」这一条件窗口内触发，比本次修复的三处（尤其是非幂等重投）更窄；而且第二次尝试大概率会因为读到畸形数据或提前 EOF 而快速失败（属于「重试注定失败但不会误伤」，不是「悄悄产生错误结果」），业务影响远低于「非幂等请求被悄悄重复执行」。修正需要在 `ReplayBuffer`/`stream_body` 之间引入「已消费但未完整」的精确位置追踪与相应的判据豁免，改动面比本次三处大，留待后续单独设计（建议先在 `study/` 下补一份方案对比：是「彻底禁止 body 读到一半后失败重试」更简单安全，还是「精确追踪已消费字节」收益更大）。
+
+### 11.2 `OPTIONS *`（asterisk-form）请求落进 origin-form 分支，拼出畸形 URL
+
+`parse_target` 只识别 CONNECT 的 authority-form、含 `://` 的 absolute-form、其余一律按 origin-form 处理（要求 `Host` 头）。RFC 9112 §3.2.4 定义的 asterisk-form（仅 `OPTIONS *` 使用）落进 origin-form 分支时，`url = f"http://{host_header}{target}"` 会拼出类似 `http://example.com*` 的字符串（`target` 是字面量 `"*"`，前面没有 `/`）。这个畸形 URL 会被转发给出口，多数服务器要么按路径 `*`（罕见但部分服务器容忍）处理要么返回 `400`，不会造成安全问题，但语义上不正确。
+
+**为什么暂不修**：`OPTIONS *` 通过正向代理转发在实践中极其罕见（主要用于服务器直连的探活场景，代理场景下客户端很少这么发），影响面小；修正需要明确「asterisk-form 经 `direct`/经上级代理时请求行分别该怎么写」这一未被当前设计文档覆盖的问题，属于需要先补设计再改代码的范畴，不适合顺手改掉。后续若排期，建议先在本节或 §3.3 补一小节设计，再实现。

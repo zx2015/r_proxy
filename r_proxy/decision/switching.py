@@ -44,7 +44,29 @@ class SwitchPolicy:
         放在冻结的上下文里会掩盖「这次调用可能消耗配额」这个副作用。
         """
         # 判据一：失败层次。没有状态码时后续的分类与来源判定全都不适用。
+        #
+        # 但「没有状态码」本身不能豁免幂等门控：TCP/DNS 层面就失败（连接被拒、
+        # 超时、RST）时请求字节还没发出去，任何方法重投都是安全的——这是
+        # ``request_sent=False`` 的情形。可一旦请求（含非幂等的 POST 请求体）
+        # 已经完整写到这个出口的 socket 上，后续无论是等响应超时、连接被对端
+        # 悄悄断开，还是握手中途失败，都不再是「没发生过」：出口很可能已经
+        # 收到并可能已经处理了这次调用。此时仍无条件切换，会把同一个 POST
+        # 重放到下一个出口，等价于让一次下单/扣款类调用被悄悄执行两次——这
+        # 正是 AGENTS.md/CLAUDE.md 明确列为红线的「非幂等方法已发出后不得重试」。
+        # 检查顺序与判据三保持一致：response_started 是更强的约束，排在前面。
         if outcome.status is None:
+            if ctx.response_started:
+                return SwitchVerdict(
+                    switch=False,
+                    keep_reason=KeepReason.RESPONSE_STARTED,
+                    failure_kind=outcome.kind,
+                )
+            if ctx.request_sent and not ctx.method.idempotent:
+                return SwitchVerdict(
+                    switch=False,
+                    keep_reason=KeepReason.NON_IDEMPOTENT,
+                    failure_kind=outcome.kind,
+                )
             return SwitchVerdict(
                 switch=True,
                 switch_reason=SwitchReason.TRANSPORT_FAILURE,

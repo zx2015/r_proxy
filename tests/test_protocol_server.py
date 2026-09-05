@@ -276,6 +276,70 @@ class TestHttpForwarding:
         finally:
             await proxy.server.stop()
 
+    async def test_1xx_interim_response_is_skipped(self) -> None:
+        """上游先回 ``100 Continue`` 再回真正的最终响应：客户端必须只看到
+        最终响应，而不是把 100 Continue 当成结果、把真正的响应当成它的 body。
+        """
+        payload = b"final-body"
+
+        async def handler(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+            await r.readuntil(b"\r\n\r\n")
+            w.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+            await w.drain()
+            w.write(
+                b"HTTP/1.1 200 OK\r\nContent-Length: "
+                + str(len(payload)).encode()
+                + b"\r\nConnection: close\r\n\r\n"
+                + payload
+            )
+            await w.drain()
+            w.close()
+
+        origin = await start_server(handler)
+        proxy = await run_proxy(snapshot())
+        try:
+            resp = await proxy.request(
+                f"GET http://{origin.address}/ HTTP/1.1\r\n"
+                f"Host: {origin.address}\r\n"
+                f"Expect: 100-continue\r\n\r\n".encode()
+            )
+            assert resp.startswith(b"HTTP/1.1 200 OK")
+            assert resp.endswith(payload)
+            assert b"100 Continue" not in resp
+        finally:
+            await proxy.server.stop()
+
+    async def test_slow_request_body_does_not_hang_forever(self) -> None:
+        """客户端声明了 ``Content-Length`` 却不发（或发得极慢）：读取 body
+        必须有超时兜底，否则这个连接与已经建立的出口 socket 会永久挂起。
+        用真实可达的本地源站，确保触发的是「读 body 超时」而非「连不上出口」。
+        """
+
+        async def handler(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+            # 正常情况下永远不会跑到这——测试要验证的是代理压根等不到完整
+            # body 就已经放弃，不会真的把（不完整的）请求转发过去。
+            await r.read(-1)
+
+        origin = await start_server(handler)
+        cfg = snapshot()
+        server = ProxyServer(cfg, head_read_timeout=0.1)
+        await server.start()
+        try:
+            reader, writer = await asyncio.open_connection(*server.bound_address)
+            addr = origin.address
+            writer.write(
+                f"POST http://{addr}/ HTTP/1.1\r\n"
+                f"Host: {addr}\r\n"
+                f"Content-Length: 100\r\n\r\n"
+                f"only-a-few-bytes".encode()  # 声明 100 字节，只发一小段就不再发送
+            )
+            await writer.drain()
+            resp = await asyncio.wait_for(reader.read(300), timeout=5)
+            assert resp.startswith(b"HTTP/1.1 502")
+            writer.close()
+        finally:
+            await server.stop()
+
 
 class TestConnectTunnel:
     async def test_direct_tunnel_relays_both_ways(self, echo_server: FakeServer) -> None:
