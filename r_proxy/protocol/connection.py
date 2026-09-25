@@ -76,6 +76,9 @@ class HttpAttempt:
     raw_head: bytes
     status: int
     headers: Headers
+    # 请求侧已经发往出口的字节数（请求行+头部+body），设计中 v2.2.0
+    # （DD_PROXY §5.2.2）：用于最终交付后的流量统计，不参与判据。
+    bytes_up: int = 0
 
 
 class ClientConnection:
@@ -91,6 +94,7 @@ class ClientConnection:
         *,
         head_read_timeout: float = DEFAULT_HEAD_READ_TIMEOUT,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
+        client_addr: str | None = None,
     ) -> None:
         self._reader = reader
         self._writer = writer
@@ -101,6 +105,10 @@ class ClientConnection:
         self._executor = executor
         self._head_read_timeout = head_read_timeout
         self._idle_timeout = idle_timeout
+        # 采集点在 ``ProxyServer._on_client``（DD_PROXY.md §4.4）：一条连接上
+        # 只解析一次请求（§4.2 连接不复用），这里只是接住并原样带下去，不
+        # 重新取值。``None`` 表示 ``get_extra_info("peername")`` 没拿到。
+        self._client_addr = client_addr
         self.request_id = new_request_id()
         # 一旦置位就不可撤回：响应头已经发出，此后任何失败都只能断开连接。
         self._response_started = False
@@ -147,7 +155,13 @@ class ClientConnection:
         )
         if not decision.chain:
             self._log_empty_chain(decision)
-            self._executor.note_dead_end(target, decision, self._cfg, request_id=self.request_id)
+            self._executor.note_dead_end(
+                target,
+                decision,
+                self._cfg,
+                request_id=self.request_id,
+                client_addr=self._client_addr,
+            )
             await self._send_error(502, MSG_NO_UPSTREAM)
             return
 
@@ -190,6 +204,7 @@ class ClientConnection:
             attempt=lambda u: self._attempt_tunnel(u, target),
             discard=_close_tunnel,
             request_id=self.request_id,
+            client_addr=self._client_addr,
         )
         delivered = result.delivered
         tunnel = delivered.payload if delivered is not None else None
@@ -223,6 +238,14 @@ class ClientConnection:
         finally:
             await tunnel.close()
             self._note_premature_death(target, upstream_name, stats)
+            self._executor.note_traffic(
+                target,
+                upstream_name,
+                self._cfg,
+                bytes_up=stats.bytes_up,
+                bytes_down=stats.bytes_down,
+                request_id=self.request_id,
+            )
 
     async def _attempt_tunnel(
         self, upstream: UpstreamConfig, target: RequestTarget
@@ -289,6 +312,7 @@ class ClientConnection:
                 attempt=lambda u: self._attempt_http(u, target, head, plan),
                 discard=_close_http,
                 request_id=self.request_id,
+                client_addr=self._client_addr,
             )
         except BadRequest as exc:
             # 客户端自己的请求体格式错误。让它穿过执行器而不是转成一次「失败
@@ -296,21 +320,34 @@ class ClientConnection:
             await self._send_error(400, str(exc))
             return
 
-        attempted = result.delivered.payload if result.delivered is not None else None
-        if attempted is None:
+        delivered = result.delivered
+        attempted = delivered.payload if delivered is not None else None
+        if attempted is None or delivered is None:
             await self._send_error(502, MSG_CHAIN_EXHAUSTED)
             return
 
+        upstream_name = delivered.outcome.upstream
+        bytes_down = 0
         try:
             self._writer.write(sanitize_response_head(attempted.raw_head))
             await self._writer.drain()
             self._response_started = True
             self._replay.give_up()
-            await pump(attempted.conn.reader, self._writer, idle_timeout=self._idle_timeout)
+            bytes_down = await pump(
+                attempted.conn.reader, self._writer, idle_timeout=self._idle_timeout
+            )
         except (OSError, TimeoutError):
             pass
         finally:
             await attempted.conn.close()
+            self._executor.note_traffic(
+                target,
+                upstream_name,
+                self._cfg,
+                bytes_up=attempted.bytes_up,
+                bytes_down=bytes_down,
+                request_id=self.request_id,
+            )
 
     async def _attempt_http(
         self,
@@ -333,8 +370,9 @@ class ClientConnection:
 
         _, read_timeout = self._cfg.timeout_for(upstream.name)
         try:
-            conn.writer.write(build_request(target, head, upstream))
-            await self._send_body(conn, plan)
+            request_head = build_request(target, head, upstream)
+            conn.writer.write(request_head)
+            body_bytes = await self._send_body(conn, plan)
             await conn.writer.drain()
             self._request_sent = True
 
@@ -388,11 +426,17 @@ class ClientConnection:
                 response_headers=headers,
             ),
             switch_context=self._switch_context(target, request_sent=True),
-            payload=HttpAttempt(conn=conn, raw_head=raw_head, status=status, headers=headers),
+            payload=HttpAttempt(
+                conn=conn,
+                raw_head=raw_head,
+                status=status,
+                headers=headers,
+                bytes_up=len(request_head) + body_bytes,
+            ),
         )
 
-    async def _send_body(self, conn: UpstreamConn, plan: BodyPlan) -> None:
-        """首次尝试边转发边缓存，重试时改从缓冲重放。
+    async def _send_body(self, conn: UpstreamConn, plan: BodyPlan) -> int:
+        """首次尝试边转发边缓存，重试时改从缓冲重放。返回本次实际转发的字节数。
 
         读取客户端请求体的每一次阻塞读用 ``head_read_timeout`` 兜底：客户端
         声明了 ``Content-Length``/chunked 之后却慢吞吞地发（或干脆不再发）
@@ -403,13 +447,23 @@ class ClientConnection:
         上限」同样适用于「一个连接占用多久」）。超时按普通传输层失败处理：
         请求还没读完自然也没能完整发往出口，``request_sent`` 保持 False，
         候选链可以正常切到下一个出口重试。
+
+        字节数**不能**读 ``self._replay.size``：body 超过 ``switch_buffer_bytes``
+        时 ``ReplayBuffer.give_up()`` 会把 ``size`` 清零，那之后这个数字就不再
+        代表「转发了多少」，只代表「缓存里还留着多少」（设计中 v2.2.0，
+        DD_PROXY §5.2.2）。因此用独立计数器，不依赖重放缓冲的状态。
         """
         if self._body_consumed:
+            replayed = self._replay.size
             self._replay.replay_into(conn.writer.write)
             await conn.writer.drain()
-            return
+            return replayed
+
+        sent = 0
 
         def sink(chunk: bytes) -> None:
+            nonlocal sent
+            sent += len(chunk)
             self._replay.append(chunk)
             conn.writer.write(chunk)
 
@@ -424,6 +478,7 @@ class ClientConnection:
             )
             raise
         self._body_consumed = True
+        return sent
 
     def _switch_context(self, target: RequestTarget, *, request_sent: bool) -> SwitchContext:
         return SwitchContext(

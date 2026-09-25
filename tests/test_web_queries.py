@@ -29,6 +29,7 @@ from r_proxy.web.schemas import LogQuery
 
 _COLUMNS = (
     "request_id",
+    "client_addr",
     "host",
     "url",
     "method",
@@ -58,6 +59,7 @@ BASE_TS = 1_700_000_000
 def log_row(**overrides: object) -> dict[str, object]:
     row: dict[str, object] = {
         "request_id": "req-1",
+        "client_addr": "203.0.113.1",
         "host": "example.com",
         "url": "http://example.com/",
         "method": "GET",
@@ -154,7 +156,12 @@ def pool(tmp_path: Path) -> ReadOnlyPool:
                 upstream_name="proxy-a",
                 upstream_priority=10,
             ),
-            log_row(request_id="c", host="c.example", created_at=BASE_TS + 4),
+            log_row(
+                request_id="c",
+                host="c.example",
+                created_at=BASE_TS + 4,
+                client_addr="198.51.100.1",
+            ),
         ],
     )
     return ReadOnlyPool(tmp_path / "logs.db")
@@ -175,6 +182,10 @@ class TestLogFilters:
         assert {row["host"] for row in rows} == {"b.example"}
         assert len(rows) == 2
 
+    def test_client_addr_filter_is_exact(self, pool: ReadOnlyPool) -> None:
+        rows = queries.query_logs(pool, query(client_addr="198.51.100.1"))
+        assert [row["request_id"] for row in rows] == ["c"]
+
     def test_upstream_status_and_time_filters_combine(self, pool: ReadOnlyPool) -> None:
         rows = queries.query_logs(pool, query(upstream="proxy-a", since=BASE_TS + 3))
         assert [row["request_id"] for row in rows] == ["b"]
@@ -192,6 +203,49 @@ class TestLogFilters:
     def test_a_drop_table_attempt_leaves_the_table(self, pool: ReadOnlyPool) -> None:
         queries.query_logs(pool, query(upstream="x'; DROP TABLE request_log; --"))
         assert len(queries.query_logs(pool, query())) == 4
+
+
+class TestLogTrafficJoin:
+    """`request_log.bytes_up/down` 恒为 0；真实传输量来自与 `traffic_log` 的联表。"""
+
+    def test_a_row_with_matching_traffic_log_reports_real_bytes(self, tmp_path: Path) -> None:
+        seed_logs(
+            tmp_path / "logs.db",
+            [log_row(request_id="a", host="a.example", bytes_up=0, bytes_down=0)],
+        )
+        seed_traffic(
+            tmp_path / "logs.db",
+            [traffic_row(request_id="a", host="a.example", bytes_up=111, bytes_down=222)],
+        )
+        pool = ReadOnlyPool(tmp_path / "logs.db")
+        (row,) = queries.query_logs(pool, query())
+        assert (row["bytes_up"], row["bytes_down"]) == (0, 0)
+        assert (row["traffic_bytes_up"], row["traffic_bytes_down"]) == (111, 222)
+
+    def test_a_row_without_a_matching_traffic_log_reports_null(self, tmp_path: Path) -> None:
+        """被切换掉的尝试从未真正传输过数据，须与「传输了 0 字节」区分开。"""
+        seed_logs(tmp_path / "logs.db", [log_row(request_id="a", host="a.example")])
+        pool = ReadOnlyPool(tmp_path / "logs.db")
+        (row,) = queries.query_logs(pool, query())
+        assert row["traffic_bytes_up"] is None
+        assert row["traffic_bytes_down"] is None
+
+    def test_filters_still_work_alongside_the_join(self, tmp_path: Path) -> None:
+        """联表不能让 host/upstream 等既有筛选条件产生「ambiguous column」。"""
+        seed_logs(
+            tmp_path / "logs.db",
+            [
+                log_row(request_id="a", host="a.example"),
+                log_row(request_id="b", host="b.example"),
+            ],
+        )
+        seed_traffic(
+            tmp_path / "logs.db",
+            [traffic_row(request_id="a", host="a.example", bytes_up=1, bytes_down=1)],
+        )
+        pool = ReadOnlyPool(tmp_path / "logs.db")
+        rows = queries.query_logs(pool, query(host="b.example"))
+        assert [row["request_id"] for row in rows] == ["b"]
 
 
 class TestPagination:
@@ -239,6 +293,69 @@ class TestSwitchChains:
     def test_placeholders_scale_with_the_id_count(self, pool: ReadOnlyPool) -> None:
         rows = queries.query_attempts(pool, ["a", "c"])
         assert {row["request_id"] for row in rows} == {"a", "c"}
+
+
+_TRAFFIC_INSERT = (
+    "INSERT INTO traffic_log (request_id, host, upstream_name, bytes_up, bytes_down, created_at)"
+    " VALUES (:request_id, :host, :upstream_name, :bytes_up, :bytes_down, :created_at)"
+)
+
+
+def traffic_row(**overrides: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "request_id": "req-1",
+        "host": "example.com",
+        "upstream_name": "direct",
+        "bytes_up": 10,
+        "bytes_down": 20,
+        "created_at": BASE_TS,
+    }
+    row.update(overrides)
+    return row
+
+
+def seed_traffic(path: Path, rows: Sequence[dict[str, object]]) -> None:
+    conn = open_write(path, Database.LOGS)
+    try:
+        for row in rows:
+            conn.execute(_TRAFFIC_INSERT, row)
+    finally:
+        conn.close()
+
+
+@pytest.fixture
+def traffic_pool(tmp_path: Path) -> ReadOnlyPool:
+    seed_traffic(
+        tmp_path / "logs.db",
+        [
+            traffic_row(request_id="a", host="big.example", bytes_up=100, bytes_down=900),
+            traffic_row(request_id="b", host="big.example", bytes_up=50, bytes_down=100),
+            traffic_row(request_id="c", host="small.example", bytes_up=1, bytes_down=1),
+            traffic_row(request_id="d", host="yesterday.example", created_at=BASE_TS - 90000),
+        ],
+    )
+    return ReadOnlyPool(tmp_path / "logs.db")
+
+
+class TestHostTraffic:
+    def test_hosts_are_ranked_by_total_bytes_descending(self, traffic_pool: ReadOnlyPool) -> None:
+        rows = queries.query_host_traffic(traffic_pool, BASE_TS - 1, BASE_TS + 1, 20)
+        assert [row["host"] for row in rows] == ["big.example", "small.example"]
+
+    def test_bytes_and_requests_are_summed_per_host(self, traffic_pool: ReadOnlyPool) -> None:
+        rows = queries.query_host_traffic(traffic_pool, BASE_TS - 1, BASE_TS + 1, 20)
+        big = rows[0]
+        assert (big["bytes_up"], big["bytes_down"], big["requests"]) == (150, 1000, 2)
+
+    def test_the_time_window_excludes_rows_outside_it(self, traffic_pool: ReadOnlyPool) -> None:
+        """`yesterday.example` 落在窗口之外，不该出现在榜单里。"""
+        rows = queries.query_host_traffic(traffic_pool, BASE_TS - 1, BASE_TS + 1, 20)
+        assert "yesterday.example" not in {row["host"] for row in rows}
+
+    def test_limit_caps_the_result_count(self, traffic_pool: ReadOnlyPool) -> None:
+        rows = queries.query_host_traffic(traffic_pool, BASE_TS - 1, BASE_TS + 1, 1)
+        assert len(rows) == 1
+        assert rows[0]["host"] == "big.example"
 
 
 @pytest.fixture
@@ -343,6 +460,17 @@ class TestHealthEndpoint:
         assert body["upstreams"][0]["available"] is True
         assert body["upstreams"][0]["last_success_age_seconds"] is None
 
+    async def test_health_reports_accumulated_traffic(self, tmp_path: Path) -> None:
+        app = await running(tmp_path)
+        try:
+            app.state.health.add_traffic("proxy-a", bytes_up=100, bytes_down=200)
+            async with client_for(app) as client:
+                body = (await client.get("/api/health")).json()
+        finally:
+            await app.stop()
+        entry = next(u for u in body["upstreams"] if u["name"] == "proxy-a")
+        assert (entry["bytes_up_total"], entry["bytes_down_total"]) == (100, 200)
+
     async def test_health_reports_the_open_circuit(self, tmp_path: Path) -> None:
         app = await running(tmp_path)
         try:
@@ -410,6 +538,62 @@ class TestHealthEndpoint:
         assert row["action"] == "reset_health"
         assert row["target"] == "proxy-a"
         assert row["actor"] == "127.0.0.1"
+
+
+class TestHostTrafficEndpoint:
+    async def test_ranks_hosts_within_the_given_window(self, tmp_path: Path) -> None:
+        seed_traffic(
+            tmp_path / "logs.db",
+            [
+                traffic_row(request_id="a", host="big.example", bytes_up=100, bytes_down=900),
+                traffic_row(request_id="b", host="small.example", bytes_up=1, bytes_down=1),
+            ],
+        )
+        app = await running(tmp_path)
+        try:
+            async with client_for(app) as client:
+                body = (
+                    await client.get(
+                        "/api/traffic/hosts",
+                        params={"since": BASE_TS - 1, "until": BASE_TS + 1},
+                    )
+                ).json()
+        finally:
+            await app.stop()
+        assert [item["host"] for item in body["items"]] == ["big.example", "small.example"]
+        assert body["since"] == BASE_TS - 1
+        assert body["until"] == BASE_TS + 1
+
+    async def test_defaults_to_today_when_no_range_is_given(self, tmp_path: Path) -> None:
+        app = await running(tmp_path)
+        try:
+            async with client_for(app) as client:
+                body = (await client.get("/api/traffic/hosts")).json()
+        finally:
+            await app.stop()
+        assert body["items"] == []
+        assert body["since"] <= body["until"]
+
+    async def test_limit_is_applied(self, tmp_path: Path) -> None:
+        seed_traffic(
+            tmp_path / "logs.db",
+            [
+                traffic_row(request_id="a", host="a.example", bytes_up=1, bytes_down=1),
+                traffic_row(request_id="b", host="b.example", bytes_up=1, bytes_down=1),
+            ],
+        )
+        app = await running(tmp_path)
+        try:
+            async with client_for(app) as client:
+                body = (
+                    await client.get(
+                        "/api/traffic/hosts",
+                        params={"since": BASE_TS - 1, "until": BASE_TS + 1, "limit": 1},
+                    )
+                ).json()
+        finally:
+            await app.stop()
+        assert len(body["items"]) == 1
 
 
 def _trip(app: Application, *, now: float | None = None) -> None:

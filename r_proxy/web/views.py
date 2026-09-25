@@ -40,6 +40,8 @@ def health_info(cfg: UpstreamConfig, table: HealthTable, *, now: float) -> Upstr
         auth_error=health.auth_error,
         last_error=health.last_error,
         last_success_age_seconds=_age(health.last_success_at, now=now),
+        bytes_up_total=health.total_bytes_up,
+        bytes_down_total=health.total_bytes_down,
     )
 
 

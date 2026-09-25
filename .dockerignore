@@ -1,11 +1,13 @@
 # 与构建无关的元数据
+# 注意：README.md 不能排除——pyproject.toml 的 readme = "README.md" 使
+# `pip install .` 依赖它，Dockerfile 也显式 COPY 了它；排除会导致构建失败
+# （COPY 找不到文件），这里曾经踩过。
 .git/
 .gitignore
 .cursor/
 .learnings/
 .claude/settings.local.json
 TODO.md
-README.md
 
 # 构建/测试缓存（绝不会进入镜像，但排除能减小构建上下文）
 build/

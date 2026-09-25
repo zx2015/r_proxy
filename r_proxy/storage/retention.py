@@ -41,6 +41,18 @@ _TRIM_BY_ROWS = """
      )
 """
 
+# traffic_log 复用与 request_log 同一份保留配置（DD_STORAGE.md §6.1）：
+# 行数增长速率是同一数量级（约等于成功交付的请求数，甚至更少），没有证据
+# 表明这张表需要独立的保留期。
+_TRIM_TRAFFIC_BY_ROWS = """
+    DELETE FROM traffic_log
+     WHERE id <= (
+         SELECT id FROM traffic_log
+          ORDER BY id DESC
+          LIMIT 1 OFFSET ?
+     )
+"""
+
 
 class Retention:
     """按固定间隔在写者线程内执行清理。"""
@@ -85,6 +97,8 @@ class Retention:
             (
                 ("DELETE FROM request_log WHERE created_at < ?", (cutoff,)),
                 (_TRIM_BY_ROWS, (self._cfg.max_log_rows,)),
+                ("DELETE FROM traffic_log WHERE created_at < ?", (cutoff,)),
+                (_TRIM_TRAFFIC_BY_ROWS, (self._cfg.max_log_rows,)),
             ),
         )
 

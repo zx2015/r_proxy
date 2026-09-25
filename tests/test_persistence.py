@@ -104,12 +104,20 @@ class TestApplyInitialState:
             rt,
             InitialState(
                 health=(
-                    HealthRow(upstream="a", total_success=10, total_failure=4, avg_latency_ms=12),
+                    HealthRow(
+                        upstream="a",
+                        total_success=10,
+                        total_failure=4,
+                        avg_latency_ms=12,
+                        total_bytes_up=300,
+                        total_bytes_down=400,
+                    ),
                 )
             ),
         )
         snapshot = rt.health.snapshot_of("a")
         assert (snapshot.total_success, snapshot.total_failure) == (10, 4)
+        assert (snapshot.total_bytes_up, snapshot.total_bytes_down) == (300, 400)
         assert rt.health.state_of("a", now=0.0) is HealthState.CLOSED
 
 
@@ -175,6 +183,19 @@ class TestHealthPersister:
         rt.health.record_result("a", ok=True, kind=FailureKind.NOT_A_FAILURE, now=0.0)
         assert persister.flush(rt.health.all(now=0.0), now_unix=1) == 1
         assert (sink.ops[0].payload[1], sink.ops[0].payload[2]) == (2, 0)
+
+    def test_byte_deltas_are_flushed_too(self) -> None:
+        """字节累计走同一条自增路径，payload 末两个槽位是本批次的字节增量。"""
+        rt = state()
+        sink = FakeSink()
+        persister = HealthPersister(sink)
+        rt.health.add_traffic("a", bytes_up=100, bytes_down=200)
+        assert persister.flush(rt.health.all(now=0.0), now_unix=1) == 1
+        assert sink.ops[0].payload[9:11] == (100, 200)
+
+        rt.health.add_traffic("a", bytes_up=50, bytes_down=25)
+        persister.flush(rt.health.all(now=0.0), now_unix=2)
+        assert sink.ops[1].payload[9:11] == (50, 25)
 
     def test_a_baseline_for_an_upstream_no_longer_configured_is_dropped(self) -> None:
         """库里留着已删出口的计数很正常。它不在内存健康表里，基线要能被裁掉，

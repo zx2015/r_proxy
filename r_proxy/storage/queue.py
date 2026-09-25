@@ -38,6 +38,7 @@ class OpKind(StrEnum):
     ROUTE_BLOCK_DELETE = "route_block_delete"
     HEALTH_COUNTERS = "health_counters"
     REQUEST_LOG = "request_log"
+    TRAFFIC_LOG = "traffic_log"
     CONFIG_AUDIT = "config_audit"
 
 
@@ -80,9 +81,14 @@ _SPECS: dict[OpKind, _Spec] = {
         Priority.CRITICAL, Database.STATE, "route_block", key_slots=(0, 1), deletes_row=True
     ),
     OpKind.HEALTH_COUNTERS: _Spec(
-        Priority.NORMAL, Database.STATE, "upstream_health", key_slots=(0,), delta_slots=(1, 2)
+        Priority.NORMAL,
+        Database.STATE,
+        "upstream_health",
+        key_slots=(0,),
+        delta_slots=(1, 2, 9, 10),
     ),
     OpKind.REQUEST_LOG: _Spec(Priority.LOSSY, Database.LOGS, "request_log"),
+    OpKind.TRAFFIC_LOG: _Spec(Priority.LOSSY, Database.LOGS, "traffic_log"),
     OpKind.CONFIG_AUDIT: _Spec(Priority.CRITICAL, Database.LOGS, "config_audit"),
 }
 
@@ -177,6 +183,8 @@ def health_counters(
     cooldown_until: int,
     auth_error: int,
     now_unix: int,
+    bytes_up_delta: int = 0,
+    bytes_down_delta: int = 0,
 ) -> WriteOp:
     """``*_delta`` 是本批次增量，其余字段是内存中的权威值（覆盖写）。"""
     return WriteOp(
@@ -191,6 +199,8 @@ def health_counters(
             cooldown_until,
             auth_error,
             now_unix,
+            bytes_up_delta,
+            bytes_down_delta,
         ),
     )
 
@@ -198,6 +208,7 @@ def health_counters(
 def request_log(
     *,
     request_id: str,
+    client_addr: str | None,
     host: str,
     url: str | None,
     method: str,
@@ -222,11 +233,17 @@ def request_log(
 
     ``error`` 直接取自 ``AttemptOutcome.error``，只含异常类型名或 errno 名，
     不含出口地址。
+
+    ``client_addr`` 只存 IP（不含端口，见 DD_STORAGE.md §3.1），采集自
+    ``ProxyServer._on_client`` 的 ``peername``；解析不到时为 ``None``。它的
+    准确性依赖容器网络模式（`host` 网络下是真实客户端 IP，`bridge` + 端口
+    映射下是网桥地址），见 DD_PROXY.md §4.4。
     """
     return WriteOp(
         OpKind.REQUEST_LOG,
         (
             request_id,
+            client_addr,
             host,
             url,
             method,
@@ -244,6 +261,28 @@ def request_log(
             bytes_down,
             now_unix,
         ),
+    )
+
+
+def traffic_log(
+    *,
+    request_id: str,
+    host: str,
+    upstream: str,
+    bytes_up: int,
+    bytes_down: int,
+    now_unix: int,
+) -> WriteOp:
+    """一个成功交付的请求关闭/结束时落一行（DD_STORAGE.md §4.3b）。
+
+    与 :func:`request_log` 分表：那张表是「每次尝试一行」的审计粒度，字节数
+    恒为 0；这里是「传输结束后才知道数字」的独立事实，只在最终交付的那次
+    尝试完整结束时写入一次。优先级同为 ``LOSSY``——丢了不改变任何路由行为，
+    只是流量榜少一行。
+    """
+    return WriteOp(
+        OpKind.TRAFFIC_LOG,
+        (request_id, host, upstream, bytes_up, bytes_down, now_unix),
     )
 
 

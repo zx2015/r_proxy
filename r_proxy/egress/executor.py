@@ -28,6 +28,7 @@ from r_proxy.storage.queue import (
     sticky_delete,
     sticky_hit,
     sticky_upsert,
+    traffic_log,
 )
 
 logger = logging.getLogger(__name__)
@@ -98,6 +99,7 @@ class AttemptExecutor:
         attempt: Callable[[UpstreamConfig], Awaitable[AttemptResult[T]]],
         discard: Callable[[T], Awaitable[None]],
         request_id: str | None = None,
+        client_addr: str | None = None,
     ) -> ExecutionResult[T]:
         """沿候选链执行。
 
@@ -138,6 +140,7 @@ class AttemptExecutor:
                     self._record_success(target, name, result.outcome, snapshot, decision, now=now)
                     self._log_attempt(
                         request_id,
+                        client_addr,
                         target,
                         decision,
                         upstream,
@@ -164,6 +167,7 @@ class AttemptExecutor:
                 )
                 self._log_attempt(
                     request_id,
+                    client_addr,
                     target,
                     decision,
                     upstream,
@@ -214,6 +218,7 @@ class AttemptExecutor:
         snapshot: ConfigSnapshot,
         *,
         request_id: str,
+        client_addr: str | None = None,
     ) -> None:
         """候选链为空：一次尝试都没发起，但仍要留一行。
 
@@ -228,6 +233,7 @@ class AttemptExecutor:
         self._sink.put(
             self._row(
                 request_id,
+                client_addr,
                 target,
                 decision,
                 upstream="",
@@ -262,11 +268,45 @@ class AttemptExecutor:
         )
         self._block(host, upstream, TUNNEL_PREMATURE_DEATH, now=self._clock())
 
+    def note_traffic(
+        self,
+        target: RequestTarget,
+        upstream: str,
+        snapshot: ConfigSnapshot,
+        *,
+        bytes_up: int,
+        bytes_down: int,
+        request_id: str,
+    ) -> None:
+        """数据传输真正结束时调用一次（协议层：CONNECT 隧道关闭 / HTTP 响应体转发完）。
+
+        与熔断、粘性无关，只做两件事（DD_ROUTING §4.8、DD_STORAGE §4.3b）：
+        出口维度的内存累计（供出口健康看板）、`traffic_log` 落一行（供主机
+        流量榜）。跳过 Web UI 自身的轮询流量，理由与 `_log_attempt` 一致
+        （DD_STORAGE §4.9）——否则仪表盘轮询会把这两份流量统计都搅乱。
+        """
+        if _is_webui_traffic(target, snapshot):
+            return
+        self._state.health.add_traffic(upstream, bytes_up=bytes_up, bytes_down=bytes_down)
+        if self._sink is None:
+            return
+        self._sink.put(
+            traffic_log(
+                request_id=request_id,
+                host=target.host,
+                upstream=upstream,
+                bytes_up=bytes_up,
+                bytes_down=bytes_down,
+                now_unix=int(self._unix_clock()),
+            )
+        )
+
     # ----------------------------------------------------------------------
 
     def _log_attempt(
         self,
         request_id: str | None,
+        client_addr: str | None,
         target: RequestTarget,
         decision: Decision,
         upstream: UpstreamConfig,
@@ -287,6 +327,7 @@ class AttemptExecutor:
         self._sink.put(
             self._row(
                 request_id,
+                client_addr,
                 target,
                 decision,
                 upstream=upstream.name,
@@ -312,6 +353,7 @@ class AttemptExecutor:
     def _row(
         self,
         request_id: str,
+        client_addr: str | None,
         target: RequestTarget,
         decision: Decision,
         *,
@@ -328,6 +370,7 @@ class AttemptExecutor:
     ) -> WriteOp:
         return request_log(
             request_id=request_id,
+            client_addr=client_addr,
             host=target.host,
             url=target.url,
             method=target.method.name,

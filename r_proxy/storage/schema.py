@@ -15,7 +15,22 @@ import sqlite3
 from enum import StrEnum
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+
+class Database(StrEnum):
+    STATE = "state"
+    LOGS = "logs"
+    RULES = "rules"
+
+
+# 三库各自独立计数版本号（见 DD_STORAGE.md §3.2）：迁移脚本按库分表存放
+# 在 ``_MIGRATIONS`` 里，版本号自然也必须按库区分，否则给 ``logs.db`` 加一步
+# 迁移会让 ``state.db``/``rules.db`` 在 ``migrate()`` 里因为 ``target`` 超出
+# 它们自己的迁移步骤表而 KeyError。
+SCHEMA_VERSIONS: dict[Database, int] = {
+    Database.STATE: 2,
+    Database.LOGS: 3,
+    Database.RULES: 1,
+}
 
 # STRICT 表需要 SQLite 3.37+。默认的动态类型会让「写字符串到 INTEGER 列」
 # 静默成功，等到读取时才炸——那时已经无从追溯是谁写坏的。
@@ -26,12 +41,6 @@ VERSION_KEY = "schema_version"
 
 class StorageError(Exception):
     """数据库无法按预期使用。启动阶段抛出即拒绝启动。"""
-
-
-class Database(StrEnum):
-    STATE = "state"
-    LOGS = "logs"
-    RULES = "rules"
 
 
 _SCHEMA_META = """
@@ -127,6 +136,38 @@ CREATE TABLE IF NOT EXISTS config_audit (
 CREATE INDEX IF NOT EXISTS idx_ca_created ON config_audit(created_at DESC);
 """
 
+# 客户端来源地址。只追加列，不改动 _LOGS_V1：request_id、host 等既有列的定义
+# 不应该在迁移脚本里重复出现,历史行该列为 NULL,与「解析不到地址」同一语义
+# （见 DD_STORAGE.md §3.2、§4.9）。
+_LOGS_V2 = """
+ALTER TABLE request_log ADD COLUMN client_addr TEXT;
+"""
+
+# 流量统计（DD_STORAGE.md §3.2、§4.3b）：独立于 request_log 的一张新表，
+# 每个成功交付的请求关闭/结束时落一行，供「当日主机流量榜」按 created_at
+# 有界聚合。不是给已有表加列，因此用 CREATE TABLE 而非 ALTER TABLE。
+_LOGS_V3 = """
+CREATE TABLE IF NOT EXISTS traffic_log (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id     TEXT    NOT NULL,
+    host           TEXT    NOT NULL,
+    upstream_name  TEXT    NOT NULL,
+    bytes_up       INTEGER NOT NULL DEFAULT 0,
+    bytes_down     INTEGER NOT NULL DEFAULT 0,
+    created_at     INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_tl_created ON traffic_log(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tl_host    ON traffic_log(host, created_at DESC);
+"""
+
+# 出口累计流量（DD_STORAGE.md §3.2、DD_ROUTING.md §4.8）：两列历史行补 0，
+# 与「还没测过」同义。
+_STATE_V2 = """
+ALTER TABLE upstream_health ADD COLUMN bytes_up_total INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE upstream_health ADD COLUMN bytes_down_total INTEGER NOT NULL DEFAULT 0;
+"""
+
 # position 不加唯一约束：交换两行在唯一索引下要变成三步（先写一个不冲突的
 # 临时值）。规则的每次保存都是整表替换，position 在事务内重编号为 0..N-1，
 # 天然唯一。代价是外部手工改库可能造成重复值，读取侧用 ORDER BY position, id
@@ -152,8 +193,8 @@ INSERT INTO rule_meta (key, value) VALUES ('revision', '0')
 """
 
 _MIGRATIONS: dict[Database, dict[int, str]] = {
-    Database.STATE: {1: _STATE_V1},
-    Database.LOGS: {1: _LOGS_V1},
+    Database.STATE: {1: _STATE_V1, 2: _STATE_V2},
+    Database.LOGS: {1: _LOGS_V1, 2: _LOGS_V2, 3: _LOGS_V3},
     Database.RULES: {1: _RULES_V1},
 }
 
@@ -186,12 +227,18 @@ def open_write(path: Path, database: Database) -> sqlite3.Connection:
     return conn
 
 
-def migrate(conn: sqlite3.Connection, database: Database, *, target: int = SCHEMA_VERSION) -> int:
+def migrate(conn: sqlite3.Connection, database: Database, *, target: int | None = None) -> int:
     """把库迁移到 ``target`` 版本，返回迁移后的版本号。
+
+    ``target`` 缺省时取该库自己的 ``SCHEMA_VERSIONS[database]``——三库版本号
+    互相独立，不能共用一个全局默认值（否则给某一库加迁移步骤会让另外两库在
+    自己的迁移步骤表里 KeyError）。
 
     **降级明确拒绝**：用旧版程序打开新版数据库可能因缺少列而静默写入错误
     数据，报错退出比冒险继续安全。
     """
+    if target is None:
+        target = SCHEMA_VERSIONS[database]
     conn.executescript(_SCHEMA_META)
     current = read_version(conn)
     if current > target:

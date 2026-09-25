@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
@@ -91,6 +92,7 @@ class LogQuery(Pagination):
 
     host: str | None = Field(None, max_length=255)
     upstream: str | None = Field(None, max_length=64)
+    client_addr: str | None = Field(None, max_length=255)
     status: int | None = Field(None, ge=100, le=599)
     since: int | None = Field(None, ge=0)
     until: int | None = Field(None, ge=0)
@@ -99,6 +101,7 @@ class LogQuery(Pagination):
 class LogItem(Model):
     id: int
     request_id: str
+    client_addr: str | None
     host: str
     url: str | None
     method: str
@@ -115,6 +118,13 @@ class LogItem(Model):
     bytes_up: int
     bytes_down: int
     created_at: int
+    # 真实传输量，来自与 ``traffic_log`` 的联表（见 web/queries.py）。``None``
+    # 表示这次尝试从未传输过数据（被切换掉）或响应体仍在流式转发中——
+    # 与「确实传输了 0 字节」是两回事，前端据此展示「—」而不是「0 B」。
+    # ``bytes_up``/``bytes_down`` 保留但恒为 0（DD_STORAGE.md §4.9），是
+    # request_log 表本身的历史字段，仍然对外暴露供审计核对。
+    traffic_bytes_up: int | None
+    traffic_bytes_down: int | None
 
 
 class LogPage(Model):
@@ -124,6 +134,43 @@ class LogPage(Model):
     page: int
     page_size: int
     has_more: bool
+
+
+class HostTrafficQuery(Model):
+    """主机流量榜的筛选条件。``since``/``until`` 缺省时取「今日」。
+
+    「今日」按**服务器进程的本地时区**计算零点（与 DD_DEPLOY.md 的容器时区
+    前提一致：`/etc/localtime` 只读挂载，与宿主一致）——`created_at` 存的是
+    UTC unix 秒，但「今天」是给人看的概念，必须按人所在的时区换算。
+    """
+
+    since: int | None = Field(None, ge=0)
+    until: int | None = Field(None, ge=0)
+    # 不复用 Pagination.page_size：这个接口不分页，只取「前 N 名」，没有
+    # 「下一页」的概念。
+    limit: int = Field(20, ge=1, le=200)
+
+    def resolved_range(self, *, now: datetime | None = None) -> tuple[int, int]:
+        moment = now if now is not None else datetime.now().astimezone()
+        since = self.since
+        if since is None:
+            midnight = moment.replace(hour=0, minute=0, second=0, microsecond=0)
+            since = int(midnight.timestamp())
+        until = self.until if self.until is not None else int(moment.timestamp())
+        return since, until
+
+
+class HostTrafficItem(Model):
+    host: str
+    bytes_up: int
+    bytes_down: int
+    requests: int
+
+
+class HostTrafficResponse(Model):
+    items: list[HostTrafficItem]
+    since: int
+    until: int
 
 
 class SwitchAttempt(Model):
@@ -171,6 +218,10 @@ class UpstreamHealthInfo(Model):
     last_error: str | None
     # 相对时长而非绝对时间：内存里的时间戳是 monotonic，绝对值对客户端无意义。
     last_success_age_seconds: float | None
+    # 累计流量，纯展示字段，不参与任何路由判据。单位是字节，人类可读格式化
+    # （KB/MB/GB）交给前端。
+    bytes_up_total: int
+    bytes_down_total: int
 
 
 class UpstreamHealthItem(UpstreamHealthInfo):

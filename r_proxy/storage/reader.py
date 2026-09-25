@@ -50,6 +50,8 @@ class HealthRow:
     total_success: int
     total_failure: int
     avg_latency_ms: int
+    total_bytes_up: int = 0
+    total_bytes_down: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,10 +146,23 @@ def _load_blocks(
 
 
 def _load_health(conn: sqlite3.Connection) -> tuple[HealthRow, ...]:
-    rows = conn.execute(
-        "SELECT upstream_name, total_success, total_failure, avg_latency_ms FROM upstream_health"
-    ).fetchall()
-    return tuple(HealthRow(row[0], row[1], row[2], row[3]) for row in rows)
+    try:
+        rows = conn.execute(
+            "SELECT upstream_name, total_success, total_failure, avg_latency_ms, "
+            "bytes_up_total, bytes_down_total FROM upstream_health"
+        ).fetchall()
+        return tuple(HealthRow(row[0], row[1], row[2], row[3], row[4], row[5]) for row in rows)
+    except sqlite3.OperationalError:
+        # 读连接在写者线程启动、完成迁移**之前**打开（见 load_initial_state
+        # 的调用顺序），因此从 STATE schema 1 升级到 2 的那一次重启会撞上
+        # 「新列还不存在」。不让这一个查询的失败拖累整个回填（否则粘性映射
+        # 与负面记忆会跟着一起丢），退回旧列集，字节数按「还没测过」处理为 0
+        # ——这本来就是事实：旧库里从未记过这两列。
+        rows = conn.execute(
+            "SELECT upstream_name, total_success, total_failure, avg_latency_ms "
+            "FROM upstream_health"
+        ).fetchall()
+        return tuple(HealthRow(row[0], row[1], row[2], row[3]) for row in rows)
 
 
 def to_monotonic(unix_ts: float, *, now_unix: float, now_mono: float) -> float:

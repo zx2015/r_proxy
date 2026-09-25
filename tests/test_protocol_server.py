@@ -21,9 +21,33 @@ from r_proxy.config.model import (
     UpstreamConfig,
     WebUIConfig,
 )
-from r_proxy.protocol.server import ProxyServer
+from r_proxy.protocol.server import ProxyServer, _client_addr
 from r_proxy.storage.queue import OpKind, WriteOp
 from tests.conftest import FakeServer, start_server
+
+
+class _FakeWriter:
+    """只为 ``_client_addr`` 测试打桩：只需要 ``get_extra_info``。"""
+
+    def __init__(self, peername: object) -> None:
+        self._peername = peername
+
+    def get_extra_info(self, name: str) -> object:
+        assert name == "peername"
+        return self._peername
+
+
+class TestClientAddrExtraction:
+    """采集点见 DD_PROXY.md §4.4：只取 host，不取端口，取不到就是 ``None``。"""
+
+    def test_ipv4_peername_yields_the_host(self) -> None:
+        assert _client_addr(_FakeWriter(("203.0.113.7", 54321))) == "203.0.113.7"
+
+    def test_ipv6_four_tuple_yields_only_the_host(self) -> None:
+        assert _client_addr(_FakeWriter(("::1", 54321, 0, 0))) == "::1"
+
+    def test_missing_peername_yields_none(self) -> None:
+        assert _client_addr(_FakeWriter(None)) is None
 
 
 class RecordingSink:
@@ -534,10 +558,11 @@ class TestRequestLogging:
             )
             rows = self.rows(sink)
             assert len(rows) == 1
-            assert rows[0][1] == http_origin.host
-            assert rows[0][3] == "GET"
-            assert rows[0][4] == "direct"
-            assert rows[0][9] == 200
+            assert rows[0][1] == "127.0.0.1"
+            assert rows[0][2] == http_origin.host
+            assert rows[0][4] == "GET"
+            assert rows[0][5] == "direct"
+            assert rows[0][10] == 200
         finally:
             await server.stop()
 
@@ -572,7 +597,8 @@ class TestRequestLogging:
             )
             rows = self.rows(sink)
             assert len(rows) == 1
-            assert (rows[0][1], rows[0][3], rows[0][4]) == ("example.com", "CONNECT", "p")
+            assert rows[0][1] == "127.0.0.1"
+            assert (rows[0][2], rows[0][4], rows[0][5]) == ("example.com", "CONNECT", "p")
         finally:
             await server.stop()
 
@@ -590,7 +616,8 @@ class TestRequestLogging:
             assert resp.startswith(b"HTTP/1.1 502")
             rows = self.rows(sink)
             assert len(rows) == 1
-            assert rows[0][10] == "no_available_upstream"
+            assert rows[0][1] == "127.0.0.1"
+            assert rows[0][11] == "no_available_upstream"
         finally:
             await server.stop()
 
@@ -617,8 +644,114 @@ class TestRequestLogging:
                 f"GET http://{origin}/ HTTP/1.1\r\nHost: {origin}\r\n\r\n".encode()
             )
             rows = self.rows(sink)
-            assert [(row[4], row[6]) for row in rows] == [("dead", 0), ("direct", 1)]
+            assert [(row[5], row[7]) for row in rows] == [("dead", 0), ("direct", 1)]
             assert len({row[0] for row in rows}) == 1
+            assert len({row[1] for row in rows}) == 1  # 同一连接，来源地址不变
+        finally:
+            await server.stop()
+
+
+class TestTrafficLogging:
+    """字节统计的产出与去向：DD_PROXY §5.2.2/§6.4、DD_STORAGE §4.3b。
+
+    ``request_log`` 的字节列恒为 0（见该类的姊妹说明），真实数字走独立的
+    ``traffic_log``，只在数据传输真正结束（响应体转发完 / 隧道关闭）时才写。
+    """
+
+    @staticmethod
+    def rows(sink: RecordingSink) -> list[tuple[object, ...]]:
+        return [op.payload for op in sink.ops if op.kind is OpKind.TRAFFIC_LOG]
+
+    @staticmethod
+    async def wait_for(sink: RecordingSink, count: int, *, timeout: float = 5.0) -> list:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            rows = TestTrafficLogging.rows(sink)
+            if len(rows) >= count:
+                return rows
+            await asyncio.sleep(0.01)
+        raise AssertionError(f"未在 {timeout}s 内看到 {count} 条 traffic_log 记录")
+
+    async def test_a_forwarded_http_request_is_logged(self, http_origin: FakeServer) -> None:
+        sink = RecordingSink()
+        server = ProxyServer(snapshot(), sink=sink)
+        await server.start()
+        host, port = server.bound_address
+        try:
+            await RunningProxy(server, host, port).request(
+                f"GET http://{http_origin.address}/hello HTTP/1.1\r\n"
+                f"Host: {http_origin.address}\r\n\r\n".encode()
+            )
+            (row,) = await self.wait_for(sink, 1)
+            request_id, host_col, upstream, bytes_up, bytes_down, _ = row
+            assert (host_col, upstream) == (http_origin.host, "direct")
+            # 响应体是回显的请求行（direct 出口按 origin-form 重写请求行，
+            # 具体字节数由 build_request 决定），这里只断言「确实发生过」。
+            assert bytes_down > 0
+            assert bytes_up > 0
+        finally:
+            await server.stop()
+
+    async def test_a_request_to_the_web_ui_port_is_not_logged(
+        self, http_origin: FakeServer
+    ) -> None:
+        sink = RecordingSink()
+        server = ProxyServer(
+            snapshot(webui=WebUIConfig(enabled=True, port=http_origin.port)), sink=sink
+        )
+        await server.start()
+        host, port = server.bound_address
+        try:
+            await RunningProxy(server, host, port).request(
+                f"GET http://{http_origin.address}/api/status HTTP/1.1\r\n"
+                f"Host: {http_origin.address}\r\n\r\n".encode()
+            )
+            await asyncio.sleep(0.05)
+            assert self.rows(sink) == []
+        finally:
+            await server.stop()
+
+    async def test_a_tunnel_is_logged_with_actual_byte_counts(
+        self, fake_proxy: FakeServer
+    ) -> None:
+        sink = RecordingSink()
+        cfg = snapshot(UpstreamConfig(name="p", type="http", address=fake_proxy.address))
+        server = ProxyServer(cfg, sink=sink)
+        await server.start()
+        host, port = server.bound_address
+        try:
+            proxy = RunningProxy(server, host, port)
+            reader, writer = await proxy.open()
+            writer.write(b"CONNECT example.com:443 HTTP/1.1\r\n\r\n")
+            await writer.drain()
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(b"abc")
+            await writer.drain()
+            assert await asyncio.wait_for(reader.readexactly(8), 5) == b"echo:abc"
+            writer.close()
+
+            (row,) = await self.wait_for(sink, 1)
+            request_id, host_col, upstream, bytes_up, bytes_down, _ = row
+            assert (host_col, upstream) == ("example.com", "p")
+            assert bytes_up == 3  # "abc"
+            assert bytes_down == 8  # "echo:abc"
+        finally:
+            await server.stop()
+
+    async def test_a_dead_end_502_produces_no_traffic_row(self) -> None:
+        """一次尝试都没发起，没有字节可记——与 ``request_log`` 不同，后者仍留一行。"""
+        sink = RecordingSink()
+        cfg = snapshot(UpstreamConfig(name="d", type="direct", address=None, enabled=False))
+        server = ProxyServer(cfg, sink=sink)
+        await server.start()
+        host, port = server.bound_address
+        try:
+            resp = await RunningProxy(server, host, port).request(
+                b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n"
+            )
+            assert resp.startswith(b"HTTP/1.1 502")
+            await asyncio.sleep(0.05)
+            assert self.rows(sink) == []
         finally:
             await server.stop()
 

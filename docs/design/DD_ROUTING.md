@@ -8,6 +8,7 @@
 | v1.3.0 | 2026-08-14 | M4 切片 b：新增 §4.7 区分 `clear_circuit`（手动重置熔断、保留累计）与 `reset`（整条移除），并说明对增量落盘的影响 | Agent |
 | v1.4.0 | 2026-08-15 | M4 切片 c：新增 §7.6 手动绑定入口 `bind_manual()` 与「超容优先淘汰 `auto`」——手动绑定被 LRU 挤掉时内存与库不一致，表现为「绑定时好时坏、重启又好了」 | Agent |
 | v1.5.0 | 2026-08-16 | 依生产日志新增 §3.2b 内网直连前置：内网 IP 字面量把 `direct` 提到链首（只重排不裁剪，粘性仍可覆盖），消除内网主机冷启动 60 秒的连接超时 | Agent |
+| v1.6.0 | 2026-09-24 | **流量统计已实现并上线**：§4.2 `UpstreamHealth` 新增 `total_bytes_up`/`total_bytes_down` 累计字段；新增 §4.8「出口累计流量」，说明为何字节累加是独立于 `record_result` 的新方法（字节只有在 relay/pump 完成后才知道，比熔断判定晚得多），以及它如何喂给出口健康看板与落盘。落盘 schema 见 [DD_STORAGE §3](./DD_STORAGE.md)，产出点见 [DD_PROXY §5.2.2/§6.4](./DD_PROXY.md) | Agent |
 
 **对应需求**：[PRD §4.3.6](../requirements/PRD_OVERVIEW.md)（故障归类）、[§4.3.7](../requirements/PRD_OVERVIEW.md)（候选链）、[§4.3.10](../requirements/PRD_OVERVIEW.md)（熔断）、[§4.2.4](../requirements/PRD_OVERVIEW.md)（地址族）、[§4.6](../requirements/PRD_OVERVIEW.md)（粘性）、[§4.9](../requirements/PRD_OVERVIEW.md)（并发）
 
@@ -274,6 +275,9 @@ class UpstreamHealth:
     total_failure: int = 0
     last_success_at: float = 0.0
     last_error: str | None = None
+    # 与熔断状态机无关的两个纯累计字段：见 §4.8。
+    total_bytes_up: int = 0
+    total_bytes_down: int = 0
 
 
 class HealthTable:
@@ -383,6 +387,24 @@ def record_result(self, name, *, ok, kind, now, error=None):
 `clear_circuit` 顺带清 `auth_error`：点重置通常正是因为刚改完上级代理凭据，标志会在下一次认证失败时自己回来。
 
 对落盘也是安全的：`HealthPersister` 用「当前累计 − 上次落盘累计」算增量，`clear_circuit` 不动累计值，因此不会产生负增量（这正是 `reset` 需要配合基线丢弃的原因，见 [DD_STORAGE §4.7](./DD_STORAGE.md)）。
+
+### 4.8 出口累计流量
+
+```python
+def add_traffic(self, name: str, *, bytes_up: int, bytes_down: int) -> None:
+    """累加字节数，与熔断状态机完全无关。"""
+    health = self._health.setdefault(name, UpstreamHealth(name))
+    health.total_bytes_up += bytes_up
+    health.total_bytes_down += bytes_down
+```
+
+**为什么不是 `record_result` 多两个参数就完事**：`record_result` 在一次尝试的**响应头**读到时调用——这正是判断成功/失败、决定要不要切换出口的时刻，此时响应体或隧道数据还一个字节都没传。字节数只有在 `pump`/`relay_bidirectional` **跑完之后**才知道（[DD_PROXY §5.2.2、§6.4](./DD_PROXY.md)），这两个时点隔着一次可能长达数小时的数据传输，把字节参数塞进 `record_result` 的签名只会让调用方在字节还不存在的时候被迫填 0，与 `request_log.bytes_up/down` 早期「先插后改」的坑是同一类错误（[DD_STORAGE §4.9](./DD_STORAGE.md)）。因此设成一个独立方法，由协议层在数据传输真正结束的那一刻单独调用一次。
+
+**不区分成功/失败**：无论这次尝试最终判定为成功还是失败（例如隧道建立后上游中途断线），已经跑出去的字节都是真实发生过的流量，没有理由只统计「成功」的那部分——出口健康看板要回答的是「这个出口扛了多少流量」，不是「这个出口扛的、且没出问题的流量」。
+
+**只有最终交付的那次尝试会调用它**：候选链里试过但被切换掉的出口，从未真正向客户端交付过任何字节（HTTP 在响应头读到前就切换、CONNECT 在 `tunnel.established` 之前就切换，见 [DD_PROXY §5.2.2](./DD_PROXY.md)），因此没有字节可记；这与 `request_log` 「归给最终交付」的既有原则一致，不需要新引入一套「部分尝试的流量算谁的」规则。
+
+**落盘复用 `HEALTH_COUNTERS` 这条已有的写入种类**（[DD_STORAGE §4.3](./DD_STORAGE.md)），只是 payload 从两个增量列（`total_success`、`total_failure`）扩成四个（另加 `total_bytes_up`、`total_bytes_down`）。这条路径本来就是「内存权威、周期性把增量刷进库」的既有机制（`HealthPersister`，[DD_STORAGE §4.3](./DD_STORAGE.md)），字节累计与既有的成功/失败累计是同一类数据（只增不减、允许最终一致、重启可回填），没有理由另起一套持久化机制。
 
 ---
 

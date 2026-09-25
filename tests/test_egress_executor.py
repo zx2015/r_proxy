@@ -931,6 +931,7 @@ class TestRequestLog:
         assert len(rows) == 1
         (
             request_id,
+            client_addr,
             host,
             url,
             method,
@@ -946,10 +947,47 @@ class TestRequestLog:
             *_,
         ) = rows[0]
         assert (request_id, host, method) == ("req-1", "example.com", "GET")
+        assert client_addr is None
         assert url == "http://example.com/"
         assert (upstream_name, priority, attempt_index) == ("a", 7, 0)
         assert (decision_source, rule_origin) == ("priority", None)
         assert (status, error, failure_kind, keep_reason) == (200, None, None, None)
+
+    async def test_client_addr_is_carried_from_execute_into_the_row(self, clock: Clock) -> None:
+        """来源地址在连接层面采集一次，随 ``execute()`` 一路传进日志行。"""
+        snap = make_snapshot(upstream("a"), upstream("b"), routing=ROUTING)
+        state = RuntimeState.from_snapshot(snap)
+        sink = FakeSink()
+        fake = FakeAttempts({"a": [transport_failure("a")], "b": [ok_result("b")]})
+
+        await build_with_sink(clock, state, sink).execute(
+            target(),
+            Decision(chain=("a", "b"), source="priority"),
+            snap,
+            attempt=fake.attempt,
+            discard=fake.discard,
+            request_id="req-addr",
+            client_addr="203.0.113.7",
+        )
+
+        rows = self.rows(sink)
+        # 切换出口不会换客户端：同一 request_id 的每一行都是同一个来源。
+        assert {row[1] for row in rows} == {"203.0.113.7"}
+
+    async def test_client_addr_is_carried_into_a_dead_end_row(self, clock: Clock) -> None:
+        snap = make_snapshot(upstream("a"), routing=ROUTING)
+        state = RuntimeState.from_snapshot(snap)
+        sink = FakeSink()
+
+        build_with_sink(clock, state, sink).note_dead_end(
+            target(),
+            Decision(chain=(), source="rule", rule_position=2, switchable=False, empty_reason="x"),
+            snap,
+            request_id="req-dead",
+            client_addr="203.0.113.9",
+        )
+
+        assert self.rows(sink)[0][1] == "203.0.113.9"
 
     async def test_every_attempt_of_a_switch_gets_its_own_row(self, clock: Clock) -> None:
         """切换链靠这些行重建。只记最终结果就看不到「先试了谁、为什么放弃」。"""
@@ -968,7 +1006,7 @@ class TestRequestLog:
         )
 
         rows = self.rows(sink)
-        assert [(row[4], row[6]) for row in rows] == [("a", 0), ("b", 1)]
+        assert [(row[5], row[7]) for row in rows] == [("a", 0), ("b", 1)]
         assert {row[0] for row in rows} == {"req-2"}
 
     async def test_a_failed_attempt_carries_its_classification(self, clock: Clock) -> None:
@@ -987,8 +1025,8 @@ class TestRequestLog:
         )
 
         first = self.rows(sink)[0]
-        assert first[10] == "TimeoutError"
-        assert first[11] == "route_error"
+        assert first[11] == "TimeoutError"
+        assert first[12] == "route_error"
 
     async def test_a_kept_response_records_why_it_was_not_switched(self, clock: Clock) -> None:
         """`keep_reason` 是「为什么没切」的唯一记录，落不了盘就等于没有。"""
@@ -1007,8 +1045,8 @@ class TestRequestLog:
         )
 
         row = self.rows(sink)[0]
-        assert row[9] == 404
-        assert row[12] == KeepReason.TARGET_HANDLED.name.lower()
+        assert row[10] == 404
+        assert row[13] == KeepReason.TARGET_HANDLED.name.lower()
 
     async def test_a_rule_hit_records_the_rule_position(self, clock: Clock) -> None:
         """用户要能把一行日志对回规则页上的那一行。"""
@@ -1027,7 +1065,7 @@ class TestRequestLog:
         )
 
         row = self.rows(sink)[0]
-        assert (row[7], row[8]) == ("rule", "rules[3]")
+        assert (row[8], row[9]) == ("rule", "rules[3]")
 
     async def test_the_duration_is_measured_around_the_attempt(self, clock: Clock) -> None:
         """耗时由执行器夹在 attempt 两侧测量，而不是让每个尝试回调自己填：
@@ -1052,7 +1090,7 @@ class TestRequestLog:
             request_id="req-7",
         )
 
-        assert self.rows(sink)[0][13] == 250
+        assert self.rows(sink)[0][14] == 250
 
     async def test_nothing_is_written_without_a_request_id(self, clock: Clock) -> None:
         """没有请求身份就没有可归组的链，写下去的行无法与任何请求对应。"""
@@ -1093,8 +1131,8 @@ class TestRequestLog:
 
         rows = self.rows(sink)
         assert len(rows) == 1
-        assert (rows[0][0], rows[0][4], rows[0][8]) == ("req-6", "", "rules[2]")
-        assert rows[0][10] == "rule_target_disabled"
+        assert (rows[0][0], rows[0][5], rows[0][9]) == ("req-6", "", "rules[2]")
+        assert rows[0][11] == "rule_target_disabled"
 
     async def test_a_request_to_the_web_ui_itself_is_not_logged(self, clock: Clock) -> None:
         """仪表盘每 3 秒轮询 `/api/status`，走代理时不该把这些噪声记进
@@ -1170,3 +1208,80 @@ class TestTunnelPrematureDeath:
         for _ in range(5):
             executor.note_tunnel_premature_death("example.com", "a", request_id="r1")
         assert state.health.state_of("a", now=0.0) is HealthState.CLOSED
+
+
+class TestNoteTraffic:
+    """`note_traffic` 与熔断、粘性无关，只做内存累计与落盘两件事（DD_ROUTING §4.8）。"""
+
+    def rows(self, sink: FakeSink) -> list[WriteOp]:
+        return [op for op in sink.ops if op.kind is OpKind.TRAFFIC_LOG]
+
+    async def test_accumulates_bytes_on_the_health_table(self, clock: Clock) -> None:
+        snap = make_snapshot(upstream("a"), routing=ROUTING)
+        state = RuntimeState.from_snapshot(snap)
+        build(clock, state).note_traffic(
+            target(host="example.com"),
+            "a",
+            snap,
+            bytes_up=100,
+            bytes_down=200,
+            request_id="r1",
+        )
+        snapshot = state.health.snapshot_of("a")
+        assert (snapshot.total_bytes_up, snapshot.total_bytes_down) == (100, 200)
+
+    async def test_accumulates_regardless_of_the_circuit_state(self, clock: Clock) -> None:
+        """已经跑出去的字节是真实流量，与这次尝试最终是否判定失败无关。"""
+        snap = make_snapshot(upstream("a"), routing=ROUTING)
+        state = RuntimeState.from_snapshot(snap)
+        for _ in range(5):
+            state.health.record_result("a", ok=False, kind=FailureKind.UPSTREAM_ERROR, now=0.0)
+        assert state.health.state_of("a", now=0.0) is HealthState.OPEN
+
+        build(clock, state).note_traffic(
+            target(host="example.com"), "a", snap, bytes_up=10, bytes_down=20, request_id="r1"
+        )
+        snapshot = state.health.snapshot_of("a")
+        assert (snapshot.total_bytes_up, snapshot.total_bytes_down) == (10, 20)
+
+    async def test_queues_a_traffic_log_row(self, clock: Clock) -> None:
+        snap = make_snapshot(upstream("a"), routing=ROUTING)
+        state = RuntimeState.from_snapshot(snap)
+        sink = FakeSink()
+        build_with_sink(clock, state, sink).note_traffic(
+            target(host="example.com"),
+            "a",
+            snap,
+            bytes_up=10,
+            bytes_down=20,
+            request_id="req-1",
+        )
+        (op,) = self.rows(sink)
+        assert op.payload == ("req-1", "example.com", "a", 10, 20, 1_700_000_000)
+
+    async def test_no_sink_still_updates_memory(self, clock: Clock) -> None:
+        """``--no-web`` 之类没有存储层的场景：内存累计照常生效，只是不落盘。"""
+        snap = make_snapshot(upstream("a"), routing=ROUTING)
+        state = RuntimeState.from_snapshot(snap)
+        build(clock, state).note_traffic(
+            target(host="example.com"), "a", snap, bytes_up=5, bytes_down=5, request_id="r1"
+        )
+        assert state.health.snapshot_of("a").total_bytes_up == 5
+
+    async def test_web_ui_traffic_is_not_recorded(self, clock: Clock) -> None:
+        """否则仪表盘轮询自己产生的连接会把出口健康与主机流量榜都搅乱。"""
+        snap = make_snapshot(
+            upstream("a"), routing=ROUTING, webui=WebUIConfig(enabled=True, port=6061)
+        )
+        state = RuntimeState.from_snapshot(snap)
+        sink = FakeSink()
+        build_with_sink(clock, state, sink).note_traffic(
+            target(host="192.0.2.100", port=6061),
+            "a",
+            snap,
+            bytes_up=10,
+            bytes_down=20,
+            request_id="req-1",
+        )
+        assert self.rows(sink) == []
+        assert state.health.snapshot_of("a").total_bytes_up == 0

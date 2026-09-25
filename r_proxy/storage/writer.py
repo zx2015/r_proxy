@@ -78,8 +78,9 @@ _SQL: dict[OpKind, str] = {
         INSERT INTO upstream_health
             (upstream_name, total_success, total_failure,
              consecutive_failures, avg_latency_ms, circuit_state,
-             cooldown_until, auth_error, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             cooldown_until, auth_error, updated_at,
+             bytes_up_total, bytes_down_total)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(upstream_name) DO UPDATE SET
             total_success        = upstream_health.total_success
                                    + excluded.total_success,
@@ -90,15 +91,24 @@ _SQL: dict[OpKind, str] = {
             circuit_state        = excluded.circuit_state,
             cooldown_until       = excluded.cooldown_until,
             auth_error           = excluded.auth_error,
-            updated_at           = excluded.updated_at
+            updated_at           = excluded.updated_at,
+            bytes_up_total       = upstream_health.bytes_up_total
+                                   + excluded.bytes_up_total,
+            bytes_down_total     = upstream_health.bytes_down_total
+                                   + excluded.bytes_down_total
     """,
     OpKind.REQUEST_LOG: """
         INSERT INTO request_log
-            (request_id, host, url, method, upstream_name, upstream_priority,
-             attempt_index, decision_source, rule_origin, http_status, error,
-             failure_kind, keep_reason, elapsed_ms, bytes_up, bytes_down,
-             created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (request_id, client_addr, host, url, method, upstream_name,
+             upstream_priority, attempt_index, decision_source, rule_origin,
+             http_status, error, failure_kind, keep_reason, elapsed_ms,
+             bytes_up, bytes_down, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """,
+    OpKind.TRAFFIC_LOG: """
+        INSERT INTO traffic_log
+            (request_id, host, upstream_name, bytes_up, bytes_down, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
     """,
     OpKind.CONFIG_AUDIT: """
         INSERT INTO config_audit

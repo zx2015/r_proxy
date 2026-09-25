@@ -23,6 +23,16 @@ MAX_HEADER_COUNT = 100
 SCHEME_DEFAULT_PORT = {"http": 80, "https": 443}
 
 # RFC 9110 §7.6.1：代理必须移除逐跳头部，不得转发。
+#
+# ``transfer-encoding`` **不在此列**：它不是单纯的逐跳元数据，而是描述消息体
+# 边界的框架头。请求体（``protocol/body.py``）与响应体（``protocol/relay.py``
+# 的 ``pump``）都是把 ``chunked`` 编码的原始字节（分块长度行 + 数据 + 结尾
+# CRLF）逐字节转发给下一跳，从不解码再重新编码。若在转发头部时把
+# ``Transfer-Encoding`` 摘掉，对端收到的头部会说「这是一条定长或到连接关闭
+# 为止的消息」，而线上的字节其实仍然带着分块长度行——对端的 HTTP 解析器会把
+# 十六进制长度行当成消息体内容，产生的响应/请求在语义上已损坏（表现为客户端
+# 侧 JSON 解析失败、页面局部功能报错）。只要转发逻辑不解码分块编码，这个头
+# 就必须原样传递，否则头部与实际字节流互相矛盾。
 HOP_BY_HOP = frozenset(
     {
         "connection",
@@ -31,7 +41,6 @@ HOP_BY_HOP = frozenset(
         "proxy-authorization",
         "te",
         "trailer",
-        "transfer-encoding",
         "upgrade",
         # 非标准但被浏览器广泛使用，同样必须终止于代理。
         "proxy-connection",

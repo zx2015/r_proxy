@@ -8,11 +8,11 @@
 """
 
 from r_proxy.storage.queue import Priority, WriteOp, WriteQueue
-from r_proxy.storage.schema import SCHEMA_VERSION, Database, StorageError, migrate, open_write
+from r_proxy.storage.schema import SCHEMA_VERSIONS, Database, StorageError, migrate, open_write
 from r_proxy.storage.writer import WriterMetrics, WriterThread
 
 __all__ = [
-    "SCHEMA_VERSION",
+    "SCHEMA_VERSIONS",
     "Database",
     "Priority",
     "StorageError",

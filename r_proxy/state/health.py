@@ -37,6 +37,9 @@ class UpstreamHealth:
     last_error: str | None = None
     # 叠加在健康状态之上的独立标志，不是第四个状态：出口仍留在候选链里。
     auth_error: bool = False
+    # 与熔断状态机无关的两个纯累计字段，见 HealthTable.add_traffic。
+    total_bytes_up: int = 0
+    total_bytes_down: int = 0
 
 
 class HealthTable:
@@ -120,6 +123,17 @@ class HealthTable:
         """标记凭据错误。不移出候选链——用户可能正在修，或只有部分目标要求认证。"""
         self._health.setdefault(name, UpstreamHealth(name)).auth_error = True
 
+    def add_traffic(self, name: str, *, bytes_up: int, bytes_down: int) -> None:
+        """累加字节数，与熔断状态机完全无关（DD_ROUTING §4.8）。
+
+        独立于 :meth:`record_result`：字节数只有在 relay/pump 完成之后才知道，
+        比响应头读到、判断成功/失败的时刻晚得多。不区分成功/失败——已经跑出去
+        的字节是真实发生过的流量，即便这次尝试最终判定为失败。
+        """
+        health = self._health.setdefault(name, UpstreamHealth(name))
+        health.total_bytes_up += bytes_up
+        health.total_bytes_down += bytes_down
+
     def state_of(self, name: str, *, now: float) -> HealthState:
         """当前状态。Web 查询也必须经此，否则会显示 ``open`` 而实际冷却已过。"""
         self.is_available(name, now=now)
@@ -136,7 +150,15 @@ class HealthTable:
             self.is_available(name, now=now)
         return [dataclasses.replace(h) for h in self._health.values()]
 
-    def restore_counters(self, name: str, *, total_success: int, total_failure: int) -> None:
+    def restore_counters(
+        self,
+        name: str,
+        *,
+        total_success: int,
+        total_failure: int,
+        total_bytes_up: int = 0,
+        total_bytes_down: int = 0,
+    ) -> None:
         """启动回填累计计数，供 Web 展示历史成功率。
 
         **不回填熔断状态**：重启可能正是运维在修网络，带着旧的 ``open``
@@ -145,6 +167,8 @@ class HealthTable:
         health = self._health.setdefault(name, UpstreamHealth(name))
         health.total_success = total_success
         health.total_failure = total_failure
+        health.total_bytes_up = total_bytes_up
+        health.total_bytes_down = total_bytes_down
 
     def reset(self, name: str) -> None:
         self._health.pop(name, None)

@@ -2,6 +2,10 @@
 
 | 版本 | 日期 | 变更说明 | 作者 |
 | :--- | :--- | :--- | :--- |
+| v2.1.7 | 2026-09-24 | 新增 `request_log.client_addr`（客户端来源地址）的 Web 侧接入：§4.2 `_COLUMNS`、`LogItem` 补该列，`LogQuery` 补可选精确匹配过滤；§7.1 前端转义清单补该字段（同样来自不可信流量，与 `host`/`url` 同等对待）；§10.7 看板日志表补「来源」列。落盘与容器网络前提见 [DD_STORAGE §4.9](./DD_STORAGE.md)、[DD_PROXY §4.4](./DD_PROXY.md) | Agent |
+| v2.2.0 | 2026-09-24 | **流量统计已实现并上线**（见 [WEBUI_SPEC §2.1/§3.1](../requirements/WEBUI_SPEC.md)）：①`/api/health`、`/api/upstreams` 新增 `bytes_up_total`/`bytes_down_total`（§4.6、§8.5）；②新增 `GET /api/traffic/hosts`（§4.2b），查 `logs.db` 新表 `traffic_log`，默认时间窗为「今日」（服务器本地时区）；③§10.6 补充：新看板不进 3 秒轮询，走独立的低频刷新（默认 30 秒）；§10.7 看板要点补第五块数据来源 | Agent |
+| v2.2.1 | 2026-09-24 | §10.7 看板日志表去掉 URL、尝试序号两列：URL 与 host 高度重复且占横向空间，尝试序号只在切换事件流里有诊断价值 | Agent |
+| v2.2.2 | 2026-09-24 | §4.2 `query_logs` 新增与 `traffic_log` 的联表：`request_log.bytes_up`/`bytes_down` 恒为 0（DD_STORAGE §4.9），看板「请求日志」的流量列此前直接显示这两个恒零字段，观感是「统计坏了」；改为 `LEFT JOIN (SELECT request_id, bytes_up, bytes_down FROM traffic_log)` 取真实传输量，新增 `LogItem.traffic_bytes_up`/`traffic_bytes_down`（`None` 表示这次尝试从未传输过数据或响应体仍在流式转发中，前端展示「—」而非「0 B」）。子查询只选三列，不会把 `traffic_log` 自己的 `host`/`upstream_name`/`created_at` 带进联表引发歧义；`_COLUMNS` 里的 `request_id`/`bytes_up`/`bytes_down` 相应加 `request_log.` 前缀 | Agent |
 | v2.1.6 | 2026-08-21 | §7 补充：新增 `sqlite3.OperationalError → 503` 的专用错误处理器，慢磁盘/WAL checkpoint 触发的忙锁不再落进兜底的 `500` | Agent |
 | v2.1.5 | 2026-08-18 | §6.1 补第三点：原子写的临时文件必须先 `fchmod(0o600)` 再写内容，`os.replace` 不会自动收紧权限；修复此前每次 Web 写配置都把含明文 `auth_token` 的 `config.toml` 权限从 600 重置为 644 的缺陷，备份文件同一问题一并修复。详见 [DD_DEPLOY §11.8](./DD_DEPLOY.md) | Agent |
 | v2.1.4 | 2026-08-16 | 依生产日志降噪：新增 §5.2.1「失败日志一个窗口只说两次话」，`record_failure()` 改为返回窗口内累计次数，避免一次页面加载刷五条同样的 `WARNING` | Agent |
@@ -242,7 +246,7 @@ async def list_logs(params: LogQueryDep, app: AppDep) -> LogPage:
 ```python
 # r_proxy/web/queries.py
 
-_COLUMNS = "id, request_id, host, url, method, upstream_name, ..."
+_COLUMNS = "id, request_id, client_addr, host, url, method, upstream_name, ..."
 
 
 def query_logs(pool: ReadOnlyPool, q: LogQuery) -> list[sqlite3.Row]:
@@ -262,6 +266,8 @@ def _where(q: LogQuery, *, extra: Sequence[str] = ()) -> tuple[str, tuple[object
         where.append("host = ?"); args.append(q.host)
     if q.upstream:
         where.append("upstream_name = ?"); args.append(q.upstream)
+    if q.client_addr:
+        where.append("client_addr = ?"); args.append(q.client_addr)
     if q.status is not None:
         where.append("http_status = ?"); args.append(q.status)
     if q.since is not None:
@@ -273,6 +279,8 @@ def _where(q: LogQuery, *, extra: Sequence[str] = ()) -> tuple[str, tuple[object
 ```
 
 `clause` 由**固定的字符串字面量**拼接而成，用户输入全部走 `?` 参数。这是唯一安全的动态 WHERE 构造方式——把列名或值直接拼进 SQL 是注入的入口。`_where` 的 `extra` 也只接受代码里写死的字面量条件（目前只有 `attempt_index > 0`），不接受任何来自请求的片段。
+
+`client_addr` 的过滤是**精确匹配**，不做前缀/网段匹配：`LogQuery` 只增加一个 `client_addr: str | None`（校验规则与 `host` 一致，`Field(None, max_length=255)`），语义是「只看这一个来源」，不实现 CIDR 解析——那需要额外依赖或手写网段判断，而看板的筛选场景一般是「盯着某个 IP 的可疑流量」，精确匹配已经够用；真要按网段分析，日志本来就能导出去用别的工具处理。
 
 三处实现上的定案：
 
@@ -295,6 +303,46 @@ rows = await asyncio.to_thread(queries.query_attempts, reader, request_ids)
 第一段 `GROUP BY request_id` + `WHERE attempt_index > 0` 定位「切换过的请求」，第二段按 `request_id IN (...)` 取回完整尝试链（走 `idx_rl_reqid`）。`IN` 的占位符个数由**列表长度**决定、与用户输入无关，`page_size ≤ 1000` 保证不会撞上 SQLite 的参数个数上限。
 
 两段之间保留策略可能刚好清掉某个请求的行，此时该条目直接跳过，而不是返回一条空链。
+
+### 4.2b 主机流量榜的接口与默认时间窗
+
+```python
+# r_proxy/web/routers/status.py
+
+@router.get("/traffic/hosts", dependencies=[Authenticated])
+async def host_traffic(params: HostTrafficQueryDep, app: AppDep) -> HostTrafficResponse:
+    since, until = params.resolved_range()  # 缺省时取「今日」，见下
+    rows = await asyncio.to_thread(
+        queries.query_host_traffic, app.storage.logs_reader, since, until, params.limit
+    )
+    return HostTrafficResponse(
+        items=[HostTrafficItem.model_validate(dict(r)) for r in rows],
+        since=since, until=until,
+    )
+```
+
+```python
+# r_proxy/web/queries.py
+
+def query_host_traffic(
+    pool: ReadOnlyPool, since: int, until: int, limit: int
+) -> list[sqlite3.Row]:
+    """在线程池中执行。区间必须由调用方先解析好——本函数不猜「今天」是哪天。"""
+    sql = """
+        SELECT host, SUM(bytes_up) AS bytes_up, SUM(bytes_down) AS bytes_down,
+               COUNT(*) AS requests
+          FROM traffic_log
+         WHERE created_at >= ? AND created_at < ?
+         GROUP BY host
+         ORDER BY (SUM(bytes_up) + SUM(bytes_down)) DESC
+         LIMIT ?
+    """
+    return pool.query(sql, (since, until, limit))
+```
+
+**默认时间窗在 `HostTrafficQuery.resolved_range()` 里算，不在 `queries.py` 里猜。** `since`/`until` 都是可选参数（与 `LogQuery` 的 `since`/`until` 同一约定：unix 秒），缺省时取「今日」——`since = 今天 00:00:00`、`until = now`。「今天」按**服务器进程的本地时区**计算（`datetime.now().astimezone()` 取零点），这个前提在 [DD_DEPLOY.md](./DD_DEPLOY.md) 里已经存在（容器 `network_mode: host` 之外，时区依赖只读挂载 `/etc/localtime` 与宿主一致），不是本次新增的假设——`created_at` 存的是 UTC unix 秒，但「今天」是给人看的概念，必须按人所在的时区换算，而不是 UTC 的零点。
+
+`limit` 默认 20、上限 200（与 `Pagination.page_size` 同一数量级的常量，不复用 `Pagination` 本身——这个接口不分页，只取「前 N 名」，没有「下一页」的概念，混用会让 `has_more` 之类字段在这里变得没有意义）。
 
 ### 4.3 分页与限制
 
@@ -850,7 +898,7 @@ function text(value) {
 
 function renderLogRow(item) {
   const tr = document.createElement("tr");
-  for (const field of ["host", "url", "upstream_name", "error"]) {
+  for (const field of ["client_addr", "host", "url", "upstream_name", "error"]) {
     const td = document.createElement("td");
     td.textContent = item[field] ?? "";     // 唯一允许的赋值方式
     tr.appendChild(td);
@@ -858,6 +906,8 @@ function renderLogRow(item) {
   return tr;
 }
 ```
+
+`client_addr` 与 `host`/`url` 同等对待，走同一条 `textContent` 路径。它本身不是客户端可任意构造的自由文本（内核给出的是合法 IP 字面量），但转义成本为零、少一个「这个字段安全所以可以特殊处理」的例外分支，比多记一条心智负担更值得。
 
 **`textContent` 而非 `innerHTML`**。这是硬规则，代码审查时应当搜索 `innerHTML` 确认零使用。使用 DOM API 构造节点比模板字符串拼接更啰嗦，但它从机制上排除了 XSS，而不是依赖每个开发者记得调用转义函数。
 
@@ -1060,6 +1110,7 @@ async def reset_health(name: str, request: Request, app: AppDep) -> UpstreamHeal
 | `available` | `health.is_available(name, now=...)` | 与候选链的实际判据同源 |
 | `last_success_age_seconds` | `now - last_success_at` | 内存里是 `monotonic`，绝对值对客户端毫无意义，因此报相对时长；从未成功过时报 `null` 而不是 0 |
 | `success_rate` | 累计计数 | 零尝试时报 `0.0`——「还没跑过」不是「全部成功」 |
+| `bytes_up_total` / `bytes_down_total` | `health.total_bytes_up` / `total_bytes_down` | 累计流量，纯展示字段，不参与任何路由判据；数值单位是字节，人类可读格式化（KB/MB/GB）交给前端，接口不做单位换算 |
 | 排序 | `(priority, name)` | 与候选链顺序一致，看板不必自己重排 |
 
 **不含 `avg_latency_ms`**：内存中尚未统计延迟（`HealthPersister` 落盘时填 0 占位）。回一个 0 会在看板上显示成「平均延迟 0ms」，比缺这一项更容易误导。延迟统计是一项独立待办，见 [MIGRATION §6.4.4](./MIGRATION.md)。
@@ -1408,11 +1459,13 @@ token 面板只在收到 `401` 后出现，不在启动时无条件索要：默�
 
 「失败不清空」是刻意的：网络抖一下就把满屏数据清空，比显示略旧的数据更糟——运维正盯着某一行看的时候尤其如此。
 
+**主机流量榜不进这套 3 秒轮询**：`/api/status`、`/api/health`、`/api/logs` 三个端点都是内存读取或命中索引的小分页查询，3 秒一次的成本可以忽略；`/api/traffic/hosts` 是一次 `GROUP BY` 聚合查询，即便有 `idx_tl_created` 收窄范围，单次开销也明显高于前三者一个数量级。给它单独一档更低频的刷新（默认 30 秒，同样遵守隐藏即暂停、失败不清空、重入跳过这三条规则），避免「看板一次网络往返」被最贵的那块数据拖慢观感。
+
 ### 10.7 各页要点
 
 | 页面 | 值得说明的实现 |
 |------|----------------|
-| 看板 | 三块数据来自三个端点（`/status`、`/health`、`/logs`），一轮里并发发出。失败的那块单独降级，不影响另两块 |
+| 看板 | 四块数据来自四个端点（`/status`、`/health`、`/logs`、`/traffic/hosts`），前三个一轮里并发发出、3 秒一次；`/traffic/hosts`独立 30 秒一档（§10.6）。失败的那块单独降级，不影响其他块。请求日志表新增「来源」列（`client_addr`），值随容器网络模式变化——`network_mode: host` 下是真实客户端 IP，`bridge`+端口映射下是 Docker 网桥地址，见 [DD_PROXY §4.4](./DD_PROXY.md)；**不展示** URL 与尝试序号两列（v2.2.1）——URL 与 host 高度重复且占横向空间，尝试序号只在切换事件流里有诊断价值，`LogItem` 仍保留这两个字段（切换链等其他视图要用），只是看板表格不画。出口健康表新增「流量」列（`bytes_up_total`/`bytes_down_total`，人类可读格式化在前端做）；「主机流量榜」是新增的独立卡片，列为 host / 上行 / 下行 / 请求数，按总流量降序，默认取当日前 20 |
 | 出口 | 拖拽的单位是**优先级组**而非单行（需求 §2.2）。同时给每组 ↑/↓ 按钮：拖拽在键盘上不可达，而需求 §5 要求关键操作可键盘访问 |
 | 粘性 | 每行三个动作：改绑、固化、清除。改绑与固化都是就地展开的面板，两者互斥，见 §10.7.2 |
 | 规则 | 两列表格 + 只读兜底行，见下 |

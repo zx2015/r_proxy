@@ -222,6 +222,40 @@ class TestObservability:
         assert table.state_of("proxy", now=200.0) is HealthState.HALF_OPEN
 
 
+class TestTraffic:
+    def test_add_traffic_accumulates_on_unknown_upstream(self, table: HealthTable) -> None:
+        table.add_traffic("proxy", bytes_up=100, bytes_down=200)
+        snap = table.snapshot_of("proxy")
+        assert (snap.total_bytes_up, snap.total_bytes_down) == (100, 200)
+
+    def test_add_traffic_accumulates_across_calls(self, table: HealthTable) -> None:
+        table.add_traffic("proxy", bytes_up=100, bytes_down=200)
+        table.add_traffic("proxy", bytes_up=50, bytes_down=25)
+        snap = table.snapshot_of("proxy")
+        assert (snap.total_bytes_up, snap.total_bytes_down) == (150, 225)
+
+    def test_add_traffic_is_independent_of_the_circuit_breaker(self, table: HealthTable) -> None:
+        """已经跑出去的字节是真实流量，即便这次尝试最终判定为失败。"""
+        fail(table, "proxy", times=5)
+        table.add_traffic("proxy", bytes_up=10, bytes_down=20)
+        snap = table.snapshot_of("proxy")
+        assert (snap.total_bytes_up, snap.total_bytes_down) == (10, 20)
+        assert table.state_of("proxy", now=10.0) is HealthState.OPEN
+
+    def test_restore_counters_seeds_bytes_from_backfill(self, table: HealthTable) -> None:
+        table.restore_counters(
+            "proxy", total_success=1, total_failure=2, total_bytes_up=300, total_bytes_down=400
+        )
+        snap = table.snapshot_of("proxy")
+        assert (snap.total_bytes_up, snap.total_bytes_down) == (300, 400)
+
+    def test_restore_counters_defaults_bytes_to_zero(self, table: HealthTable) -> None:
+        """旧库升级前从未记过这两列，回填按「还没测过」处理为 0。"""
+        table.restore_counters("proxy", total_success=1, total_failure=0)
+        snap = table.snapshot_of("proxy")
+        assert (snap.total_bytes_up, snap.total_bytes_down) == (0, 0)
+
+
 class TestReset:
     def test_reset_clears_all_state(self, table: HealthTable) -> None:
         fail(table, "proxy", times=5)

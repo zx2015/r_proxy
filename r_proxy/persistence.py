@@ -55,6 +55,8 @@ def apply_initial_state(state: RuntimeState, initial: InitialState) -> None:
             health.upstream,
             total_success=health.total_success,
             total_failure=health.total_failure,
+            total_bytes_up=health.total_bytes_up,
+            total_bytes_down=health.total_bytes_down,
         )
     logger.info(
         "回填粘性 %d 条、负面记忆 %d 条、出口计数 %d 项",
@@ -96,8 +98,11 @@ class HealthPersister:
         # 整个历史总量，被 `+ excluded` 再加一遍——每重启一次计数翻一倍。
         # 播种取库里的值而非内存快照：从 `start()` 到首次 flush 之间完成的请求
         # 确实是新增量，用内存快照当基线会把这些请求吞掉。
-        self._last: dict[str, tuple[int, int]] = (
-            {h.upstream: (h.total_success, h.total_failure) for h in initial.health}
+        self._last: dict[str, tuple[int, int, int, int]] = (
+            {
+                h.upstream: (h.total_success, h.total_failure, h.total_bytes_up, h.total_bytes_down)
+                for h in initial.health
+            }
             if initial is not None
             else {}
         )
@@ -110,11 +115,21 @@ class HealthPersister:
         live = {e.name for e in entries}
         self._last = {name: v for name, v in self._last.items() if name in live}
         for health in entries:
-            success, failure = self._last.get(health.name, (0, 0))
-            delta = (health.total_success - success, health.total_failure - failure)
-            if delta == (0, 0):
+            success, failure, bytes_up, bytes_down = self._last.get(health.name, (0, 0, 0, 0))
+            delta = (
+                health.total_success - success,
+                health.total_failure - failure,
+                health.total_bytes_up - bytes_up,
+                health.total_bytes_down - bytes_down,
+            )
+            if delta == (0, 0, 0, 0):
                 continue
-            self._last[health.name] = (health.total_success, health.total_failure)
+            self._last[health.name] = (
+                health.total_success,
+                health.total_failure,
+                health.total_bytes_up,
+                health.total_bytes_down,
+            )
             self._sink.put(
                 health_counters(
                     upstream=health.name,
@@ -128,6 +143,8 @@ class HealthPersister:
                     cooldown_until=0,
                     auth_error=int(health.auth_error),
                     now_unix=now_unix,
+                    bytes_up_delta=delta[2],
+                    bytes_down_delta=delta[3],
                 )
             )
             written += 1

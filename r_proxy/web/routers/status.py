@@ -24,6 +24,9 @@ from r_proxy.web.deps import AppDep, Authenticated, client_ip
 from r_proxy.web.schemas import (
     ConnectionsInfo,
     HealthResponse,
+    HostTrafficItem,
+    HostTrafficQuery,
+    HostTrafficResponse,
     LogItem,
     LogPage,
     LogQuery,
@@ -40,6 +43,7 @@ from r_proxy.web.schemas import (
 router = APIRouter()
 
 LogQueryDep = Annotated[LogQuery, Depends()]
+HostTrafficQueryDep = Annotated[HostTrafficQuery, Depends()]
 
 
 @router.get("/healthz", include_in_schema=False)
@@ -116,6 +120,20 @@ async def list_switches(params: LogQueryDep, app: AppDep) -> SwitchPage:
         page=params.page,
         page_size=params.page_size,
         has_more=len(found) > params.page_size,
+    )
+
+
+@router.get("/traffic/hosts", dependencies=[Authenticated])
+async def host_traffic(params: HostTrafficQueryDep, app: AppDep) -> HostTrafficResponse:
+    """当日（或指定区间）各 host 的流量排行。"""
+    since, until = params.resolved_range()
+    rows = await asyncio.to_thread(
+        queries.query_host_traffic, app.storage.logs_reader, since, until, params.limit
+    )
+    return HostTrafficResponse(
+        items=[HostTrafficItem.model_validate(dict(row)) for row in rows],
+        since=since,
+        until=until,
     )
 
 

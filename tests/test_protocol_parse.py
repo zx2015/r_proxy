@@ -177,12 +177,24 @@ class TestStripHopByHop:
                     ("Connection", "keep-alive"),
                     ("Proxy-Connection", "keep-alive"),
                     ("Keep-Alive", "timeout=5"),
-                    ("Transfer-Encoding", "chunked"),
                     ("Upgrade", "h2c"),
                 ]
             )
         )
         assert [k.lower() for k, _ in h.items()] == ["host"]
+
+    def test_keeps_transfer_encoding(self) -> None:
+        """``Transfer-Encoding`` 描述消息体的实际字节框架，不是纯粹的逐跳元数据。
+
+        请求体（``protocol/body.py``）与响应体（``pump``）都原样转发
+        ``chunked`` 编码的分块长度行与数据，从不解码重编码。如果这里把头部
+        摘掉，对端收到的头部与线上实际字节框架就自相矛盾——对端会把分块
+        长度行当成消息内容解析，产生的消息在语义上已损坏。
+        """
+        h = strip_hop_by_hop(
+            Headers([("Host", "x.com"), ("Transfer-Encoding", "chunked")])
+        )
+        assert h.get("transfer-encoding") == "chunked"
 
     def test_removes_proxy_authorization(self) -> None:
         """凭据必须终止于代理，且不得进入后续流程或日志。"""

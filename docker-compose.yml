@@ -15,8 +15,13 @@ services:
     environment:
       R_PROXY_CONFIG: /config/config.toml
     volumes:
-      - /var/lib/r-proxy-docker/config:/config
-      - /var/lib/r-proxy-docker/data:/data
+      # 本机（mini-server）独立数据盘挂在 /media/data（见
+      # docs/design/DD_DEPLOY.md §9.x 机器清单），真实的部署数据一直落在
+      # /media/data/r-proxy-docker/{config,data}——不是本文件曾经写的
+      # /var/lib/r-proxy-docker（那条路径在这台机器上从未有数据，是文档模板
+      # 路径与本机实际路径的一次未记录漂移，2026-08-31 更新部署时发现并修正）。
+      - /media/data/r-proxy-docker/config:/config
+      - /media/data/r-proxy-docker/data:/data
       # slim 镜像默认 UTC，不挂时区的话日志时间和宿主差 8 小时。
       - /etc/localtime:/etc/localtime:ro
     # 容器默认 nofile 软限 1024，低于 max_client_connections 所需的余量，

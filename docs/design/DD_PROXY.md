@@ -8,6 +8,8 @@
 | v1.3.0 | 2026-08-21 | 安全修复：新增 §3.1.1，`parse_head` 拒绝裸露 CR/LF——此前请求行 target 中嵌入的裸 `\n` 能一路活到 `RequestTarget.host`，被 `connector.py`/`connection.py` 原样拼进发往出口的请求，构成 HTTP 请求走私/头部注入 | Agent |
 | v1.4.0 | 2026-08-31 | Bug 修复：§3.4 更正——`transfer-encoding` 从 `HOP_BY_HOP` 固定摘除集合中移除。请求体（`body.py`）与响应体（`pump`）都只原样转发 `chunked` 编码的分块字节、从不解码重编码，若摘掉该头部会让对端收到的头部与线上实际字节框架自相矛盾（对端把分块长度行当成消息体内容），表现为经代理访问带 `Transfer-Encoding: chunked` 响应的接口时客户端解析失败（真实案例：内网 Web 应用某个 JSON 接口经代理后前端报「Failed to load this section」）。新增 `tests/test_protocol_chunked_response.py` 端到端复现 | Agent |
 | v1.5.0 | 2026-09-05 | 代码评审整改两处：①§4.3 补「读取客户端请求体」超时行——`_send_body` 此前读客户端 body 完全没有超时，慢速/挂起的客户端会让连接与已建立的出口 socket 一起永久挂起，`max_client_connections` 防不了这种单连接卡死，现复用 `head_read_timeout` 兜底；②§5.2 新增 §5.2.1「1xx 中间响应必须跳过」——`_attempt_http` 此前把上游的 `100 Continue`/`103 Early Hints` 当成最终响应转发，真正的响应被当成它的 body 混入客户端，现循环跳过 1xx 直至读到最终响应。新增 §11「已知限制与后续工作」记录评审中发现但暂未修的两处待观察点。两处修复均新增端到端回归测试（`tests/test_protocol_server.py`） | Agent |
+| v1.6.0 | 2026-09-24 | 新增 §4.4「客户端来源地址的采集」：`ProxyServer._on_client` 在 `Accepted` 状态即取 `writer.get_extra_info("peername")`，随连接对象一路传给 `ClientConnection` 与 `AttemptExecutor`，落盘见 [DD_STORAGE §4.9](./DD_STORAGE.md)；本模块只负责采集与传递，不做可信度判断（准确性依赖容器网络模式，见该节说明） | Agent |
+| v1.7.0 | 2026-09-24 | **流量统计已实现并上线**（见 [WEBUI_SPEC §2.1](../requirements/WEBUI_SPEC.md)）：新增 §5.2.2「HTTP 侧字节数的产出」与 §6.4「隧道字节数的去向」——协议层此前已经准确统计字节（§5.2、§6.3），但只喂给早夭判定，从不外传；本次把这两处已有的统计接到执行器新增的 `note_traffic()` 门面，一份进 `HealthTable` 的内存累计（出口健康看板），一份进 `logs.db` 新表 `traffic_log`（今日主机流量榜，见 [DD_STORAGE §3](./DD_STORAGE.md) / [§4.3b](./DD_STORAGE.md)）。`HttpAttempt` 新增 `bytes_up` 字段承载请求侧字节数 | Agent |
 
 **对应需求**：[PRD §4.1](../requirements/PRD_OVERVIEW.md)、[§4.3.11](../requirements/PRD_OVERVIEW.md)、[§4.3.13](../requirements/PRD_OVERVIEW.md)、[§7.2](../requirements/PRD_OVERVIEW.md)
 
@@ -320,6 +322,31 @@ per-upstream 超时覆盖对应 [PRD §4.3.12](../requirements/PRD_OVERVIEW.md)�
 
 **读取客户端请求体为何此前没有超时、又为何补上（v1.5.0 修复）**：`stream_body()` 从客户端读 body 时，早期实现只有响应阶段（`pump`）与读响应头阶段设了超时，`_send_body` 里对客户端的读取是裸的 `reader.read(...)`——客户端声明 `Content-Length`/chunked 之后慢吞吞地发、或干脆不再发，这个读取会无限期挂起。`max_client_connections` 限的是**同时存在多少个连接**，挡不住「每个连接各自卡死在读 body 这一步」——少量慢体请求就能把连接槽位占满，是一个真实的资源枯竭点。现在用 `head_read_timeout` 包一层：超时按普通传输层失败处理（`request_sent` 仍是 `False`，候选链可以正常切到下一个出口），并记一条 `WARNING`。之所以复用 `head_read_timeout` 而不新增一个专门的配置项：两者本质都是「愿意等客户端把这次请求交代清楚多久」，没有必要为同一语义拆两个旋钮。
 
+### 4.4 客户端来源地址的采集
+
+监控看板的请求日志要能回答「这条流量是从哪台机器发来的」（[PRD §4.3.9](../requirements/PRD_OVERVIEW.md)），落盘字段是 `request_log.client_addr`（[DD_STORAGE §4.9](./DD_STORAGE.md)）。采集点必须尽量靠前：
+
+```python
+# r_proxy/protocol/server.py
+
+async def _on_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    ...
+    peer = writer.get_extra_info("peername")
+    client_addr = str(peer[0]) if peer else None
+    conn = ClientConnection(reader, writer, ..., client_addr=client_addr)
+```
+
+放在 `_on_client`（状态机的 `Accepted` 阶段）而不是在 `AttemptExecutor` 里现取，理由有二：
+
+1. **地址只在连接层面存在一次。** `peername` 是这条 TCP 连接的属性，与请求内容无关；一条连接上只解析一次请求（§4.2 连接不复用），采集一次、随连接对象传下去即可，不需要每次尝试重新查询
+2. **`AttemptExecutor` 不持有 `writer`。** 它只看得到 `RequestTarget` 与 `Decision`（[DD_STORAGE §4.9](./DD_STORAGE.md)已说明这层只看得到切换链，看不到协议层对象），把 socket 相关的取值逻辑塞进去会打破这层边界
+
+`client_addr` 随 `ClientConnection` 构造函数传入，保存为实例属性，`_run()` 里连同 `request_id` 一起交给 `execute()`；候选链为空的「死路」分支（`_log_empty_chain`/`note_dead_end`）同样带上这个值——这类请求虽然一次尝试都没发起，但仍然是「有个真实客户端连上来」，来源信息同样有诊断价值。
+
+**只取 `peername` 的地址部分，不取端口。** `get_extra_info("peername")` 对 IPv4 连接返回 `(host, port)` 二元组，对 IPv6 连接可能是 `(host, port, flowinfo, scopeid)` 四元组；两种情况都只切片取 `[0]`。端口是这次 TCP 连接的临时值，留着没有审计意义（[DD_STORAGE §3.1](./DD_STORAGE.md)）。
+
+**这不是、也不应该做成 `X-Forwarded-For` 那一套。** 这里取的是内核看到的 TCP 对端地址，而不是任何应用层头部——客户端能完全控制自己发出的头部，采信它等于把这一列变成可以被伪造的数据（同样的取舍见 [DD_WEB §5.3](./DD_WEB.md) 的认证限流）。**准确性因此完全取决于容器网络部署模式**：`network_mode: host` 下这是真实客户端 IP，`bridge` + 端口映射下会退化成 Docker 网桥地址（如 `172.17.0.1`），所有经该容器的流量看起来都来自同一个「客户端」。这是部署选型的已知代价而非本模块的缺陷，详见 [DD_DEPLOY.md](./DD_DEPLOY.md)。
+
 ---
 
 ## 5. HTTP 转发
@@ -400,6 +427,23 @@ r-proxy 从不实现 `Expect: 100-continue` 的握手优化（`_send_body` 无�
 
 修复：读到响应头后先判断状态码，若落在 `[100, 200)` 区间就继续读下一段头部，循环直到拿到真正的最终响应，全程仍在同一个 `read_timeout` 窗口内（不会因为多跳 1xx 而无界等待）；连续跳过的 1xx 超过 8 次视为上游行为异常，判为失败。跳过 1xx 时记一条 `INFO` 日志，便于观察这条路径是否被频繁触发（正常情况下应当很少见到）。
 
+### 5.2.2 HTTP 侧字节数的产出
+
+`pump()` 早就返回搬运的总字节数（§5.2 代码块的 `return total`），`_handle_http` 此前**丢弃这个返回值**——响应体转发完就直接进 `finally` 关连接，没有任何调用方关心过这个数字。改动只需要接住它：
+
+```python
+bytes_down = await pump(attempted.conn.reader, self._writer, idle_timeout=self._idle_timeout)
+```
+
+请求侧（`bytes_up`）没有现成的返回值可接，因为写往上游发生在 `_attempt_http`（构造请求行/头部 + 转发请求体），而不是 `_handle_http`。两处都已经拿得到字节数，只是从未累加过：
+
+- 请求头：`build_request(...)` 的返回值本身就是 `bytes`，`len(...)` 即头部字节数
+- 请求体：`_send_body` 的 `sink(chunk)` 回调此前只做两件事（写进 `ReplayBuffer`、写往出口 socket），加一句计数即可；重放路径（`self._body_consumed` 为真时）走 `self._replay.replay_into(...)`，字节数等于重放缓冲区当前长度
+
+这两个数字之和记进 `HttpAttempt.bytes_up`（新增字段），随成功的尝试结果一路带到 `_handle_http`。**只有最终被交付给客户端的那次尝试**需要这个字段——之前失败重试的尝试确实也消耗了带宽，但那些字节从未变成客户端能看到的响应，不计入「这次请求的流量」，与 `request_log` 早已确立的「归给最终交付」原则（§4.9 下方，[DD_STORAGE](./DD_STORAGE.md)）保持一致。
+
+字节数的去向（内存累计 + 落盘）在协议层之外，见 [DD_STORAGE §4.3b](./DD_STORAGE.md) 与 [DD_ROUTING §4.8](./DD_ROUTING.md)。
+
 ### 5.3 请求体已发出后失败：为何不能无脑重投（v1.5.0 相关，判据见 [DD_SWITCHING.md](./DD_SWITCHING.md)）
 
 `_attempt_http` 把「连接失败」与「请求已发出但等响应失败（超时/对端悄悄断开）」归并成同一种 `outcome.status is None` 的传输层失败上报给判据层。这两者风险完全不同：前者字节没发出去，换个出口重投绝对安全；后者（尤其是非幂等的 POST/PATCH）请求体可能已经被出口完整收到并处理，无脑重投等价于让一次下单/扣款类调用被执行两次。DD_SWITCHING.md v1.4.0 已经在判据层补上 `request_sent`/方法幂等性的门控，本节记录这一约束对协议层的要求：`ClientConnection._request_sent` 必须严格在「请求行、头部、请求体全部写入 socket 且 `drain()` 成功」之后才置位，提前置位会让判据层误以为字节没发出去而放行本不该发生的重投；置位太晚（例如漏掉 `drain()` 失败的分支）则会让本可以安全重投的请求被误判为「已发出」而放弃重试。
@@ -474,6 +518,27 @@ async def _relay(self, conn: UpstreamConn, ctx: RequestContext) -> None:
 隧道关闭时的判定见 [DD_SWITCHING §8](./DD_SWITCHING.md)。协议层只负责准确统计字节数与存活时长，判定逻辑在决策层。
 
 `on_bytes` 回调而非在 `pump` 内部直接累加：`pump` 是通用函数（HTTP 响应体转发也用它），不应该知道隧道统计的存在。
+
+### 6.4 隧道字节数的去向
+
+`RelayStats.bytes_up`/`bytes_down` 早夭统计一直在准确地算（§6.3），只是此前只喂给 `_note_premature_death` 这一个消费者，字节数本身用完即弃。新增第二个消费者：`_handle_connect` 的 `finally` 块里，紧挨着 `self._note_premature_death(...)` 之后，再调一次 `self._executor.note_traffic(...)`：
+
+```python
+finally:
+    await tunnel.close()
+    self._note_premature_death(target, upstream_name, stats)
+    self._executor.note_traffic(
+        target.host, upstream_name,
+        bytes_up=stats.bytes_up, bytes_down=stats.bytes_down,
+        request_id=self.request_id,
+    )
+```
+
+三点设计取舍：
+
+1. **只在隧道关闭时上报一次，不是边传边报。** `on_bytes` 回调每个 64KB chunk 触发一次，若在这里也调用 `note_traffic`（进而入队一次数据库写入）， 大文件下载会把写队列打爆——`RelayStats` 已经在内存里精确累加，关闭时读一次总数完全够用。代价是**长连接的流量只在断开那一刻才可见**：一个跑三小时的下载，看板在它结束之前看不到这部分字节。这是有意的取舍，不是遗漏——出口健康看板与主机流量榜都是「事后统计」的展示面，不是实时流量计，接受这个滞后换取写路径不被拖垮
+2. **`finally` 保证异常路径也会上报。** `relay_bidirectional` 抛出的 `OSError`/`TimeoutError` 已被外层吞掉，`stats` 里累计的字节是真实发生过的流量（哪怕隧道最终是异常结束的），不上报等于让这部分真实流量凭空消失
+3. **`note_traffic` 不影响熔断与早夭判定。** 它只做两件与路由决策无关的事——见 [DD_ROUTING §4.8](./DD_ROUTING.md) 与 [DD_STORAGE §4.3b](./DD_STORAGE.md)：出口维度的内存累计（供出口健康看板）、`logs.db` 里落一行 `traffic_log`（供主机流量榜）
 
 ---
 

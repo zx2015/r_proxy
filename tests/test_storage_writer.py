@@ -28,10 +28,11 @@ from r_proxy.storage.queue import (
     sticky_hit,
     sticky_manual_upsert,
     sticky_upsert,
+    traffic_log,
 )
 from r_proxy.storage.retention import Retention
 from r_proxy.storage.schema import (
-    SCHEMA_VERSION,
+    SCHEMA_VERSIONS,
     Database,
     StorageError,
     migrate,
@@ -53,11 +54,14 @@ def db_config(tmp_path: Path, **kwargs: object) -> DatabaseConfig:
     return DatabaseConfig(**defaults)  # type: ignore[arg-type]
 
 
-def request_log(request_id: str = "rid", host: str = "example.com") -> WriteOp:
+def request_log(
+    request_id: str = "rid", host: str = "example.com", client_addr: str | None = "203.0.113.1"
+) -> WriteOp:
     return WriteOp(
         OpKind.REQUEST_LOG,
         (
             request_id,
+            client_addr,
             host,
             f"http://{host}/",
             "GET",
@@ -115,7 +119,7 @@ class TestSchema:
     def test_fresh_database_is_at_the_current_version(self, tmp_path: Path) -> None:
         conn = open_write(tmp_path / "state.db", Database.STATE)
         try:
-            assert read_version(conn) == SCHEMA_VERSION
+            assert read_version(conn) == SCHEMA_VERSIONS[Database.STATE]
         finally:
             conn.close()
 
@@ -124,7 +128,7 @@ class TestSchema:
         open_write(path, Database.STATE).close()
         conn = open_write(path, Database.STATE)
         try:
-            assert migrate(conn, Database.STATE) == SCHEMA_VERSION
+            assert migrate(conn, Database.STATE) == SCHEMA_VERSIONS[Database.STATE]
         finally:
             conn.close()
 
@@ -136,12 +140,82 @@ class TestSchema:
             conn.execute(
                 "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?)"
                 " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (str(SCHEMA_VERSION + 5),),
+                (str(SCHEMA_VERSIONS[Database.STATE] + 5),),
             )
         finally:
             conn.close()
         with pytest.raises(StorageError):
             open_write(path, Database.STATE)
+
+    def test_logs_db_migrates_client_addr_column_in_place(self, tmp_path: Path) -> None:
+        """已在跑的库（只有 v1 的 request_log）升级后必须自动补上 client_addr 列。"""
+        path = tmp_path / "logs.db"
+        conn = open_write(path, Database.LOGS)
+        conn.close()
+        # 模拟一个仍停在版本 1 的历史库：把 schema_version 拨回 1，
+        # 且该版本本来就没有 client_addr 列（v1 建表脚本没有这一列）。
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute(
+                "UPDATE schema_meta SET value = '1' WHERE key = 'schema_version'"
+            )
+            conn.execute("ALTER TABLE request_log DROP COLUMN client_addr")
+            conn.commit()
+        finally:
+            conn.close()
+
+        conn = open_write(path, Database.LOGS)
+        try:
+            assert read_version(conn) == SCHEMA_VERSIONS[Database.LOGS]
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(request_log)")}
+            assert "client_addr" in columns
+        finally:
+            conn.close()
+
+    def test_logs_db_migrates_traffic_log_table_in_place(self, tmp_path: Path) -> None:
+        """已在跑的库（停在 v2，没有 traffic_log）升级后必须自动建出这张表。"""
+        path = tmp_path / "logs.db"
+        conn = open_write(path, Database.LOGS)
+        conn.close()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("UPDATE schema_meta SET value = '2' WHERE key = 'schema_version'")
+            conn.execute("DROP TABLE traffic_log")
+            conn.commit()
+        finally:
+            conn.close()
+
+        conn = open_write(path, Database.LOGS)
+        try:
+            assert read_version(conn) == SCHEMA_VERSIONS[Database.LOGS]
+            tables = {
+                r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            assert "traffic_log" in tables
+        finally:
+            conn.close()
+
+    def test_state_db_migrates_traffic_columns_in_place(self, tmp_path: Path) -> None:
+        """已在跑的库（只有 v1 的 upstream_health）升级后必须自动补上两个字节列。"""
+        path = tmp_path / "state.db"
+        conn = open_write(path, Database.STATE)
+        conn.close()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("UPDATE schema_meta SET value = '1' WHERE key = 'schema_version'")
+            conn.execute("ALTER TABLE upstream_health DROP COLUMN bytes_up_total")
+            conn.execute("ALTER TABLE upstream_health DROP COLUMN bytes_down_total")
+            conn.commit()
+        finally:
+            conn.close()
+
+        conn = open_write(path, Database.STATE)
+        try:
+            assert read_version(conn) == SCHEMA_VERSIONS[Database.STATE]
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(upstream_health)")}
+            assert {"bytes_up_total", "bytes_down_total"} <= columns
+        finally:
+            conn.close()
 
     def test_strict_tables_reject_a_string_in_an_integer_column(self, tmp_path: Path) -> None:
         conn = open_write(tmp_path / "state.db", Database.STATE)
@@ -202,6 +276,8 @@ class TestSchema:
         assert "host_upstream" not in names[Database.LOGS]
         assert "request_log" in names[Database.LOGS]
         assert "request_log" not in names[Database.STATE]
+        assert "traffic_log" in names[Database.LOGS]
+        assert "traffic_log" not in names[Database.STATE]
 
 
 class TestMerge:
@@ -268,6 +344,8 @@ class TestMerge:
                 cooldown_until=0,
                 auth_error=0,
                 now_unix=1,
+                bytes_up_delta=100,
+                bytes_down_delta=200,
             ),
             health_counters(
                 upstream="a",
@@ -279,11 +357,14 @@ class TestMerge:
                 cooldown_until=99,
                 auth_error=0,
                 now_unix=2,
+                bytes_up_delta=50,
+                bytes_down_delta=25,
             ),
         ]
         merged = merge(ops)
         assert len(merged) == 1
         assert merged[0].payload[1:6] == (3, 3, 3, 40, "open")
+        assert merged[0].payload[9:11] == (150, 225)
 
     def test_route_block_upserts_are_not_summed(self) -> None:
         """fail_count 的自增在 SQL 侧（+1 per 语句），payload 里没有增量列。
@@ -381,6 +462,46 @@ class TestWriterThread:
             rows = w.state_rows("SELECT hit_count FROM host_upstream")
         assert rows == [(5,)]
 
+    def test_health_bytes_accumulate_across_batches(self, tmp_path: Path) -> None:
+        """出口累计流量走同一条自增路径，不因分批落盘而丢失或翻倍。"""
+        with RunningWriter(tmp_path) as w:
+            w.queue.put(
+                health_counters(
+                    upstream="a",
+                    success_delta=1,
+                    failure_delta=0,
+                    consecutive_failures=0,
+                    avg_latency_ms=0,
+                    circuit_state="closed",
+                    cooldown_until=0,
+                    auth_error=0,
+                    now_unix=1,
+                    bytes_up_delta=100,
+                    bytes_down_delta=200,
+                )
+            )
+            w.flush()
+            w.queue.put(
+                health_counters(
+                    upstream="a",
+                    success_delta=1,
+                    failure_delta=0,
+                    consecutive_failures=0,
+                    avg_latency_ms=0,
+                    circuit_state="closed",
+                    cooldown_until=0,
+                    auth_error=0,
+                    now_unix=2,
+                    bytes_up_delta=50,
+                    bytes_down_delta=25,
+                )
+            )
+            w.flush()
+            rows = w.state_rows(
+                "SELECT bytes_up_total, bytes_down_total FROM upstream_health"
+            )
+        assert rows == [(150, 225)]
+
     def test_timestamps_never_go_backwards(self, tmp_path: Path) -> None:
         """CC-08：乱序落盘的批次不该让「最后成功时间」倒退。"""
         with RunningWriter(tmp_path) as w:
@@ -450,6 +571,26 @@ class TestWriterThread:
             w.flush()
             rows = w.log_rows("SELECT request_id FROM request_log ORDER BY id")
         assert [r[0] for r in rows] == ["rid-0", "rid-1", "rid-2"]
+
+    def test_traffic_log_rows_are_appended_not_merged(self, tmp_path: Path) -> None:
+        """每次上报都是独立事实：同一 host 的多次流量应保留成多行。"""
+        with RunningWriter(tmp_path) as w:
+            for i in range(3):
+                w.queue.put(
+                    traffic_log(
+                        request_id=f"rid-{i}",
+                        host="example.com",
+                        upstream="a",
+                        bytes_up=10,
+                        bytes_down=20,
+                        now_unix=int(time.time()),
+                    )
+                )
+            w.flush()
+            rows = w.log_rows(
+                "SELECT host, bytes_up, bytes_down FROM traffic_log ORDER BY id"
+            )
+        assert rows == [("example.com", 10, 20)] * 3
 
     def test_state_and_logs_go_to_their_own_files(self, tmp_path: Path) -> None:
         with RunningWriter(tmp_path) as w:

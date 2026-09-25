@@ -133,11 +133,26 @@ class ProxyServer:
             self._executor,
             head_read_timeout=self._head_read_timeout,
             idle_timeout=self._idle_timeout,
+            client_addr=_client_addr(writer),
         )
         task = asyncio.create_task(conn.handle())
         # add_done_callback 同时承担计数与清理，不需要额外的计数器。
         self._active.add(task)
         task.add_done_callback(self._active.discard)
+
+
+def _client_addr(writer: asyncio.StreamWriter) -> str | None:
+    """连接层面只采集一次（DD_PROXY.md §4.4），随连接对象传下去。
+
+    ``peername`` 对 IPv4 是 ``(host, port)``，对 IPv6 可能是 4 元组（含
+    ``flowinfo``、``scopeid``）；两种情况都只取 ``host``，端口留着没有审计
+    价值。理论上 ``get_extra_info`` 也可能拿不到（连接已被撤销等边界情况），
+    此时返回 ``None``，不应让整条请求日志因此写入失败。
+    """
+    peer = writer.get_extra_info("peername")
+    if not peer:
+        return None
+    return str(peer[0])
 
 
 async def _reject(writer: asyncio.StreamWriter) -> None:

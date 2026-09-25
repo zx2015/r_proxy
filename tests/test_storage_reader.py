@@ -157,6 +157,54 @@ class TestHealthBackfill:
         (row,) = load(cfg).health
         assert not hasattr(row, "circuit_state")
 
+    def test_traffic_bytes_are_restored(self, tmp_path: Path) -> None:
+        cfg = seed(
+            tmp_path,
+            [
+                (
+                    "INSERT INTO upstream_health"
+                    " (upstream_name, bytes_up_total, bytes_down_total, updated_at)"
+                    " VALUES ('up1', 300, 400, 1)",
+                    (),
+                )
+            ],
+        )
+        (row,) = load(cfg).health
+        assert (row.total_bytes_up, row.total_bytes_down) == (300, 400)
+
+    def test_missing_traffic_columns_fall_back_without_losing_other_state(
+        self, tmp_path: Path
+    ) -> None:
+        """升级前一次重启：state.db 还是旧 schema，两个字节列不存在。
+
+        这一个查询失败不能拖累整个回填——粘性映射与负面记忆必须照常恢复。
+        """
+        cfg = seed(
+            tmp_path,
+            [
+                sticky_row("a.com", "up1", updated_at=100),
+                (
+                    "INSERT INTO upstream_health"
+                    " (upstream_name, total_success, total_failure, updated_at)"
+                    " VALUES ('up1', 5, 1, 1)",
+                    (),
+                ),
+            ],
+        )
+        conn = sqlite3.connect(cfg.state_path)
+        try:
+            conn.execute("ALTER TABLE upstream_health DROP COLUMN bytes_up_total")
+            conn.execute("ALTER TABLE upstream_health DROP COLUMN bytes_down_total")
+            conn.commit()
+        finally:
+            conn.close()
+
+        state = load(cfg)
+        assert len(state.sticky) == 1
+        (row,) = state.health
+        assert (row.total_success, row.total_failure) == (5, 1)
+        assert (row.total_bytes_up, row.total_bytes_down) == (0, 0)
+
 
 class TestCorruptDatabase:
     def test_a_broken_file_yields_an_empty_state(self, tmp_path: Path) -> None:

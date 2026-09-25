@@ -2,6 +2,8 @@
 
 | 版本 | 日期 | 变更说明 | 作者 |
 | :--- | :--- | :--- | :--- |
+| v1.9.0 | 2026-09-24 | 新增 `request_log.client_addr`（客户端来源地址）：§3 schema 补列，§3.1 补取舍说明，§3.2 补 `logs.db` schema 版本 1→2 的迁移步骤示例，§4.9 补字段来源（`ProxyServer._on_client` 的 `peername`）与容器网络前提（依赖 `network_mode: host`，见 [DD_DEPLOY.md](./DD_DEPLOY.md)） | Agent |
+| v1.10.0 | 2026-09-24 | **流量统计已实现并上线**（见 [WEBUI_SPEC §2.1](../requirements/WEBUI_SPEC.md)）：①`state.db` 的 `upstream_health` 新增 `bytes_up_total`/`bytes_down_total`（`STATE` schema 1→2），供出口健康看板；②`logs.db` 新增 `traffic_log` 表（`LOGS` schema 2→3），每个成功交付的请求关闭/结束时落一行，供「当日主机流量榜」按 `created_at` 有界聚合，不依赖全表扫描；③§4.3 新增 §4.3b 关键 SQL；④§5 启动回填新增两个字节字段；⑤§6 清理任务把 `traffic_log` 并入既有的 `request_log` 保留策略。生产端见 [DD_PROXY §5.2.2/§6.4](./DD_PROXY.md)，内存侧见 [DD_ROUTING §4.8](./DD_ROUTING.md) | Agent |
 | v1.8.0 | 2026-08-23 | §4.9 补「排除对 Web UI 自身的访问」：目标端口等于 `webui.port` 时不写 `request_log`，理由与只比端口不比 host 的取舍 | Agent |
 | v1.7.0 | 2026-08-21 | 代码评审整改：§4.6 补严重积压日志限频（`WriteQueue.put` 同一秒内的丢弃只报一次摘要，避免极端 QPS 下逐条打印刷屏）；§4.7 补 `HealthPersister.run` 取消时的最后一次落盘（`try...finally`，覆盖关停前不足一个周期的窗口） | Agent |
 | v1.0.0 | 2026-08-13 | 初始版本：双库划分与 schema、唯一写者线程、批量事务与写入合并、有界队列与分级丢弃、启动回填、日志清理、只读连接 | Agent |
@@ -129,7 +131,9 @@ CREATE TABLE IF NOT EXISTS upstream_health (
                                          ('closed', 'open', 'half_open')),
     cooldown_until        INTEGER NOT NULL DEFAULT 0,
     auth_error            INTEGER NOT NULL DEFAULT 0,
-    updated_at            INTEGER NOT NULL
+    updated_at            INTEGER NOT NULL,
+    bytes_up_total        INTEGER NOT NULL DEFAULT 0,  -- 见 §3.2
+    bytes_down_total      INTEGER NOT NULL DEFAULT 0
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -144,6 +148,7 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 CREATE TABLE IF NOT EXISTS request_log (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     request_id         TEXT    NOT NULL,
+    client_addr        TEXT,                    -- 客户端来源 IP，见 §4.9
     host               TEXT    NOT NULL,
     url                TEXT,
     method             TEXT    NOT NULL,
@@ -179,6 +184,20 @@ CREATE TABLE IF NOT EXISTS config_audit (
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS idx_ca_created ON config_audit(created_at DESC);
+
+-- 见 §3.2、§4.3b
+CREATE TABLE IF NOT EXISTS traffic_log (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id     TEXT    NOT NULL,
+    host           TEXT    NOT NULL,
+    upstream_name  TEXT    NOT NULL,
+    bytes_up       INTEGER NOT NULL DEFAULT 0,
+    bytes_down     INTEGER NOT NULL DEFAULT 0,
+    created_at     INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_tl_created ON traffic_log(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tl_host    ON traffic_log(host, created_at DESC);
 ```
 
 ```sql
@@ -208,6 +227,9 @@ CREATE TABLE IF NOT EXISTS rule_meta (
 | 索引均为 `DESC` | 所有查询都是「最近的 N 条」，降序索引避免排序步骤 |
 | `idx_rl_reqid` | 支撑 [PRD §4.3.9](../requirements/PRD_OVERVIEW.md)：用户拿 `request_id` 到 Web 界面查完整失败链 |
 | `request_log` 增加 `failure_kind`、`keep_reason` | 需求原表缺这两列，但「为什么没有切换」是明确的可诊断性要求（[PRD §4.3.5](../requirements/PRD_OVERVIEW.md)），必须落盘 |
+| `request_log.client_addr` 只存 IP，不存端口 | 端口是每次 TCP 连接的临时值，同一客户端两次请求端口大概率不同，无审计价值；只留 IP 才是「这条流量从哪台机器来的」的可用粒度。列允许 `NULL`：`get_extra_info("peername")` 理论上可能取不到（连接已被撤销等边界情况），此时不应让整条日志写入失败 |
+| `traffic_log` 与 `request_log` 分表 | `request_log` 是「每次尝试一行」的审计粒度，`bytes_up`/`bytes_down` 恒为 0（§4.9）；流量统计要的是「每个成功交付的请求一行、字节数是真实终值」，粒度和产出时点都不同。硬塞进 `request_log` 要么违反「只插不改」（响应体转发完才知道字节数，那时对应的尝试行早已插入），要么让同一请求的多次尝试行重复计入总流量。拆成独立表，`request_log` 的既有语义与查询都不受影响 |
+| `traffic_log` 无 `attempt_index`/`failure_kind` 等审计字段 | 它不是诊断「为什么切换」的表，只回答「谁产生了多少流量」；混入审计字段只会让聚合查询多背负无关的列 |
 | `route_block` 无 TTL 清理索引外的机制 | 依赖 `blocked_until` 索引的定期清理，见 §6.2 |
 | `host_upstream.source` 无 `'rule'` | 规则命中不写粘性（[PRD §4.4.4](../requirements/PRD_OVERVIEW.md)），`CHECK` 约束把这条语义固化进 schema |
 | `rule.position` **不加**唯一约束 | 见下方说明 |
@@ -243,6 +265,15 @@ def migrate(conn: sqlite3.Connection, target: int = SCHEMA_VERSION) -> None:
 版本号存在 `schema_meta` 而非 `PRAGMA user_version`：后者是单个整数，无法记录迁移时间、程序版本等辅助信息，而 `schema_meta` 是通用键值表，后续需要存别的元信息时不必再加表。
 
 **降级明确拒绝**。用旧版程序打开新版数据库可能因缺少列而静默写入错误数据，报错退出比冒险继续安全。
+
+**三库各自独立计数版本号**（`_MIGRATIONS: dict[Database, dict[int, str]]`），互不影响。`logs.db` 新增 `client_addr` 列是第一次真实发生的迁移：`_LOGS_V1` 是建表时的全量 DDL 不再改动，新增一步 `_LOGS_V2 = "ALTER TABLE request_log ADD COLUMN client_addr TEXT;"`，`Database.LOGS` 的 `SCHEMA_VERSION` 由 1 升到 2。已经在跑的实例升级后自动补齐这一列（历史行该列为 `NULL`，与「解析不到地址」的运行时语义一致，读取侧不需要区分这两种情况）；全新安装则直接建出含该列的表——**物理列顺序与 §3 展示的 DDL 不同**（`ALTER TABLE ADD COLUMN` 总是把新列追加在表尾），但因为所有读写路径都显式列出列名（见 §4.9、`web/queries.py` 的 `_COLUMNS`），列的物理顺序不影响任何行为，仅仅是 `PRAGMA table_info` 里看到的顺序会不一致。
+
+**流量统计涉及两处迁移**：
+
+- `Database.STATE` 由 1 升到 2：`_STATE_V2 = "ALTER TABLE upstream_health ADD COLUMN bytes_up_total INTEGER NOT NULL DEFAULT 0; ALTER TABLE upstream_health ADD COLUMN bytes_down_total INTEGER NOT NULL DEFAULT 0;"`。历史行两列均补 `0`——「这个出口在升级前扛过多少流量」本来就无从统计，`0` 与「还没测过」同义，不会被误读成「这个出口没流量」（看板会连同 `updated_at` 一起展示，用户能看出这是刚升级的新计数）
+- `Database.LOGS` 由 2 升到 3：`_LOGS_V3` 是整段 `CREATE TABLE IF NOT EXISTS traffic_log (...)` DDL（新表，不是给已有表加列，因此用 `CREATE TABLE` 而非 `ALTER TABLE`）
+
+两处都遵循同一条既有规则：**迁移脚本只增不改**，`_STATE_V1`/`_LOGS_V1`/`_LOGS_V2` 的定义原样保留，新步骤各自成一个新的字典条目。
 
 ---
 
@@ -362,8 +393,9 @@ _SQL = {
         INSERT INTO upstream_health
             (upstream_name, total_success, total_failure,
              consecutive_failures, avg_latency_ms, circuit_state,
-             cooldown_until, auth_error, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             cooldown_until, auth_error, updated_at,
+             bytes_up_total, bytes_down_total)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(upstream_name) DO UPDATE SET
             total_success        = upstream_health.total_success + excluded.total_success,
             total_failure        = upstream_health.total_failure + excluded.total_failure,
@@ -372,7 +404,9 @@ _SQL = {
             circuit_state        = excluded.circuit_state,
             cooldown_until       = excluded.cooldown_until,
             auth_error           = excluded.auth_error,
-            updated_at           = excluded.updated_at
+            updated_at           = excluded.updated_at,
+            bytes_up_total       = upstream_health.bytes_up_total + excluded.bytes_up_total,
+            bytes_down_total     = upstream_health.bytes_down_total + excluded.bytes_down_total
     """,
 
     "route_block_upsert": """
@@ -386,6 +420,15 @@ _SQL = {
             last_failure_at = excluded.last_failure_at,
             blocked_until   = excluded.blocked_until
     """,
+
+    # 见 §4.3b。纯 INSERT，无 key_slots：每次上报都是独立的事实，
+    # 不与同批次的其他行合并——同一 host 短时间内的多次流量本就该是多行，
+    # 合并成一行会让「主机流量榜」的 requests 计数失真。
+    "traffic_log": """
+        INSERT INTO traffic_log
+            (request_id, host, upstream_name, bytes_up, bytes_down, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """,
 }
 ```
 
@@ -397,7 +440,27 @@ _SQL = {
 4. **`MAX(last_success_at, excluded.last_success_at)`**：时间戳单调保护（RC-06）。乱序落盘的批次不会让时间倒退
 5. **`consecutive_failures = excluded.consecutive_failures`**（覆盖而非自增）：它是内存中的权威值，不是增量。混淆这两类字段是最容易出的错——把覆盖写成自增，计数会翻倍；把自增写成覆盖，并发批次会互相丢失
 
-自增列还有一条不那么显眼的配套要求：**计算增量的基线必须与启动回填同源**。`HealthPersister` 用「当前累计 − 上次落盘累计」算增量，而 `apply_initial_state` 已经把库里的历史值装进了内存健康表；基线若从零起算，首次落盘的增量就是整个历史总量，被 `+ excluded` 再加一遍，每重启一次计数翻一倍。2026-08-16 的容器化验证暴露了这个缺陷，修复是把回填用的 `InitialState` 一并交给 `HealthPersister` 播种基线，详见 [DD_DEPLOY §9.1](./DD_DEPLOY.md)。
+自增列还有一条不那么显眼的配套要求：**计算增量的基线必须与启动回填同源**。`HealthPersister` 用「当前累计 − 上次落盘累计」算增量，而 `apply_initial_state` 已经把库里的历史值装进了内存健康表；基线若从零起算，首次落盘的增量就是整个历史总量，被 `+ excluded` 再加一遍，每重启一次计数翻一倍。2026-08-16 的容器化验证暴露了这个缺陷，修复是把回填用的 `InitialState` 一并交给 `HealthPersister` 播种基线，详见 [DD_DEPLOY §9.1](./DD_DEPLOY.md)。`bytes_up_total`/`bytes_down_total` 是同一类自增列，`HealthPersister._last` 的基线元组随之从 `(success, failure)` 扩成 `(success, failure, bytes_up, bytes_down)`，播种与丢弃基线的规则完全复用（§4.7 已有的「热重载删除出口时基线一并丢弃」同样适用）。
+
+### 4.3b 主机流量榜的查询与「不需要全表扫描」
+
+`traffic_log` 只服务一个查询：某个时间区间内，按 `host` 分组的流量与请求数排行——即「今日各主机流量」看板。
+
+```sql
+SELECT host,
+       SUM(bytes_up)   AS bytes_up,
+       SUM(bytes_down) AS bytes_down,
+       COUNT(*)        AS requests
+  FROM traffic_log
+ WHERE created_at >= ? AND created_at < ?
+ GROUP BY host
+ ORDER BY (SUM(bytes_up) + SUM(bytes_down)) DESC
+ LIMIT ?
+```
+
+`WHERE created_at >= ? AND created_at < ?` 命中 `idx_tl_created`，把扫描范围严格限定在请求的时间区间内（典型用法是「今天」，即当天 0 点到现在）——这正是 [WEBUI_SPEC §1.2](../requirements/WEBUI_SPEC.md) 强调的「聚合类统计不能对 `logs.db` 做全表扫描」的红线在这里的满足方式：`GROUP BY host` 确实要扫过命中范围内的所有行，但这个范围由索引先行收窄到「一天」，而不是整张表的全部历史；`retention`（§6）保证这张表本身也不会无限增长。**不提供「全部历史」的聚合视图**是有意的收窄：那需要扫描不受时间约束的整张表，且运维真正关心的是「现在」而非历史总量，历史总量已经由出口维度的累计字段（`upstream_health.bytes_up_total`）间接给出。
+
+`GROUP BY host` 不加 `LIMIT` 保护会有多坏？一天之内出现的不同 `host` 数量有上界（客户端能访问的域名数量），不会像 `request_log` 的全表行数那样随时间无界增长，因此这里的风险主要是「当天访问过很多不同域名」而非「跑了很久没清理」，`LIMIT`（默认 20，见 [DD_WEB](./DD_WEB.md)）截断的是排序后的展示条数，SQLite 仍需要先把所有分组算完才能排序截断——这是可接受的：分组数的上界已经由「一天」这个时间窗天然收敛。
 
 ### 4.4 批次内合并
 
@@ -684,6 +747,7 @@ UPDATE rule_meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key 
 | 字段 | 取值 | 说明 |
 |------|------|------|
 | `request_id` | 由 `ClientConnection` 生成并传入 `execute()` | 与失败响应头 `X-R-Proxy-Request-Id` 是同一个值，用户拿着它就能查到整条链 |
+| `client_addr` | `ProxyServer._on_client` 里 `writer.get_extra_info("peername")` 的 host 部分 | 见下 |
 | `attempt_index` | 0 起递增 | Web 的切换页用 `attempt_index > 0` 筛选「发生过切换的请求」 |
 | `rule_origin` | `rules[3]` | 与校验报错、界面行号同一套写法，用户不需要换算 |
 | `failure_kind` | 取自 `verdict.failure_kind` | **不取** `outcome.kind`：前者才是判据链的结论，也是真正用来记熔断与负面记忆的那一个。记另一个会让日志与系统实际行为对不上——而对不上时用户信的是日志 |
@@ -693,7 +757,20 @@ UPDATE rule_meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key 
 
 **耗时由执行器测，不由尝试回调自己填。** 回调有四个返回分支（连接失败、握手非 2xx、正常应答……），让每个分支各自计时，漏掉任何一个都会在界面上留下一列无声的 0——而「这一列是 0」看起来完全像是「这次很快」。夹在 `await attempt(...)` 两侧测量只有一个点，无法遗漏。
 
-**字节数目前恒为 0。** 这一行在尝试结束时就写下，而响应体是之后才流式转发的，那一刻还没有可记的数字。要填准只能在传输结束后回来 `UPDATE`，但 `request_log` 是只插不改的（§4.4 的合并表把 `insert` 列为不合并、每条都要保留），为一个展示字段引入「先插后改」会同时破坏批量插入的形状与只插不改的不变量。留 0 并在此写明，好过让一个看不出真假的数字上界面。
+**`client_addr` 在连接建立时采集一次，此后对同一 `request_id` 的每一次尝试都复用同一个值**——切换出口不会换客户端，采集点在 `protocol/server.py::ProxyServer._on_client`，随 `reader`/`writer` 一起传进 `ClientConnection`，不属于 `AttemptExecutor` 自己的职责，但和 `elapsed_ms` 一样是「协议层量出来、执行器随行写下」的字段。`get_extra_info("peername")` 对 IPv4 返回 `(host, port)`，对 IPv6 可能是 4 元组（含 `flowinfo`、`scopeid`）；只取 `host` 部分入库，端口本身没有审计价值（见 §3.1）。
+
+**这一列的准确性完全由容器网络模式决定，不是代码能控制的边界**。`asyncio` 拿到的 `peername` 是操作系统内核看到的 TCP 对端地址——容器场景下这就是「谁在和监听 socket 建连」，而不是「最初发起请求的那台机器」。两者是否一致取决于中间有没有做过 NAT：
+
+| 部署方式 | `client_addr` 看到的是 |
+|----------|------------------------|
+| `network_mode: host`（当前 compose 配置） | 真实客户端 IP |
+| `bridge` + 显式 `ports:` 映射 | Docker 网桥地址（如 `172.17.0.1`），所有客户端都长一个样 |
+
+这不是本模块要修的缺陷——纯 TCP 转发代理（含 CONNECT 隧道）没有 HTTP 反向代理场景下那种可信的 `X-Forwarded-For` 来源可用；客户端能完全控制自己发出的任何头部，采信应用层头部会让这一列变成可以被伪造的数据，这与 [DD_WEB §5.3](./DD_WEB.md) 「客户端标识取连接的对端地址，不看 `X-Forwarded-For`」是同一条理由。部署选型见 [DD_DEPLOY.md](./DD_DEPLOY.md)，两种模式的取舍已在那里写明代价。
+
+**字节数目前恒为 0，且这是 `request_log` 上的永久性质，不是留待将来修的坑。** 这一行在尝试结束时就写下，而响应体是之后才流式转发的，那一刻还没有可记的数字。要填准只能在传输结束后回来 `UPDATE`，但 `request_log` 是只插不改的（§4.4 的合并表把 `insert` 列为不合并、每条都要保留），为一个展示字段引入「先插后改」会同时破坏批量插入的形状与只插不改的不变量。留 0 并在此写明，好过让一个看不出真假的数字上界面。
+
+真实的字节数**另有去处**：`traffic_log`（§4.3b）是专为「传输结束后才知道数字」这个时点设计的独立表——它不追求 `request_log` 那种「每次尝试一行」的审计粒度，只在最终交付的那次尝试完整结束（隧道关闭 / 响应体转发完）时插入一行，天然避开了「先插后改」的问题：这一行本来就是在字节数已知之后才第一次被创建，不需要改任何已存在的行。`request_log.bytes_up`/`bytes_down` 这两列因此继续保留、继续恒为 0——它们描述的是「这次尝试」，而不是「这次请求最终传输了多少」，两者本就是不同的问题。
 
 **两处写入，不止一处**：候选链为空时一次尝试都没发起，仍写一行（`upstream_name` 为空串、`error` 记 `empty_reason`）。客户端此时只收到不含任何拓扑信息的 `502`（[PRD §4.3.9](../requirements/PRD_OVERVIEW.md)），这一行是用户判断「规则配错了」还是「网络坏了」的唯一依据（[RULES_CONFIG §4.4](../requirements/RULES_CONFIG.md)）。
 
@@ -704,6 +781,8 @@ UPDATE rule_meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key 
 只比端口、不比 host：`webui.host` 可能配的是 `0.0.0.0`，客户端连接时用的是局域网 IP 或 `127.0.0.1`，字面值永远对不上绑定地址；而 `webui.port`（默认 `6061`）与代理端口、上游地址撞车的概率可忽略，用它作判据足够可靠且是 O(1) 比较，不占用热路径。`webui.enabled=False`（`--no-web` 或配置关闭）时不生效——此时端口号不代表任何正在监听的服务，不能拿来误伤真实指向该端口的流量。
 
 这条过滤只作用于 `request_log` 的落盘，不影响熔断、粘性绑定与转发本身：Web UI 流量仍按正常路由决策转发，只是不再产生可追溯的一行。
+
+**`traffic_log` 与 `note_dead_end`/`note_tunnel_premature_death` 是同一类「非核心判据、由执行器代收」的旁路接口。** `AttemptExecutor.note_traffic(host, upstream, *, bytes_up, bytes_down, request_id)` 由协议层在数据传输真正结束时调用一次（[DD_PROXY §5.2.2/§6.4](./DD_PROXY.md)），内部做两件互不依赖的事：`self._state.health.add_traffic(...)`（内存累计，[DD_ROUTING §4.8](./DD_ROUTING.md)）与 `self._sink.put(traffic_log(...))`（入队落盘）。同样要经 `_is_webui_traffic` 判定跳过——否则仪表盘轮询自己产生的连接会把「主机流量榜」的排行搞乱，比污染 `request_log` 更直接：那是一张专门统计流量大小的表。
 
 ---
 
@@ -738,7 +817,7 @@ def load_initial_state(cfg: DatabaseConfig, limits: LimitsConfig,
 |----------|------|
 | 粘性映射 | 按 `updated_at DESC` 取前 N 条（N = LRU 容量），最近用过的最有价值 |
 | 负面记忆 | 只回填**未过期**的（`blocked_until > now`） |
-| 健康计数 | 回填累计成功/失败次数，供 Web 展示历史成功率 |
+| 健康计数 | 回填累计成功/失败次数及累计字节数（`bytes_up_total`/`bytes_down_total`），供 Web 展示历史成功率与累计流量 |
 | 熔断状态 | **不回填** `circuit_state`，一律重置为 `closed` |
 
 **熔断状态不回填**是有意的。进程重启可能正是因为运维在修复网络问题，带着旧的 `open` 状态启动会让刚修好的出口继续被拒绝 60 秒。重启后重新观测是更合理的默认——重启本身就是「重新开始」的语义。
@@ -785,6 +864,8 @@ def _run_retention(self, logs: sqlite3.Connection) -> None:
 **清理在写者线程内执行**，与业务写入串行（[PRD §4.4.6](../requirements/PRD_OVERVIEW.md)）。放到独立线程会引入第二个写者，违反核心约束。
 
 删除 10 万行可能耗时数百毫秒，期间写者线程不消费队列。这是可接受的——队列有 10000 容量，200ms 的积压远未触及水位。若日志量极大导致单次清理过久，可分批删除（每次 1 万行，多轮执行）。
+
+**`traffic_log` 复用同一套保留策略**：同一个 `_run_retention` 函数里对 `traffic_log` 重复一遍同样形状的两条 `DELETE`（各自的 `retention_days`/`max_log_rows` 可以与 `request_log` 共用同一份配置，也可以独立配置——取决于运维想不想让流量榜的历史窗口比请求日志更短；默认先复用同一份配置，没有证据表明这两张表需要不同的保留期）。`traffic_log` 的行数增长速率与 `request_log`是同一数量级（都约等于「成功交付的请求数」，`traffic_log` 甚至更少——它不像 `request_log` 那样每次切换都多一行），不会成为清理任务新的性能瓶颈。
 
 ### 6.2 负面记忆
 
