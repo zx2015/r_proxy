@@ -85,6 +85,7 @@ _SCHEMA: dict[str, frozenset[str]] = {
             "read_timeout",
             "switch_on_status",
             "sticky_fail_threshold",
+            "sticky_ttl",
             "route_block_ttl",
             "tunnel_probe_window",
             "switch_buffer_bytes",
@@ -422,6 +423,7 @@ def _build_routing(t: Mapping[str, Any]) -> RoutingConfig:
         sticky_fail_threshold=_get_int(
             t, "sticky_fail_threshold", defaults.sticky_fail_threshold, "routing"
         ),
+        sticky_ttl=_get_int(t, "sticky_ttl", defaults.sticky_ttl, "routing"),
         route_block_ttl=_get_int(t, "route_block_ttl", defaults.route_block_ttl, "routing"),
         tunnel_probe_window=_get_float(
             t, "tunnel_probe_window", defaults.tunnel_probe_window, "routing"

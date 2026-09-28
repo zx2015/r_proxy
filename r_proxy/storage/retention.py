@@ -15,6 +15,7 @@ import time
 from typing import TYPE_CHECKING
 
 from r_proxy.config.model import DatabaseConfig
+from r_proxy.storage.expiry import StickyExpiryPolicy
 from r_proxy.storage.schema import Database
 
 if TYPE_CHECKING:
@@ -57,16 +58,20 @@ _TRIM_TRAFFIC_BY_ROWS = """
 class Retention:
     """按固定间隔在写者线程内执行清理。"""
 
-    __slots__ = ("_cfg", "_interval", "_next_run")
+    __slots__ = ("_cfg", "_expiry", "_interval", "_next_run")
 
     def __init__(
         self,
         cfg: DatabaseConfig,
         *,
+        expiry: StickyExpiryPolicy | None = None,
         interval_seconds: float = DEFAULT_INTERVAL_SECONDS,
         first_run_immediately: bool = True,
     ) -> None:
         self._cfg = cfg
+        # 默认禁用粘性清理：只有 StorageService 显式注入策略时才生效，
+        # 让旧调用点（不带 expiry 的测试）保持原行为。
+        self._expiry = expiry if expiry is not None else StickyExpiryPolicy()
         self._interval = interval_seconds
         # 默认启动后立刻跑一次：进程可能刚好在上次清理前崩了，日志表已经
         # 超限，再等一小时只会让它继续涨。
@@ -86,8 +91,11 @@ class Retention:
         return True
 
     def run(self, connections: dict[Database, sqlite3.Connection]) -> int:
-        return self._clean_logs(connections[Database.LOGS]) + self._clean_blocks(
-            connections[Database.STATE]
+        state_conn = connections[Database.STATE]
+        return (
+            self._clean_logs(connections[Database.LOGS])
+            + self._clean_blocks(state_conn)
+            + self._clean_sticky(state_conn)
         )
 
     def _clean_logs(self, conn: sqlite3.Connection) -> int:
@@ -106,6 +114,30 @@ class Retention:
         cutoff = int(time.time()) - BLOCK_GRACE_SECONDS
         return self._in_transaction(
             conn, (("DELETE FROM route_block WHERE blocked_until < ?", (cutoff,)),)
+        )
+
+    def _clean_sticky(self, conn: sqlite3.Connection) -> int:
+        """删除磁盘上早于 TTL 的 ``auto`` 粘性行。``manual`` 与 ``ttl=0`` 跳过。
+
+        不留宽限期（与 :meth:`_clean_blocks` 的 ``BLOCK_GRACE_SECONDS`` 相反）：
+        ``auto`` 是「上次哪条路能用」的缓存，价值随时间衰减，也没有需要保留的
+        诊断字段。``manual`` 永不删——用户的声明跨重启必须保留。
+
+        与内存侧的惰性过期是**两条独立路径**：这里只动磁盘副本，**不**发
+        ``sticky_delete`` 入队通知内存。最终一致：内存权威在路由热路径，
+        磁盘副本短暂「出现又消失」对路由不可观测（DD_ROUTING §7.7）。
+        """
+        if not self._expiry.enabled:
+            return 0
+        cutoff = self._expiry.cutoff(now_unix=int(time.time()))
+        return self._in_transaction(
+            conn,
+            (
+                (
+                    "DELETE FROM host_upstream WHERE source = 'auto' AND updated_at < ?",
+                    (cutoff,),
+                ),
+            ),
         )
 
     def _in_transaction(

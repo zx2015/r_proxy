@@ -130,6 +130,9 @@ class RoutingConfig:
     read_timeout: float = 30.0
     switch_on_status: frozenset[int] = DEFAULT_SWITCH_ON_STATUS
     sticky_fail_threshold: int = 3
+    # ``auto`` 粘性条目多久没被访问就失效（秒）。``0`` 表示禁用过期。
+    # 只作用于 ``auto``：``manual`` 是用户的声明，不随空闲作废（DD_ROUTING §7.7）。
+    sticky_ttl: int = 2_592_000
     route_block_ttl: int = 600
     tunnel_probe_window: float = 5.0
     switch_buffer_bytes: int = 65536

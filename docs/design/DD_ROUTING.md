@@ -9,6 +9,7 @@
 | v1.4.0 | 2026-08-15 | M4 切片 c：新增 §7.6 手动绑定入口 `bind_manual()` 与「超容优先淘汰 `auto`」——手动绑定被 LRU 挤掉时内存与库不一致，表现为「绑定时好时坏、重启又好了」 | Agent |
 | v1.5.0 | 2026-08-16 | 依生产日志新增 §3.2b 内网直连前置：内网 IP 字面量把 `direct` 提到链首（只重排不裁剪，粘性仍可覆盖），消除内网主机冷启动 60 秒的连接超时 | Agent |
 | v1.6.0 | 2026-09-24 | **流量统计已实现并上线**：§4.2 `UpstreamHealth` 新增 `total_bytes_up`/`total_bytes_down` 累计字段；新增 §4.8「出口累计流量」，说明为何字节累加是独立于 `record_result` 的新方法（字节只有在 relay/pump 完成后才知道，比熔断判定晚得多），以及它如何喂给出口健康看板与落盘。落盘 schema 见 [DD_STORAGE §3](./DD_STORAGE.md)，产出点见 [DD_PROXY §5.2.2/§6.4](./DD_PROXY.md) | Agent |
+| v1.7.0 | 2026-09-28 | 新增 §7.7「`auto` 条目的空闲过期」：`routing.sticky_ttl`（默认 30 天）；`get_live` 与 `get` 分离；`manual` 不参与过期；惰性删除 + 与 `RouteMemory` 一致的「改小 TTL 不立即清空旧条目」立场；与磁盘侧 `Retention._clean_sticky` / `_load_sticky` 过滤构成最终一致 | Agent |
 
 **对应需求**：[PRD §4.3.6](../requirements/PRD_OVERVIEW.md)（故障归类）、[§4.3.7](../requirements/PRD_OVERVIEW.md)（候选链）、[§4.3.10](../requirements/PRD_OVERVIEW.md)（熔断）、[§4.2.4](../requirements/PRD_OVERVIEW.md)（地址族）、[§4.6](../requirements/PRD_OVERVIEW.md)（粘性）、[§4.9](../requirements/PRD_OVERVIEW.md)（并发）
 
@@ -758,6 +759,51 @@ while len(self._entries) > self._capacity:
 ```
 
 全是 `manual` 时照旧淘汰最旧的那条：容量上限是硬约束，不能因为条目类型而失效（[PRD §7.2](../requirements/PRD_OVERVIEW.md) 的「可增长资源必须有界」）。扫描代价与 `manual` 条目数同阶，而它在实际配置里是个位数。
+
+### 7.7 `auto` 条目的空闲过期
+
+§7.1–§7.6 描述的清除条件全部是「事件触发」：失败达阈值、出口被删、LRU 超容、重启回填截断。一个冷门 host 的 `auto` 绑定会无限期占住内存 LRU 容量与磁盘 `host_upstream` 表，即便它对应的访问模式早已不存在。本节引入**时间触发**的失效。
+
+**语义**：`auto` 条目若连续 `routing.sticky_ttl` 秒（默认 2_592_000 = 30 天）未被命中（`record_success` 会刷新 `last_used_at`），下次被路由决策查询时即视为不存在并删除。`manual` 是用户声明，不参与过期。`sticky_ttl = 0` 表示禁用过期（与 `happy_eyeballs_delay` 的「0 表示关闭」同一约定）。
+
+**`get` 与 `get_live` 分离**：
+
+```python
+def get(self, host: str) -> StickyEntry | None:
+    """无副作用读取。返回活引用，**不**因 TTL 触发删除。
+    适合存活性检查、调试日志、metrics 计数等「看一眼不动状态」的场景。"""
+
+def get_live(self, host: str, *, now: float) -> StickyEntry | None:
+    """带惰性过期的查询。auto 条目空闲达到 ttl 时当场删除并返回 None。"""
+    entry = self._entries.get(host)
+    if entry is None:
+        return None
+    if self._ttl > 0.0 and entry.source != "manual" and now - entry.last_used_at >= self._ttl:
+        del self._entries[host]
+        return None
+    self._entries.move_to_end(host)
+    return entry
+```
+
+`Router._apply_sticky`（§3.3）改用 `get_live`；Web 与测试里的存在性断言仍用 `get`。把过期判定塞进 `get` 会让「无副作用读取」的承诺失效，且让所有断言型调用都背上「过期就删除」的副作用。
+
+**`entries(now)` 过滤过期 auto**：Web 列表必须显示「真正还在生效的绑定」，否则界面与路由行为对不上。`entries` 只过滤不删除——查询路径保持只读，删除留给下次 `get_live` 或 LRU 淘汰。
+
+**`reconfigure` 改小 TTL 不立即清空已有条目**：与 §6（`RouteMemory.reconfigure`）同一立场。缩短 TTL 时遍历删除等于制造一次集中的重新学习风暴；旧条目在下次被访问时按新 TTL 自然淘汰。
+
+**与磁盘侧的协作**：内存惰性过期**不**回发 `sticky_delete` 落盘。三条独立路径构成最终一致（RC-03）：
+
+| 路径 | 时机 | 作用 |
+|------|------|------|
+| 内存 `get_live` | 每次路由查询 | 权威决策：过期即删 |
+| `Retention._clean_sticky` | 写者线程每小时 | 磁盘上 `auto` 行 `updated_at < cutoff` 即删（[DD_STORAGE §6.3](./DD_STORAGE.md)） |
+| `_load_sticky` 回填过滤 | 启动时 | `auto` 行 `updated_at < cutoff` 不回填，避免白占 LRU 容量（[DD_STORAGE §5.1](./DD_STORAGE.md)） |
+
+**接受的可观测噪音**：内存已因惰性过期删掉的 `auto`，可能在磁盘上短暂「还在」直到下一次 `Retention` 跑；该 host 真有新流量时 `record_success` 会重新 UPSERT 把磁盘也刷新。这种「磁盘副本出现又消失」对路由完全不可观测，不要当 bug 排查。
+
+**「最后访问时间」用 `updated_at`**：`sticky_hit` 与 `sticky_upsert` 都 bump `updated_at`（[DD_STORAGE §4.3](./DD_STORAGE.md)），对应「任何访问」，比 `last_success_at`（仅成功）更贴合「没访问就失效」的语义。回填时 `last_used_at` 取 `MAX(last_success_at, updated_at)`——管理员手工 `INSERT` 的行 `last_success_at` 默认 0，若直接当时间戳用会被 `to_monotonic` 推出极负值、立刻被 TTL 误判为远古过期。
+
+**`sticky_ttl = 0` 不影响 LRU**：容量上限仍是硬约束，禁用过期只是关掉时间维度。
 
 ---
 

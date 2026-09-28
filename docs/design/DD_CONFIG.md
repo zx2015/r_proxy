@@ -8,6 +8,7 @@
 | v1.3.0 | 2026-08-14 | M4 切片 a 回写：新增 `E_WEB_TOKEN_NON_ASCII`（在回环短路之前检查）；`E_PORT_CONFLICT` 排除两端均为 `0` 的情形 | Agent |
 | v1.2.0 | 2026-08-13 | 实现回写：`by_name` 改为只读 `Mapping`（`MappingProxyType`），新增 `ConfigSnapshot.build()` 作为唯一构造入口；报错统一补文件名前缀；`validate()` 增加 `nofile_limit` 与 `rule_targets` 参数以避免校验层直接触碰系统调用与规则文件 | Agent |
 | v2.0.0 | 2026-08-15 | 规则改由 `rules.db` 存储：`ConfigSnapshot.rule_files` / `rule_versions` 两字段删除，新增 `rules_enabled`；`rules.files` 键废弃且残留时报 `E_RULES_FILES_REMOVED`（取代 `E_DUP_RULE_FILENAME`）；`rule_targets` 的形状由「目标 → 文件:行号」改为「出口名 → `rules[i]`」；§6.2/§6.3 重载改为从库读并编译，`rules.enabled = false` 时不打开库 | Agent |
+| v2.1.0 | 2026-09-28 | `RoutingConfig` 新增 `sticky_ttl`（默认 2_592_000 = 30 天，`0` 表示禁用过期；`E_TIMEOUT_POSITIVE` 只拒负数）。语义见 [DD_ROUTING §7.7](./DD_ROUTING.md)，Web 设置白名单同步暴露 | Agent |
 
 **对应需求**：[PRD §4.2](../requirements/PRD_OVERVIEW.md)（上级代理池与优先级）、[PRD §4.9.6](../requirements/PRD_OVERVIEW.md)（配置快照）、[PRD §5](../requirements/PRD_OVERVIEW.md)（文件布局）、[WEBUI §6](../requirements/WEBUI_SPEC.md)（配置持久化）
 
@@ -122,6 +123,7 @@ class RoutingConfig:
         {403, 407, 408, 429, 451, 502, 503, 504, 511}
     )
     sticky_fail_threshold: int = 3
+    sticky_ttl: int = 2_592_000               # auto 粘性空闲过期（秒），0 表示禁用
     route_block_ttl: int = 600
     tunnel_probe_window: float = 5.0
     switch_buffer_bytes: int = 65536

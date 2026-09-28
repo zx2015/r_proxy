@@ -13,9 +13,11 @@ import logging
 import time
 
 from r_proxy.config.model import DatabaseConfig, LimitsConfig
+from r_proxy.storage.expiry import StickyExpiryPolicy
 from r_proxy.storage.metrics import StorageMetrics
 from r_proxy.storage.queue import Priority, WriteQueue
 from r_proxy.storage.reader import InitialState, ReadOnlyPool, load_initial_state
+from r_proxy.storage.retention import Retention
 from r_proxy.storage.writer import WriterThread
 
 logger = logging.getLogger(__name__)
@@ -24,20 +26,31 @@ DEFAULT_STOP_TIMEOUT = 10.0
 
 
 class StorageService:
-    __slots__ = ("_cfg", "_limits", "_thread", "logs_reader", "queue", "state_reader")
+    __slots__ = ("_cfg", "_expiry", "_limits", "_thread", "logs_reader", "queue", "state_reader")
 
-    def __init__(self, cfg: DatabaseConfig, limits: LimitsConfig) -> None:
+    def __init__(
+        self,
+        cfg: DatabaseConfig,
+        limits: LimitsConfig,
+        *,
+        sticky_policy: StickyExpiryPolicy | None = None,
+    ) -> None:
         self._cfg = cfg
         self._limits = limits
+        self._expiry = sticky_policy or StickyExpiryPolicy()
         self.queue = WriteQueue(maxsize=cfg.write_queue_size)
-        self._thread = WriterThread(self.queue, cfg)
+        self._thread = WriterThread(self.queue, cfg, retention=Retention(cfg, expiry=self._expiry))
         self.state_reader = ReadOnlyPool(cfg.state_path)
         self.logs_reader = ReadOnlyPool(cfg.logs_path)
 
     def load_initial_state(self) -> InitialState:
         """在写者线程启动**之前**调用：此时库里的内容就是上次退出时的样子。"""
         return load_initial_state(
-            self._cfg, self._limits, now_unix=time.time(), now_mono=time.monotonic()
+            self._cfg,
+            self._limits,
+            now_unix=time.time(),
+            now_mono=time.monotonic(),
+            sticky_policy=self._expiry,
         )
 
     def start(self) -> None:

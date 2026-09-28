@@ -24,6 +24,7 @@ from r_proxy.protocol.server import DEFAULT_DRAIN_TIMEOUT, ProxyServer
 from r_proxy.rules.loader import LoadResult, load_rules
 from r_proxy.rules.model import EMPTY_RULE_SET, RuleSet
 from r_proxy.state.runtime import RuntimeState
+from r_proxy.storage.expiry import StickyExpiryPolicy
 from r_proxy.storage.metrics import MetricsReporter
 from r_proxy.storage.rules_store import RulesStore
 from r_proxy.storage.schema import StorageError
@@ -147,7 +148,11 @@ class Application:
 
         # 库打不开就拒绝启动：粘性与负面记忆丢了还能重学，但一个连不上磁盘的
         # 代理会静默地把每次学到的东西都扔掉，用户无从察觉。
-        storage = StorageService(snapshot.database, snapshot.limits)
+        storage = StorageService(
+            snapshot.database,
+            snapshot.limits,
+            sticky_policy=StickyExpiryPolicy(ttl_seconds=float(snapshot.routing.sticky_ttl)),
+        )
         initial = storage.load_initial_state()
         try:
             storage.start()

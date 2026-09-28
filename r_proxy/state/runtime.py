@@ -75,7 +75,10 @@ class RuntimeState:
                 capacity=snapshot.limits.route_block_cache_size,
                 ttl=float(snapshot.routing.route_block_ttl),
             ),
-            sticky=StickyCache(capacity=snapshot.limits.sticky_cache_size),
+            sticky=StickyCache(
+                capacity=snapshot.limits.sticky_cache_size,
+                ttl=float(snapshot.routing.sticky_ttl),
+            ),
         )
 
     @property
@@ -101,5 +104,8 @@ class RuntimeState:
             ttl=float(snapshot.routing.route_block_ttl),
         )
         self.sticky.forget_upstreams_except(names)
-        self.sticky.reconfigure(capacity=snapshot.limits.sticky_cache_size)
+        self.sticky.reconfigure(
+            capacity=snapshot.limits.sticky_cache_size,
+            ttl=float(snapshot.routing.sticky_ttl),
+        )
         self.cursors.reset_all()

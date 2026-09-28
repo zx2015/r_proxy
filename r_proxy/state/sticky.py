@@ -28,26 +28,54 @@ class StickyEntry:
 
 
 class StickyCache:
-    """容量受 ``limits.sticky_cache_size`` 限制（默认 10000），超限按 LRU 淘汰。"""
+    """容量受 ``limits.sticky_cache_size`` 限制（默认 10000），超限按 LRU 淘汰。
 
-    __slots__ = ("_capacity", "_entries")
+    ``auto`` 条目在 ``ttl`` 秒内未被访问（``record_success`` 会刷新 ``last_used_at``）
+    即视为过期，下次查询时惰性删除。``manual`` 是用户声明，不参与过期。``ttl<=0``
+    关闭过期行为（DD_ROUTING §7.7）。
+    """
 
-    def __init__(self, capacity: int) -> None:
+    __slots__ = ("_capacity", "_entries", "_ttl")
+
+    def __init__(self, capacity: int, ttl: float = 0.0) -> None:
         self._capacity = capacity
+        self._ttl = float(ttl)
         self._entries: OrderedDict[str, StickyEntry] = OrderedDict()
 
     @property
     def size(self) -> int:
         return len(self._entries)
 
+    @property
+    def ttl(self) -> float:
+        """当前生效的过期时长。日志/调试里要能说清「多久没访问就失效」。"""
+        return self._ttl
+
     def get(self, host: str) -> StickyEntry | None:
         """返回**活引用**而非副本：这是每请求都走的热路径。
 
-        调用方只读。需要快照的场合用 :meth:`entries`。
+        调用方只读——**不会**因 TTL 触发删除。需要过期判定请用 :meth:`get_live`。
+        适合存活性检查、调试日志、metrics 计数等「看一眼不动状态」的场景。
         """
         entry = self._entries.get(host)
         if entry is not None:
             self._entries.move_to_end(host)
+        return entry
+
+    def get_live(self, host: str, *, now: float) -> StickyEntry | None:
+        """带惰性过期的查询。``auto`` 条目空闲达到 ``ttl`` 时**当场删除**并返回
+        ``None``；``manual`` 永不过期。
+
+        故意与 :meth:`get` 分开：路由热路径以外需要「只读」的代码不应承担过期
+        删除这种副作用，也避免每次拿到活引用都要重新判定 TTL。
+        """
+        entry = self._entries.get(host)
+        if entry is None:
+            return None
+        if self._ttl > 0.0 and entry.source != "manual" and now - entry.last_used_at >= self._ttl:
+            del self._entries[host]
+            return None
+        self._entries.move_to_end(host)
         return entry
 
     def record_success(self, host: str, upstream: str, *, now: float) -> bool:
@@ -101,9 +129,16 @@ class StickyCache:
     def clear(self, host: str) -> bool:
         return self._entries.pop(host, None) is not None
 
-    def entries(self) -> list[StickyEntry]:
-        """副本列表，供 Web 与测试查看，改它不影响权威状态。"""
-        return [dataclasses.replace(e) for e in self._entries.values()]
+    def entries(self, *, now: float) -> list[StickyEntry]:
+        """副本列表，供 Web 与测试查看，改它不影响权威状态。
+
+        **过滤掉已过期的 ``auto``**（判定与 :meth:`get_live` 一致）：界面显示的
+        必须是真正还在生效的绑定，否则会与路由行为对不上。不在这里删除——查询
+        路径只读取，删除留给下次 :meth:`get_live` 或 LRU 淘汰。
+        """
+        return [
+            dataclasses.replace(e) for e in self._entries.values() if not self._expired(e, now=now)
+        ]
 
     def restore(self, entry: StickyEntry) -> None:
         """启动回填。按 ``updated_at`` 降序调用，最近用过的最有价值。"""
@@ -118,9 +153,23 @@ class StickyCache:
             if entry.upstream not in names:
                 del self._entries[host]
 
-    def reconfigure(self, *, capacity: int) -> None:
+    def reconfigure(self, *, capacity: int, ttl: float) -> None:
+        """热重载调整容量与过期时长，已有条目**保留**。
+
+        新 TTL 只作用于后续的 :meth:`get_live`：不在这里遍历删除已过期条目，
+        与 :meth:`RouteMemory.reconfigure` 同一立场——缩短 TTL 时让一批条目
+        同时消失，等于制造一次集中的重新学习。旧条目会在下次被访问时按新 TTL
+        自然淘汰。
+        """
         self._capacity = capacity
+        self._ttl = float(ttl)
         self._evict_to_capacity()
+
+    def _expired(self, entry: StickyEntry, *, now: float) -> bool:
+        """``auto`` 条目是否已过空闲期。``manual`` 与 ``ttl<=0`` 恒为 False。"""
+        return (
+            self._ttl > 0.0 and entry.source != "manual" and now - entry.last_used_at >= self._ttl
+        )
 
     def _put(self, entry: StickyEntry) -> None:
         if self._capacity <= 0:

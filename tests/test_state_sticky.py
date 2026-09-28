@@ -11,8 +11,10 @@ from __future__ import annotations
 from r_proxy.state.sticky import StickyCache, StickyEntry
 
 
-def cache(capacity: int = 10, *, entries: list[StickyEntry] | None = None) -> StickyCache:
-    c = StickyCache(capacity)
+def cache(
+    capacity: int = 10, *, entries: list[StickyEntry] | None = None, ttl: float = 0.0
+) -> StickyCache:
+    c = StickyCache(capacity, ttl=ttl)
     for entry in entries or []:
         c.restore(entry)
     return c
@@ -193,7 +195,7 @@ class TestCapacity:
         c = cache(capacity=4)
         for host in ("a", "b", "c", "d"):
             c.record_success(f"{host}.com", "u", now=1.0)
-        c.reconfigure(capacity=2)
+        c.reconfigure(capacity=2, ttl=0.0)
         assert c.size == 2
         assert c.get("a.com") is None
         assert c.get("d.com") is not None
@@ -210,7 +212,7 @@ class TestInspection:
         """Web 界面拿到的快照不该能改到权威状态。"""
         c = cache()
         c.record_success("a.com", "u", now=1.0)
-        snapshot = c.entries()
+        snapshot = c.entries(now=1.0)
         snapshot[0].upstream = "tampered"
         entry = c.get("a.com")
         assert entry is not None and entry.upstream == "u"
@@ -226,3 +228,70 @@ class TestInspection:
         for i in range(5):
             c.restore(StickyEntry(host=f"h{i}.com", upstream="u", source="auto"))
         assert c.size == 2
+
+
+def auto(host: str, upstream: str, *, last_used_at: float) -> StickyEntry:
+    return StickyEntry(host=host, upstream=upstream, source="auto", last_used_at=last_used_at)
+
+
+class TestTtl:
+    """``auto`` 空闲超过 ``ttl`` 即失效，``manual`` 永不失效（DD_ROUTING §7.7）。"""
+
+    def test_an_idle_auto_entry_expires_on_the_next_lookup(self) -> None:
+        c = cache(ttl=100.0, entries=[auto("a.com", "u", last_used_at=0.0)])
+        assert c.get_live("a.com", now=100.0) is None
+        # 惰性删除：条目真的没了，不只是这次返回 None。
+        assert c.size == 0
+
+    def test_an_auto_entry_just_inside_the_window_survives(self) -> None:
+        c = cache(ttl=100.0, entries=[auto("a.com", "u", last_used_at=0.0)])
+        entry = c.get_live("a.com", now=99.9)
+        assert entry is not None and entry.upstream == "u"
+
+    def test_the_boundary_counts_as_expired(self) -> None:
+        """``>=`` 而非 ``>``：恰好满 TTL 即失效，与 RouteMemory 一致。"""
+        c = cache(ttl=100.0, entries=[auto("a.com", "u", last_used_at=0.0)])
+        assert c.get_live("a.com", now=100.0) is None
+
+    def test_a_manual_entry_never_expires(self) -> None:
+        c = cache(ttl=100.0, entries=[manual("a.com", "u")])
+        assert c.get_live("a.com", now=10_000_000.0) is not None
+
+    def test_zero_ttl_disables_expiry(self) -> None:
+        """``0`` 表示关闭过期，不是「立即过期」（与 happy_eyeballs_delay 同一约定）。"""
+        c = cache(ttl=0.0, entries=[auto("a.com", "u", last_used_at=0.0)])
+        assert c.get_live("a.com", now=10_000_000.0) is not None
+
+    def test_plain_get_does_not_expire(self) -> None:
+        """``get`` 承诺无副作用读取：过期判定只属于 ``get_live``。"""
+        c = cache(ttl=100.0, entries=[auto("a.com", "u", last_used_at=0.0)])
+        assert c.get("a.com") is not None
+        assert c.size == 1
+
+    def test_a_success_refreshes_the_idle_clock(self) -> None:
+        """命中一次就重置计时：不然活跃使用的绑定也会被当成冷数据清掉。"""
+        c = cache(ttl=100.0, entries=[auto("a.com", "u", last_used_at=0.0)])
+        c.record_success("a.com", "u", now=90.0)
+        assert c.get_live("a.com", now=150.0) is not None
+
+    def test_reconfigure_does_not_evict_existing_entries_by_the_new_ttl(self) -> None:
+        """改小 TTL 不立即清空旧条目——与 RouteMemory.reconfigure 同一立场：
+        集体失效等于制造一次集中的重新学习。旧条目在下次访问时才淘汰。"""
+        c = cache(ttl=0.0, entries=[auto("a.com", "u", last_used_at=0.0)])
+        c.reconfigure(capacity=10, ttl=1.0)
+        assert c.size == 1
+        assert c.get_live("a.com", now=1000.0) is None
+
+    def test_entries_hides_expired_auto_but_keeps_manual(self) -> None:
+        c = cache(
+            ttl=100.0,
+            entries=[auto("old.com", "u", last_used_at=0.0), manual("pinned.com", "u")],
+        )
+        hosts = [e.host for e in c.entries(now=100.0)]
+        assert hosts == ["pinned.com"]
+
+    def test_entries_does_not_delete_what_it_hides(self) -> None:
+        """列表查询只读：过滤靠判定，删除留给 get_live 或 LRU。"""
+        c = cache(ttl=100.0, entries=[auto("old.com", "u", last_used_at=0.0)])
+        assert c.entries(now=100.0) == []
+        assert c.size == 1

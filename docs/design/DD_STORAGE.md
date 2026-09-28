@@ -4,6 +4,7 @@
 | :--- | :--- | :--- | :--- |
 | v1.9.0 | 2026-09-24 | 新增 `request_log.client_addr`（客户端来源地址）：§3 schema 补列，§3.1 补取舍说明，§3.2 补 `logs.db` schema 版本 1→2 的迁移步骤示例，§4.9 补字段来源（`ProxyServer._on_client` 的 `peername`）与容器网络前提（依赖 `network_mode: host`，见 [DD_DEPLOY.md](./DD_DEPLOY.md)） | Agent |
 | v1.10.0 | 2026-09-24 | **流量统计已实现并上线**（见 [WEBUI_SPEC §2.1](../requirements/WEBUI_SPEC.md)）：①`state.db` 的 `upstream_health` 新增 `bytes_up_total`/`bytes_down_total`（`STATE` schema 1→2），供出口健康看板；②`logs.db` 新增 `traffic_log` 表（`LOGS` schema 2→3），每个成功交付的请求关闭/结束时落一行，供「当日主机流量榜」按 `created_at` 有界聚合，不依赖全表扫描；③§4.3 新增 §4.3b 关键 SQL；④§5 启动回填新增两个字节字段；⑤§6 清理任务把 `traffic_log` 并入既有的 `request_log` 保留策略。生产端见 [DD_PROXY §5.2.2/§6.4](./DD_PROXY.md)，内存侧见 [DD_ROUTING §4.8](./DD_ROUTING.md) | Agent |
+| v1.11.0 | 2026-09-28 | 粘性映射加时间老化：①`RoutingConfig.sticky_ttl`（默认 30 天，0=禁用）；②`§5.1` 回填 SQL 加 `WHERE source='manual' OR updated_at >= cutoff`，`last_used_at` 取 `MAX(last_success_at, updated_at)`；③新增 §6.3「粘性老化清理」（无宽限期，仅删 `auto`，`manual` 永存）；④`StickyExpiryPolicy` 放在 `storage/expiry.py` 作为分层边界 | Agent |
 | v1.8.0 | 2026-08-23 | §4.9 补「排除对 Web UI 自身的访问」：目标端口等于 `webui.port` 时不写 `request_log`，理由与只比端口不比 host 的取舍 | Agent |
 | v1.7.0 | 2026-08-21 | 代码评审整改：§4.6 补严重积压日志限频（`WriteQueue.put` 同一秒内的丢弃只报一次摘要，避免极端 QPS 下逐条打印刷屏）；§4.7 补 `HealthPersister.run` 取消时的最后一次落盘（`try...finally`，覆盖关停前不足一个周期的窗口） | Agent |
 | v1.0.0 | 2026-08-13 | 初始版本：双库划分与 schema、唯一写者线程、批量事务与写入合并、有界队列与分级丢弃、启动回填、日志清理、只读连接 | Agent |
@@ -815,7 +816,7 @@ def load_initial_state(cfg: DatabaseConfig, limits: LimitsConfig,
 
 | 回填内容 | 处理 |
 |----------|------|
-| 粘性映射 | 按 `updated_at DESC` 取前 N 条（N = LRU 容量），最近用过的最有价值 |
+| 粘性映射 | 按 `updated_at DESC` 取前 N 条（N = LRU 容量），最近用过的最有价值；§5.1 过滤过期 `auto` |
 | 负面记忆 | 只回填**未过期**的（`blocked_until > now`） |
 | 健康计数 | 回填累计成功/失败次数及累计字节数（`bytes_up_total`/`bytes_down_total`），供 Web 展示历史成功率与累计流量 |
 | 熔断状态 | **不回填** `circuit_state`，一律重置为 `closed` |
@@ -834,6 +835,27 @@ def _to_monotonic(unix_ts: int, *, now_unix: float, now_mono: float) -> float:
 1. 粘性回填另读 `last_success_at` 并同样转成 monotonic。若回填后的条目 `last_used_at` 为 0，LRU 会把刚回填的绑定当成最旧的先淘汰——回填的意义正在于它们最近用过
 2. 读出的行由顶层 `persistence.apply_initial_state()` 装进 `RuntimeState`。回填要同时理解两侧的数据结构，而 `state` 禁止 I/O、`storage` 不该理解路由语义，因此这段粘合放在两层之上
 3. 库不存在（首次启动）、打不开、表缺失、文件损坏一律回退为空状态并记 `ERROR`。路由状态是可重新学习的，为它拒绝启动不合理——与「库打不开就拒绝启动」不冲突：后者说的是**写**路径，写不进去意味着此后学到的一切都会静默丢失
+
+### 5.1 粘性回填过滤
+
+配合 [DD_ROUTING §7.7](./DD_ROUTING.md) 的时间老化，粘性回填 SQL 增加一道前置过滤——过期 `auto` 不入内存：
+
+```sql
+SELECT host, upstream_name, source, fail_count, hit_count,
+       MAX(last_success_at, updated_at)
+  FROM host_upstream
+ WHERE source = 'manual' OR updated_at >= ?
+ ORDER BY updated_at DESC
+ LIMIT ?
+```
+
+`cutoff` 由 `StickyExpiryPolicy`（[`storage/expiry.py`](../../r_proxy/storage/expiry.py)）计算：`now_unix - sticky_ttl`。`sticky_ttl <= 0`（禁用过期）时 cutoff 退化为 0，`updated_at >= 0` 恒真，等价于不过滤。
+
+**`manual` 永远回填**：用户的声明跨重启必须保留，过滤 `WHERE source != 'manual'` 是用户数据丢失级别的 bug。
+
+**`last_used_at` 取 `MAX(last_success_at, updated_at)`**：管理员手工 `INSERT` 的行 `last_success_at` 默认 0，若直接当时间戳用会被 `to_monotonic` 推出极负值、立刻被 TTL 误判为远古过期。「最后访问」用 `updated_at` 是因为 `sticky_hit` 与 `sticky_upsert` 都会 bump 它（§4.3），对应「任何访问」，比 `last_success_at`（仅成功）更贴合「没访问就失效」的语义。
+
+`StickyExpiryPolicy` 只在 `storage/` 内自洽——`state/` 用 monotonic 域只需裸的 `ttl` 秒数，`storage/` 用 Unix 域需要 cutoff；同一对象暴露两个语义反而要揉在一起。数值仍源自 `[routing] sticky_ttl`，存储层不解释「粘性」的路由含义，只把它当作「多久没更新就算旧」的时间条件。
 
 ---
 
@@ -886,6 +908,18 @@ def _clean_route_block(self, state: sqlite3.Connection) -> None:
 - Web 界面提供手动完整 `VACUUM` 入口，并明确提示「期间服务可能短暂停顿」
 
 `auto_vacuum` 必须在**建库时**设置，对已有数据库无效。这是迁移逻辑需要注意的：升级到支持增量 vacuum 的版本时，已有数据库无法启用，只能建议用户删除 `logs.db` 重建（这正是双库划分的价值之一）。
+
+### 6.4 粘性老化
+
+`_clean_sticky` 在 `Retention.run` 中与 `_clean_logs`/`_clean_blocks` 同一处执行，按 `routing.sticky_ttl` 删除过期的 `auto` 粘性行：
+
+```sql
+DELETE FROM host_upstream WHERE source = 'auto' AND updated_at < ?
+```
+
+**不留宽限期**（与 `_clean_blocks` 的 `BLOCK_GRACE_SECONDS=86400` 相反）：`auto` 是「上次哪条路能用」的缓存，价值随时间衰减，也没有需要保留的诊断字段（`fail_count` 已存在 `route_block`，不在 `host_upstream` 上）。`manual` 永不删——用户的声明跨重启必须保留。
+
+**与内存惰性过期是两条独立路径**（RC-03）：磁盘清理**不**发 `sticky_delete` 入队通知内存。内存权威在路由热路径，磁盘副本短暂「出现又消失」对路由完全不可观测。磁盘的 SQL 是最坏情况下的兜底——内存已经惰性删了的 `auto`，磁盘可能还在，直到下一次 `Retention` 跑过去删掉。
 
 ---
 

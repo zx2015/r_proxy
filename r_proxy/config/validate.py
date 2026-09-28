@@ -359,6 +359,17 @@ def _check_routing(s: ConfigSnapshot, issues: list[ValidationIssue]) -> None:
             )
         )
 
+    # sticky_ttl 的 0 是「关闭过期」，不是非法值——auto 粘性永久保留。
+    if r.sticky_ttl < 0:
+        issues.append(
+            ValidationIssue(
+                "error",
+                "E_TIMEOUT_POSITIVE",
+                f"sticky_ttl 不能为负，得到 {r.sticky_ttl}（0 表示 auto 粘性永不过期）",
+                "routing.sticky_ttl",
+            )
+        )
+
 
 def _check_resources(
     s: ConfigSnapshot, nofile_limit: int | None, issues: list[ValidationIssue]

@@ -196,6 +196,7 @@ def _project(snapshot: ConfigSnapshot) -> SettingsResponse:
             read_timeout=r.read_timeout,
             switch_on_status=sorted(r.switch_on_status),
             sticky_fail_threshold=r.sticky_fail_threshold,
+            sticky_ttl=r.sticky_ttl,
             route_block_ttl=r.route_block_ttl,
             tunnel_probe_window=r.tunnel_probe_window,
             switch_buffer_bytes=r.switch_buffer_bytes,

@@ -250,7 +250,7 @@ class TestClearing:
         sticky.record_success("c.example", "direct", now=now)
         body = (await client.request("DELETE", "/api/sticky", json={"upstream": "proxy-a"})).json()
         assert body["cleared"] == 2
-        assert [e.host for e in sticky.entries()] == ["c.example"]
+        assert [e.host for e in sticky.entries(now=now)] == ["c.example"]
 
     async def test_a_batch_by_hosts_normalises_each_entry(
         self, app: Application, client: httpx.AsyncClient

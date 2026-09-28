@@ -63,7 +63,7 @@ HostPath = Annotated[str, Path(min_length=1, max_length=255)]
 @router.get("/sticky", dependencies=[Authenticated])
 async def list_sticky(params: StickyQueryDep, app: AppDep) -> StickyPage:
     now = time.monotonic()
-    entries = [e for e in app.state.sticky.entries() if _matches(e, params)]
+    entries = [e for e in app.state.sticky.entries(now=now) if _matches(e, params)]
     entries.sort(key=_sort_key(params.sort), reverse=True)
     window = entries[params.offset : params.offset + params.page_size]
     return StickyPage(
@@ -213,7 +213,11 @@ async def clear_sticky_batch(
 
     sticky = app.state.sticky
     if body.upstream is not None:
-        targets = [e.host for e in sticky.entries() if e.upstream == body.upstream]
+        # ``now=`` 过滤掉已过期的 auto：批量清除的语义是「清掉现在生效的绑定」，
+        # 把内存里还残留着但下次访问就会被惰性删掉的条目也算进去，会让用户
+        # 以为是自己清掉的，其实是系统已经放弃的。
+        now_mono = time.monotonic()
+        targets = [e.host for e in sticky.entries(now=now_mono) if e.upstream == body.upstream]
     else:
         targets = [normalize_host(h) for h in (body.hosts or [])]
 

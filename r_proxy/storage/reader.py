@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from r_proxy.config.model import DatabaseConfig, LimitsConfig
+from r_proxy.storage.expiry import StickyExpiryPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +67,12 @@ class InitialState:
 
 
 def load_initial_state(
-    cfg: DatabaseConfig, limits: LimitsConfig, *, now_unix: float, now_mono: float
+    cfg: DatabaseConfig,
+    limits: LimitsConfig,
+    *,
+    now_unix: float,
+    now_mono: float,
+    sticky_policy: StickyExpiryPolicy | None = None,
 ) -> InitialState:
     """从 ``state.db`` 读出重启后仍然有效的状态。
 
@@ -82,7 +88,13 @@ def load_initial_state(
         return InitialState()
     try:
         return InitialState(
-            sticky=_load_sticky(conn, limits, now_unix=now_unix, now_mono=now_mono),
+            sticky=_load_sticky(
+                conn,
+                limits,
+                now_unix=now_unix,
+                now_mono=now_mono,
+                expiry=sticky_policy or StickyExpiryPolicy(),
+            ),
             blocks=_load_blocks(conn, limits, now_unix=now_unix, now_mono=now_mono),
             health=_load_health(conn),
         )
@@ -94,17 +106,27 @@ def load_initial_state(
 
 
 def _load_sticky(
-    conn: sqlite3.Connection, limits: LimitsConfig, *, now_unix: float, now_mono: float
+    conn: sqlite3.Connection,
+    limits: LimitsConfig,
+    *,
+    now_unix: float,
+    now_mono: float,
+    expiry: StickyExpiryPolicy,
 ) -> tuple[StickyRow, ...]:
+    # ``manual`` 不论新旧都回填——用户的声明跨重启必须保留；``auto`` 已被
+    # TTL 淘汰的行也不回填，回填进内存只会白占 LRU 容量（DD_STORAGE §5.1）。
+    # 禁用过期时 cutoff=0，``updated_at >= 0`` 恒真，等价于不过滤。
     # 按 updated_at 降序取前 N 条（N = LRU 容量）：最近用过的最有价值。
     rows = conn.execute(
         """
-        SELECT host, upstream_name, source, fail_count, hit_count, last_success_at
+        SELECT host, upstream_name, source, fail_count, hit_count,
+               MAX(last_success_at, updated_at)
           FROM host_upstream
+         WHERE source = 'manual' OR updated_at >= ?
          ORDER BY updated_at DESC
          LIMIT ?
         """,
-        (limits.sticky_cache_size,),
+        (expiry.cutoff(now_unix=int(now_unix)), limits.sticky_cache_size),
     ).fetchall()
     return tuple(
         StickyRow(

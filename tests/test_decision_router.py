@@ -599,6 +599,22 @@ class TestStickyPrepend:
             "b",
         )
 
+    def test_expired_auto_sticky_is_not_prepended(self, router: Router) -> None:
+        """空闲超 sticky_ttl 的 auto 绑定在路由决策时被惰性删除，等同于没学过。"""
+        snap = make_snapshot(
+            upstream("a", priority=10),
+            upstream("b", priority=20),
+            routing=RoutingConfig(sticky_ttl=100),
+        )
+        state = RuntimeState.from_snapshot(snap)
+        state.sticky.record_success("example.com", "b", now=0.0)
+        # 150 秒后发起请求，已超 100 秒 TTL
+        decision = router.build_chain(target("example.com"), snap, EMPTY_RULE_SET, state, now=150.0)
+        assert decision.chain == ("a", "b")
+        assert decision.source == "priority"
+        # 确认内存已被惰性清除
+        assert state.sticky.get("example.com") is None
+
 
 class TestPurity:
     def test_router_holds_no_per_request_state(self, router: Router) -> None:

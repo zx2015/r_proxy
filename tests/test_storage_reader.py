@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from r_proxy.config.model import DatabaseConfig, LimitsConfig
+from r_proxy.storage.expiry import StickyExpiryPolicy
 from r_proxy.storage.reader import InitialState, ReadOnlyPool, load_initial_state, to_monotonic
 from r_proxy.storage.schema import Database, open_write
 
@@ -58,10 +59,20 @@ def block_row(
 
 
 def load(
-    cfg: DatabaseConfig, limits: LimitsConfig | None = None, *, now: float | None = None
+    cfg: DatabaseConfig,
+    limits: LimitsConfig | None = None,
+    *,
+    now: float | None = None,
+    expiry: StickyExpiryPolicy | None = None,
 ) -> InitialState:
     now_unix = time.time() if now is None else now
-    return load_initial_state(cfg, limits or LimitsConfig(), now_unix=now_unix, now_mono=1000.0)
+    return load_initial_state(
+        cfg,
+        limits or LimitsConfig(),
+        now_unix=now_unix,
+        now_mono=1000.0,
+        sticky_policy=expiry,
+    )
 
 
 class TestStickyBackfill:
@@ -98,6 +109,72 @@ class TestStickyBackfill:
         cfg = seed(tmp_path, [sticky_row("a.com", "up1", updated_at=now - 30)])
         (entry,) = load(cfg, now=now).sticky
         assert entry.last_used_at == pytest.approx(970.0)
+
+
+class TestStickyRestoreExpiry:
+    """回填过滤：过期 auto 不入内存；manual 不论新旧都进（DD_STORAGE §5.1）。"""
+
+    def test_expired_auto_rows_are_skipped(self, tmp_path: Path) -> None:
+        now = int(time.time())
+        rows = [sticky_row(f"h{i}.com", "up1", updated_at=now - 10_000 - i) for i in range(5)]
+        cfg = seed(tmp_path, rows)
+        restored = load(cfg, now=now, expiry=StickyExpiryPolicy(ttl_seconds=3_600.0)).sticky
+        assert restored == ()
+
+    def test_recent_auto_rows_still_come_through(self, tmp_path: Path) -> None:
+        now = int(time.time())
+        rows = [sticky_row("fresh.com", "up1", updated_at=now - 60)]
+        cfg = seed(tmp_path, rows)
+        (entry,) = load(cfg, now=now, expiry=StickyExpiryPolicy(ttl_seconds=3_600.0)).sticky
+        assert entry.host == "fresh.com"
+
+    def test_manual_rows_are_always_restored(self, tmp_path: Path) -> None:
+        """manual 是用户声明，跨重启必须保留：无论多久没动都回填。"""
+        now = int(time.time())
+        cfg = seed(
+            tmp_path, [sticky_row("pinned.com", "up1", source="manual", updated_at=now - 10_000)]
+        )
+        (entry,) = load(cfg, now=now, expiry=StickyExpiryPolicy(ttl_seconds=3_600.0)).sticky
+        assert (entry.host, entry.source) == ("pinned.com", "manual")
+
+    def test_zero_ttl_restores_everything(self, tmp_path: Path) -> None:
+        """``ttl=0`` 是「禁用过期」，回填不过滤任何 auto——与 ``get_live`` 一致。"""
+        now = int(time.time())
+        cfg = seed(
+            tmp_path,
+            [
+                sticky_row("old.com", "up1", updated_at=now - 10_000),
+                sticky_row("pinned.com", "up1", source="manual", updated_at=now - 10_000),
+            ],
+        )
+        restored = load(cfg, now=now, expiry=StickyExpiryPolicy(ttl_seconds=0.0)).sticky
+        assert [e.host for e in restored] == ["old.com", "pinned.com"]
+
+    def test_the_default_policy_disables_filtering(self, tmp_path: Path) -> None:
+        """不传 policy 时回填行为与旧版完全一致：不过滤 auto。"""
+        now = int(time.time())
+        cfg = seed(tmp_path, [sticky_row("old.com", "up1", updated_at=now - 10_000)])
+        assert load(cfg, now=now).sticky[0].host == "old.com"
+
+    def test_last_used_at_falls_back_to_updated_at(self, tmp_path: Path) -> None:
+        """``last_success_at=0``（管理员手工 insert 常见）时，回填以
+        ``updated_at`` 作最后访问时间——否则会被 TTL 误判为远古过期。"""
+        now = int(time.time())
+        cfg = seed(
+            tmp_path,
+            [
+                (
+                    "INSERT INTO host_upstream"
+                    " (host, upstream_name, source, last_success_at,"
+                    "  fail_count, hit_count, updated_at)"
+                    " VALUES (?, ?, 'auto', 0, 0, 1, ?)",
+                    ("a.com", "up1", now - 60),
+                )
+            ],
+        )
+        (entry,) = load(cfg, now=now, expiry=StickyExpiryPolicy(ttl_seconds=3_600.0)).sticky
+        # now_mono=1000.0、距今 60 秒 → 940.0，而不是 last_success_at=0 推出的极负值。
+        assert entry.last_used_at == pytest.approx(940.0)
 
 
 class TestBlockBackfill:

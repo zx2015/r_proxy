@@ -517,6 +517,7 @@ class RoutingSettings(Model):
     read_timeout: float
     switch_on_status: list[int]
     sticky_fail_threshold: int
+    sticky_ttl: int
     route_block_ttl: int
     tunnel_probe_window: float
     switch_buffer_bytes: int
@@ -564,6 +565,8 @@ class SettingsUpdateRequest(VersionedRequest):
     # 但会让用户以为设置生效了。
     switch_on_status: list[StatusCode] | None = Field(None, max_length=64)
     sticky_fail_threshold: int | None = Field(None, ge=1, le=100)
+    # 上界 1 年。0 是合法值，表示 auto 粘性永不过期（DD_ROUTING §7.7）。
+    sticky_ttl: int | None = Field(None, ge=0, le=31_536_000)
     route_block_ttl: int | None = Field(None, ge=1, le=86_400)
     tunnel_probe_window: float | None = Field(None, gt=0, le=300)
     max_switches_per_host: int | None = Field(None, ge=1, le=1_000)
@@ -592,6 +595,7 @@ _SETTING_KEYS = {
     "read_timeout": "routing.read_timeout",
     "switch_on_status": "routing.switch_on_status",
     "sticky_fail_threshold": "routing.sticky_fail_threshold",
+    "sticky_ttl": "routing.sticky_ttl",
     "route_block_ttl": "routing.route_block_ttl",
     "tunnel_probe_window": "routing.tunnel_probe_window",
     "max_switches_per_host": "routing.status_switch_rate_limit.max_switches_per_host",

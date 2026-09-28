@@ -50,7 +50,7 @@ class Router:
                 empty_reason=self._empty_reason(target, snapshot, state),
             )
         ordered = _direct_first(self._order(usable, snapshot, state), target, snapshot)
-        chain, source = self._apply_sticky(ordered, target, state, usable)
+        chain, source = self._apply_sticky(ordered, target, state, usable, now=now)
         return Decision(chain=chain, source=source)
 
     def _apply_sticky(
@@ -59,14 +59,19 @@ class Router:
         target: RequestTarget,
         state: RuntimeStateView,
         usable: set[str],
+        *,
+        now: float,
     ) -> tuple[tuple[str, ...], DecisionSource]:
         """把上次成功的出口提到链首，其余保持优先级序。
 
         粘性出口已不在 ``usable`` 中（被禁用、熔断、有负面记忆、地址族不匹配）
         时**不前置也不清除**：清除是执行层的职责，只有真正尝试失败才累加
         ``fail_count``。路由层因熔断暂时跳过它，不代表这个绑定是错的。
+
+        用 :meth:`StickyCache.get_live` 而非 ``get``：空闲超过 ``sticky_ttl`` 的
+        ``auto`` 绑定在此惰性删除，等价于「从没学过」（DD_ROUTING §7.7）。
         """
-        entry = state.sticky.get(target.host)
+        entry = state.sticky.get_live(target.host, now=now)
         if entry is None or entry.upstream not in usable:
             return chain, "priority"
         head = entry.upstream
