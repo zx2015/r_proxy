@@ -118,8 +118,7 @@ class TestChunkedResponsePassThrough:
             "section」类故障的根因。"
         )
         assert "content-length:" not in header_text, (
-            "分块响应不应该同时出现 Content-Length，否则客户端对消息边界的"
-            "判断会产生歧义。"
+            "分块响应不应该同时出现 Content-Length，否则客户端对消息边界的判断会产生歧义。"
         )
 
     async def test_body_bytes_pass_through_unmodified_and_decode_correctly(

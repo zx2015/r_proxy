@@ -156,9 +156,7 @@ class TestSchema:
         # 且该版本本来就没有 client_addr 列（v1 建表脚本没有这一列）。
         conn = sqlite3.connect(path)
         try:
-            conn.execute(
-                "UPDATE schema_meta SET value = '1' WHERE key = 'schema_version'"
-            )
+            conn.execute("UPDATE schema_meta SET value = '1' WHERE key = 'schema_version'")
             conn.execute("ALTER TABLE request_log DROP COLUMN client_addr")
             conn.commit()
         finally:
@@ -497,9 +495,7 @@ class TestWriterThread:
                 )
             )
             w.flush()
-            rows = w.state_rows(
-                "SELECT bytes_up_total, bytes_down_total FROM upstream_health"
-            )
+            rows = w.state_rows("SELECT bytes_up_total, bytes_down_total FROM upstream_health")
         assert rows == [(150, 225)]
 
     def test_timestamps_never_go_backwards(self, tmp_path: Path) -> None:
@@ -587,9 +583,7 @@ class TestWriterThread:
                     )
                 )
             w.flush()
-            rows = w.log_rows(
-                "SELECT host, bytes_up, bytes_down FROM traffic_log ORDER BY id"
-            )
+            rows = w.log_rows("SELECT host, bytes_up, bytes_down FROM traffic_log ORDER BY id")
         assert rows == [("example.com", 10, 20)] * 3
 
     def test_state_and_logs_go_to_their_own_files(self, tmp_path: Path) -> None:

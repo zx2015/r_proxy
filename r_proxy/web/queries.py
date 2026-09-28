@@ -96,9 +96,7 @@ def query_attempts(pool: ReadOnlyPool, request_ids: Sequence[str]) -> list[sqlit
 _AUDIT_COLUMNS = "id, actor, action, target, diff, version_before, version_after, created_at"
 
 
-def query_host_traffic(
-    pool: ReadOnlyPool, since: int, until: int, limit: int
-) -> list[sqlite3.Row]:
+def query_host_traffic(pool: ReadOnlyPool, since: int, until: int, limit: int) -> list[sqlite3.Row]:
     """当日（或指定区间）各 host 的流量排行（DD_STORAGE.md §4.3b）。
 
     区间必须由调用方先解析好（见 ``HostTrafficQuery.resolved_range``）——本函数

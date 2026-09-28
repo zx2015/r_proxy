@@ -166,9 +166,7 @@ async def _storage_busy(request: Request, exc: Exception) -> JSONResponse:
     if not isinstance(exc, sqlite3.OperationalError):
         return await _unhandled_error(request, exc)
     request_id = uuid.uuid4().hex[:16]
-    logger.warning(
-        "存储查询繁忙 [%s] %s %s: %s", request_id, request.method, request.url.path, exc
-    )
+    logger.warning("存储查询繁忙 [%s] %s %s: %s", request_id, request.method, request.url.path, exc)
     return JSONResponse(
         status_code=503,
         content={

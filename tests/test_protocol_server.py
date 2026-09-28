@@ -711,9 +711,7 @@ class TestTrafficLogging:
         finally:
             await server.stop()
 
-    async def test_a_tunnel_is_logged_with_actual_byte_counts(
-        self, fake_proxy: FakeServer
-    ) -> None:
+    async def test_a_tunnel_is_logged_with_actual_byte_counts(self, fake_proxy: FakeServer) -> None:
         sink = RecordingSink()
         cfg = snapshot(UpstreamConfig(name="p", type="http", address=fake_proxy.address))
         server = ProxyServer(cfg, sink=sink)

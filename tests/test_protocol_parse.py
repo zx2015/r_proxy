@@ -191,9 +191,7 @@ class TestStripHopByHop:
         摘掉，对端收到的头部与线上实际字节框架就自相矛盾——对端会把分块
         长度行当成消息内容解析，产生的消息在语义上已损坏。
         """
-        h = strip_hop_by_hop(
-            Headers([("Host", "x.com"), ("Transfer-Encoding", "chunked")])
-        )
+        h = strip_hop_by_hop(Headers([("Host", "x.com"), ("Transfer-Encoding", "chunked")]))
         assert h.get("transfer-encoding") == "chunked"
 
     def test_removes_proxy_authorization(self) -> None:
