@@ -306,13 +306,19 @@ async function promote(item, condition) {
   }
 }
 
-/** 一次说清三件事：规则落在哪、它盖住了谁、规则功能是不是开着。*/
+/** 一次说清四件事：规则落在哪、它盖住了谁、连带清掉了哪些、规则功能是不是开着。*/
 function promoteMessage(condition, item, result) {
   const parts = [`已固化为 rules[${result.position}]：${condition} → ${item.upstream}。`];
   if (result.previous_match) {
     parts.push(
       `原先命中的 rules[${result.previous_match.position}]（${result.previous_match.condition}）` +
         "对该 host 不再生效。",
+    );
+  }
+  if (result.swept_hosts && result.swept_hosts.length > 0) {
+    parts.push(
+      `同时清除了 ${result.swept_hosts.length} 条已被该规则覆盖的粘性映射：` +
+        `${result.swept_hosts.join("、")}。`,
     );
   }
   if (!result.rules_enabled) parts.push("注意：规则功能当前已关闭，这条规则暂不生效。");

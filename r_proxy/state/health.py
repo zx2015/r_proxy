@@ -50,8 +50,11 @@ class HealthTable:
     def is_available(self, name: str, *, now: float) -> bool:
         """该出口现在能否进入候选链。
 
-        会顺带完成 ``open → half_open`` 的惰性迁移，因此对 ``half_open``
-        出口连续调用只有第一次配合 :meth:`acquire_probe` 能放行探测。
+        **不是纯查询方法**：会顺带完成 ``open → half_open`` 的惰性迁移（写
+        `self._health[name].state`），因此对 ``half_open`` 出口连续调用只有
+        第一次配合 :meth:`acquire_probe` 能放行探测。只想看一眼状态而不想
+        触发迁移的调用方不存在——`state_of`/`all`/`views.health_info` 都特意
+        经它才能拿到不过期的状态（见各自文档），没有绕开它的安全用法。
         """
         health = self._health.get(name)
         if health is None or health.state is HealthState.CLOSED:

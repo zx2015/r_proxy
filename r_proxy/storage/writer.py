@@ -29,7 +29,7 @@ _SQL: dict[OpKind, str] = {
         INSERT INTO host_upstream
             (host, upstream_name, source, last_url, last_success_at,
              last_http_status, fail_count, hit_count, updated_at)
-        VALUES (?, ?, 'auto', ?, ?, ?, 0, 1, ?)
+        VALUES (?, ?, 'auto', ?, ?, ?, 0, ?, ?)
         ON CONFLICT(host) DO UPDATE SET
             upstream_name    = excluded.upstream_name,
             last_url         = excluded.last_url,
@@ -37,7 +37,7 @@ _SQL: dict[OpKind, str] = {
                                    excluded.last_success_at),
             last_http_status = excluded.last_http_status,
             fail_count       = 0,
-            hit_count        = host_upstream.hit_count + 1,
+            hit_count        = host_upstream.hit_count + excluded.hit_count,
             updated_at       = excluded.updated_at
         WHERE host_upstream.source != 'manual'
     """,
@@ -66,9 +66,9 @@ _SQL: dict[OpKind, str] = {
         INSERT INTO route_block
             (host, upstream_name, fail_count, last_error,
              last_failure_at, blocked_until)
-        VALUES (?, ?, 1, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(host, upstream_name) DO UPDATE SET
-            fail_count      = route_block.fail_count + 1,
+            fail_count      = route_block.fail_count + excluded.fail_count,
             last_error      = excluded.last_error,
             last_failure_at = excluded.last_failure_at,
             blocked_until   = excluded.blocked_until

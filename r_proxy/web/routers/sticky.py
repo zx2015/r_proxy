@@ -126,6 +126,10 @@ async def promote_sticky(
     规则生效后这条粘性再也不会被读到（命中规则会短路掉粘性），留着只会显示一个
     不再变化的命中数，所以顺带清掉。清除放在写库成功**之后**：反过来会在校验
     失败时白丢一条有用的绑定。
+
+    新规则通常比单个 host 覆盖面更宽（如 `*.modelscope.cn`），表里可能还有其他
+    host 恰好落进它的覆盖范围（如 `api-inference.modelscope.cn`）。这些条目同样
+    会被新规则短路，因此固化成功后一并清扫（见 ``_sweep_shadowed_sticky``）。
     """
     key = normalize_host(host)
     if not key:
@@ -159,11 +163,13 @@ async def promote_sticky(
     cleared = app.state.sticky.clear(key)
     if cleared:
         app.storage.queue.put(sticky_delete(host=key))
+    swept_hosts = _sweep_shadowed_sticky(app, exclude=key)
     return StickyPromoteResponse(
         position=position,
         revision=revision,
         rules_enabled=app.snapshot.rules_enabled,
         sticky_cleared=cleared,
+        swept_hosts=swept_hosts,
         previous_match=(
             None
             if previous is None
@@ -171,6 +177,31 @@ async def promote_sticky(
         ),
         issues=[IssueItem.model_validate(d) for d in issue_details(issues)],
     )
+
+
+def _sweep_shadowed_sticky(app: Application, *, exclude: str) -> list[str]:
+    """清掉「现在已被某条规则覆盖」的其余粘性映射。
+
+    固化只保证触发本次操作的那个 host 被处理；表里可能还有其他 host 恰好落进
+    新规则（覆盖面通常比单个 host 更宽，例如 `*.modelscope.cn`）的范围，例如
+    `api-inference.modelscope.cn`。这些条目会被新规则短路，永远不再被路由读取，
+    留着只会在界面上显示一批不再变化的绑定，因此一并清掉。
+
+    用 :func:`match` 逐条对当前规则表重新判定，而不是自己解析新规则的条件字符
+    串去比对——「是否被规则覆盖」正是路由决策要回答的问题，另写一份匹配逻辑
+    必然与真实行为漂移。`app.rules` 在这里已经是固化后热重载过的最新快照。
+    """
+    swept: list[str] = []
+    now = time.monotonic()
+    for entry in app.state.sticky.entries(now=now):
+        if entry.host == exclude:
+            continue
+        if match(app.rules, _probe(entry.host)) is None:
+            continue
+        if app.state.sticky.clear(entry.host):
+            app.storage.queue.put(sticky_delete(host=entry.host))
+            swept.append(entry.host)
+    return swept
 
 
 def _probe(host: str) -> RequestTarget:

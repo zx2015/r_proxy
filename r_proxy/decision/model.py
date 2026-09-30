@@ -67,6 +67,14 @@ class SwitchContext:
     response_started: bool
     host: str
     attempt_index: int = 0
+    # 读客户端请求体超时（客户端声明了长度却不发/发得太慢）。与 `replayable`
+    # 语义不同：`replayable` 只回答「已转发的字节能不能重放给下一个出口」，
+    # 而这里回答「客户端本身还会不会再发数据」——换哪个出口都等不到客户端
+    # 补发剩余的 body，因此即便 `replayable` 仍为 True（尚未超过缓冲上限）
+    # 也不该切换。`switch_buffer_bytes: 0` 时 `replayable` 从一开始就是
+    # False，但传输层失败（字节还没发出）仍可切换（DD_SWITCHING §7.6）——
+    # 这条与 `replayable` 分开建模，才不会把那条既有规则连带破坏。
+    client_body_timeout: bool = False
 
 
 class SwitchReason(Enum):
@@ -88,6 +96,7 @@ class KeepReason(Enum):
     RESPONSE_STARTED = auto()
     RATE_LIMITED = auto()
     IDLE_CONNECTION_RECYCLED = auto()
+    CLIENT_BODY_TIMEOUT = auto()
 
 
 @dataclass(frozen=True, slots=True)

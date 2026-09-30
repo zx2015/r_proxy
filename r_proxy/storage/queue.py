@@ -64,7 +64,9 @@ class _Spec:
 
 
 _SPECS: dict[OpKind, _Spec] = {
-    OpKind.STICKY_UPSERT: _Spec(Priority.CRITICAL, Database.STATE, "host_upstream", key_slots=(0,)),
+    OpKind.STICKY_UPSERT: _Spec(
+        Priority.CRITICAL, Database.STATE, "host_upstream", key_slots=(0,), delta_slots=(5,)
+    ),
     OpKind.STICKY_MANUAL_UPSERT: _Spec(
         Priority.CRITICAL, Database.STATE, "host_upstream", key_slots=(0,)
     ),
@@ -75,7 +77,7 @@ _SPECS: dict[OpKind, _Spec] = {
         Priority.CRITICAL, Database.STATE, "host_upstream", key_slots=(0,), deletes_row=True
     ),
     OpKind.ROUTE_BLOCK_UPSERT: _Spec(
-        Priority.CRITICAL, Database.STATE, "route_block", key_slots=(0, 1)
+        Priority.CRITICAL, Database.STATE, "route_block", key_slots=(0, 1), delta_slots=(2,)
     ),
     OpKind.ROUTE_BLOCK_DELETE: _Spec(
         Priority.CRITICAL, Database.STATE, "route_block", key_slots=(0, 1), deletes_row=True
@@ -135,10 +137,24 @@ class WriteOp:
 
 
 def sticky_upsert(
-    *, host: str, upstream: str, url: str | None, now_unix: int, status: int | None
+    *,
+    host: str,
+    upstream: str,
+    url: str | None,
+    now_unix: int,
+    status: int | None,
+    hit_delta: int = 1,
 ) -> WriteOp:
-    """绑定关系变化才发 UPSERT。纯计数变化走 :func:`sticky_hit`。"""
-    return WriteOp(OpKind.STICKY_UPSERT, (host, upstream, url, now_unix, status, now_unix))
+    """绑定关系变化才发 UPSERT。纯计数变化走 :func:`sticky_hit`。
+
+    ``hit_delta`` 默认 1：一次绑定变化本身也算一次命中。它是 delta 列
+    （``_SPECS`` 里的 ``delta_slots``），同批次内该 host 连续换绑多次时会被
+    合并相加，而不是像 ``upstream``/``status`` 那样只保留最后一次的值——否则
+    落盘的 ``hit_count`` 会比实际发生的命中次数少。
+    """
+    return WriteOp(
+        OpKind.STICKY_UPSERT, (host, upstream, url, now_unix, status, hit_delta, now_unix)
+    )
 
 
 def sticky_manual_upsert(*, host: str, upstream: str, now_unix: int) -> WriteOp:
@@ -163,9 +179,25 @@ def sticky_delete(*, host: str) -> WriteOp:
 
 
 def route_block_upsert(
-    *, host: str, upstream: str, reason: str, now_unix: int, blocked_until: int
+    *,
+    host: str,
+    upstream: str,
+    reason: str,
+    now_unix: int,
+    blocked_until: int,
+    fail_count_delta: int = 1,
 ) -> WriteOp:
-    return WriteOp(OpKind.ROUTE_BLOCK_UPSERT, (host, upstream, reason, now_unix, blocked_until))
+    """``fail_count_delta`` 是本次 delta 列（默认 1，即一次失败）。
+
+    同批次内同一 ``(host, upstream)`` 连续被 block 多次时会被合并相加，而不是
+    只保留最后一次的 ``blocked_until``/``reason`` 之外的值——`fail_count` 是
+    Web 界面上「这个出口对这个 host 失败过几次」的诊断依据（[DD_STORAGE
+    §6.2](../design/DD_STORAGE.md)），批次内静默少计会让这个数字失真。
+    """
+    return WriteOp(
+        OpKind.ROUTE_BLOCK_UPSERT,
+        (host, upstream, fail_count_delta, reason, now_unix, blocked_until),
+    )
 
 
 def route_block_delete(*, host: str, upstream: str) -> WriteOp:

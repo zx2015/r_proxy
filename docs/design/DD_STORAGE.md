@@ -2,6 +2,7 @@
 
 | 版本 | 日期 | 变更说明 | 作者 |
 | :--- | :--- | :--- | :--- |
+| v1.12.0 | 2026-09-30 | 代码评审修复：`route_block_upsert`/`sticky_upsert` 的 `fail_count`/`hit_count` 补 `delta_slots`（新增 `fail_count_delta`/`hit_delta` 参数，默认 1），SQL 由 `route_block.fail_count + 1`/`host_upstream.hit_count + 1` 改为 `+ excluded.fail_count`/`+ excluded.hit_count`；此前同批次内同一 `(host, upstream)`/同一 host 被多次写入时，合并只留最后一条，计数会比实际少（§4.4、§4.4a） | Agent |
 | v1.9.0 | 2026-09-24 | 新增 `request_log.client_addr`（客户端来源地址）：§3 schema 补列，§3.1 补取舍说明，§3.2 补 `logs.db` schema 版本 1→2 的迁移步骤示例，§4.9 补字段来源（`ProxyServer._on_client` 的 `peername`）与容器网络前提（依赖 `network_mode: host`，见 [DD_DEPLOY.md](./DD_DEPLOY.md)） | Agent |
 | v1.10.0 | 2026-09-24 | **流量统计已实现并上线**（见 [WEBUI_SPEC §2.1](../requirements/WEBUI_SPEC.md)）：①`state.db` 的 `upstream_health` 新增 `bytes_up_total`/`bytes_down_total`（`STATE` schema 1→2），供出口健康看板；②`logs.db` 新增 `traffic_log` 表（`LOGS` schema 2→3），每个成功交付的请求关闭/结束时落一行，供「当日主机流量榜」按 `created_at` 有界聚合，不依赖全表扫描；③§4.3 新增 §4.3b 关键 SQL；④§5 启动回填新增两个字节字段；⑤§6 清理任务把 `traffic_log` 并入既有的 `request_log` 保留策略。生产端见 [DD_PROXY §5.2.2/§6.4](./DD_PROXY.md)，内存侧见 [DD_ROUTING §4.8](./DD_ROUTING.md) | Agent |
 | v1.11.0 | 2026-09-28 | 粘性映射加时间老化：①`RoutingConfig.sticky_ttl`（默认 30 天，0=禁用）；②`§5.1` 回填 SQL 加 `WHERE source='manual' OR updated_at >= cutoff`，`last_used_at` 取 `MAX(last_success_at, updated_at)`；③新增 §6.3「粘性老化清理」（无宽限期，仅删 `auto`，`manual` 永存）；④`StickyExpiryPolicy` 放在 `storage/expiry.py` 作为分层边界 | Agent |
@@ -356,7 +357,7 @@ _SQL = {
         INSERT INTO host_upstream
             (host, upstream_name, source, last_url, last_success_at,
              last_http_status, fail_count, hit_count, updated_at)
-        VALUES (?, ?, 'auto', ?, ?, ?, 0, 1, ?)
+        VALUES (?, ?, 'auto', ?, ?, ?, 0, ?, ?)
         ON CONFLICT(host) DO UPDATE SET
             upstream_name    = excluded.upstream_name,
             last_url         = excluded.last_url,
@@ -364,7 +365,7 @@ _SQL = {
                                    excluded.last_success_at),
             last_http_status = excluded.last_http_status,
             fail_count       = 0,
-            hit_count        = host_upstream.hit_count + 1,
+            hit_count        = host_upstream.hit_count + excluded.hit_count,
             updated_at       = excluded.updated_at
         WHERE host_upstream.source != 'manual'
     """,
@@ -414,9 +415,9 @@ _SQL = {
         INSERT INTO route_block
             (host, upstream_name, fail_count, last_error,
              last_failure_at, blocked_until)
-        VALUES (?, ?, 1, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(host, upstream_name) DO UPDATE SET
-            fail_count      = route_block.fail_count + 1,
+            fail_count      = route_block.fail_count + excluded.fail_count,
             last_error      = excluded.last_error,
             last_failure_at = excluded.last_failure_at,
             blocked_until   = excluded.blocked_until
@@ -440,6 +441,7 @@ _SQL = {
 3. **`total_success + excluded.total_success`**：SQL 侧自增。传入的是「本批次增量」而非「累计值」，因此 Python 侧从不需要读取当前值。这是 RC-02 的解法
 4. **`MAX(last_success_at, excluded.last_success_at)`**：时间戳单调保护（RC-06）。乱序落盘的批次不会让时间倒退
 5. **`consecutive_failures = excluded.consecutive_failures`**（覆盖而非自增）：它是内存中的权威值，不是增量。混淆这两类字段是最容易出的错——把覆盖写成自增，计数会翻倍；把自增写成覆盖，并发批次会互相丢失
+6. **`sticky_upsert` 的 `hit_count`、`route_block_upsert` 的 `fail_count` 同样是自增列，即使整条语句的性质是「upsert」**：`hit_count = host_upstream.hit_count + excluded.hit_count`、`fail_count = route_block.fail_count + excluded.fail_count`，而不是固定的 `+ 1`。「这条语句是 upsert」与「这条语句里某一列是自增」是两回事——upsert 的 `upstream_name`/`blocked_until` 这类字段该覆盖，但混在同一条语句里的计数列如果也跟着覆盖，同一批次内该行被写入两次以上时，`_combine()`（§4.4）会按「非增量列取最后一份」的规则把中间的增量全部丢弃，计数比实际发生的次数少。`route_block.fail_count` 尤其要注意：它是 Web 界面「这个出口对这个 host 失败过几次」的诊断依据（§6.2），批次内静默少计会直接影响这个数字的可信度
 
 自增列还有一条不那么显眼的配套要求：**计算增量的基线必须与启动回填同源**。`HealthPersister` 用「当前累计 − 上次落盘累计」算增量，而 `apply_initial_state` 已经把库里的历史值装进了内存健康表；基线若从零起算，首次落盘的增量就是整个历史总量，被 `+ excluded` 再加一遍，每重启一次计数翻一倍。2026-08-16 的容器化验证暴露了这个缺陷，修复是把回填用的 `InitialState` 一并交给 `HealthPersister` 播种基线，详见 [DD_DEPLOY §9.1](./DD_DEPLOY.md)。`bytes_up_total`/`bytes_down_total` 是同一类自增列，`HealthPersister._last` 的基线元组随之从 `(success, failure)` 扩成 `(success, failure, bytes_up, bytes_down)`，播种与丢弃基线的规则完全复用（§4.7 已有的「热重载删除出口时基线一并丢弃」同样适用）。
 
@@ -489,7 +491,7 @@ def _merge(ops: list[WriteOp]) -> list[WriteOp]:
 | 操作类型 | 合并方式 |
 |----------|----------|
 | `increment` | 增量相加：`hit_count + 1` 三次 → `hit_count + 3` |
-| `upsert`（同主键） | 保留最后一个（后写的覆盖先写的） |
+| `upsert`（同主键） | 权威列保留最后一个（后写的覆盖先写的）；**但该语句里嵌着的计数列（`sticky_upsert.hit_count`、`route_block_upsert.fail_count`）仍按 `delta_slots` 相加**，不能因为整条语句是「upsert」就整体套用「取最后一份」——历史上这里漏标过 `delta_slots`，同批次内多次写入会悄悄少计（详见 v1.12.0） |
 | `insert`（如 `request_log`） | **不合并**，每条都要保留 |
 | `delete` + 后续 `upsert` | 保留 `upsert`（顺序语义） |
 
@@ -1044,6 +1046,8 @@ Web 界面只回答「现在怎么样」。长期后台运行还需要回答「�
 | 自动成功 + 已有 manual 绑定 | UPSERT 被 `WHERE` 拒绝，绑定不变 | CC-06 |
 | 乱序落盘的两批 `last_success_at` | 取较大值，不倒退 | CC-08 |
 | 同一批次 5 条同 host 的 `hit_count + 1` | 合并为一条 `+ 5` | — |
+| 同一批次内同一 host 连续换绑（多次 `sticky_upsert`） | `upstream_name` 取最后一次，`hit_count` 的增量按次数相加 | — |
+| 同一批次内同一 `(host, upstream)` 被 block 多次 | `fail_count` 按次数相加，不因合并成一条而少计 | — |
 | 同一批次 `delete` 后 `upsert` | 最终结果为 `upsert` | — |
 | 同一批次 `upsert` 后 `delete` | 最终结果为 `delete` | — |
 | 队列写满后继续写 `request_log` | 丢弃并计数，不阻塞事件循环 | RL-03 |

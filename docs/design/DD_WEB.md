@@ -2,6 +2,8 @@
 
 | 版本 | 日期 | 变更说明 | 作者 |
 | :--- | :--- | :--- | :--- |
+| v2.2.4 | 2026-09-30 | §5.3 补部署拓扑警告：`AuthThrottle` 按对端地址限流的前提是 Web 界面直接暴露给客户端，反向代理前置会让限流失效/误伤，交叉引用 [DD_DEPLOY §2.1](./DD_DEPLOY.md) 的详细分析与规避方向 | Agent |
+| v2.2.3 | 2026-09-30 | §8.9 固化粘性为规则新增「连带清扫」：固化成功后除清掉被固化的 host 外，还用 `match()` 重新扫描其余粘性条目，把恰好落进新规则覆盖范围的一并清除（如固化 `*.modelscope.cn` 后 `api-inference.modelscope.cn` 同步清掉），响应新增 `swept_hosts` 字段；§8.9.2 约束表补一行 | Agent |
 | v2.1.7 | 2026-09-24 | 新增 `request_log.client_addr`（客户端来源地址）的 Web 侧接入：§4.2 `_COLUMNS`、`LogItem` 补该列，`LogQuery` 补可选精确匹配过滤；§7.1 前端转义清单补该字段（同样来自不可信流量，与 `host`/`url` 同等对待）；§10.7 看板日志表补「来源」列。落盘与容器网络前提见 [DD_STORAGE §4.9](./DD_STORAGE.md)、[DD_PROXY §4.4](./DD_PROXY.md) | Agent |
 | v2.2.0 | 2026-09-24 | **流量统计已实现并上线**（见 [WEBUI_SPEC §2.1/§3.1](../requirements/WEBUI_SPEC.md)）：①`/api/health`、`/api/upstreams` 新增 `bytes_up_total`/`bytes_down_total`（§4.6、§8.5）；②新增 `GET /api/traffic/hosts`（§4.2b），查 `logs.db` 新表 `traffic_log`，默认时间窗为「今日」（服务器本地时区）；③§10.6 补充：新看板不进 3 秒轮询，走独立的低频刷新（默认 30 秒）；§10.7 看板要点补第五块数据来源 | Agent |
 | v2.2.1 | 2026-09-24 | §10.7 看板日志表去掉 URL、尝试序号两列：URL 与 host 高度重复且占横向空间，尝试序号只在切换事件流里有诊断价值 | Agent |
@@ -513,6 +515,8 @@ class AuthThrottle:
 
 - **被跟踪的 IP 数必须有上限**（`MAX_TRACKED_CLIENTS = 1024`，LRU 淘汰）。可增长资源都要有界，否则伪造源地址就能把内存撑满
 - **客户端标识取连接的对端地址，不看 `X-Forwarded-For`**。Web 界面直连本机，转发头完全由客户端控制，采信它等于让攻击者用一个伪造头绕开限流
+
+这条设计对部署拓扑有一个隐含假设：**Web 界面直接暴露给客户端**，`request.client.host` 拿到的是真实源地址。若在 Web 界面前面套一层反向代理（例如为了 TLS 终止），所有请求在这里看到的都是反向代理自身的地址，限流会退化成「对所有经这台代理的请求共用一个阈值」——攻击者可以无限次爆破而不触发限流，正常用户反而会被这个共享 IP 的阈值误伤。这不是本节代码要解决的问题（信任 `X-Forwarded-For` 只会更糟，见上一条），而是部署侧必须知道的约束，见 [DD_DEPLOY §2.1](./DD_DEPLOY.md) 的警告与两个规避方向。
 
 ---
 
@@ -1185,6 +1189,7 @@ async def promote_sticky(host: HostPath, body: StickyPromoteRequest,
     cleared = app.state.sticky.clear(key)           # 写库成功之后才清
     if cleared:
         app.storage.queue.put(sticky_delete(host=key))
+    swept_hosts = _sweep_shadowed_sticky(app, exclude=key)  # 顺带清连带覆盖的
 ```
 
 #### 8.9.1 为什么这不是「让粘性更持久」
@@ -1212,8 +1217,11 @@ async def promote_sticky(host: HostPath, body: StickyPromoteRequest,
 | 粘性条目**不存在**也照写规则 | 条目可能在点击与提交之间被 LRU 淘汰。规则内容全在请求体里，没有理由因此失败——报错只会让用户重来一遍同样的操作。响应用 `sticky_cleared` 如实回报 |
 | 清粘性放在写库成功**之后** | 反过来会在校验失败、条件重复、出口被禁时白丢一条有用的绑定 |
 | `previous_match` 在写库**之前**算 | 写完会热重载，之后再算命中的必然是刚插进去的那条 |
+| 连带清扫在写库成功、清完被固化的 host **之后**执行，且不影响接口返回值以外的失败 | 扫描与清除都只碰内存与写队列，不再有校验或写库这类会失败的步骤；即使这一步清到 0 条也不该影响固化本身已经成功这件事 |
 
 清掉粘性条目而不是留着标注：规则生效后它再也不会被读到（命中规则短路掉粘性），留着只会在界面上显示一个不再变化的命中数，还白占 LRU 容量。这也意味着 `StickySource` 只有 `auto | manual` 两个取值——**没有** `rule` 来源，规则命中既不读也不写粘性。
+
+同样的道理不止对被固化的那一个 host 成立。新规则的覆盖面通常比单个 host 更宽（如 `*.modelscope.cn`），表里可能还有其他 host 恰好落进它的范围（如 `api-inference.modelscope.cn`）——这些条目此后也会被同一条规则短路。因此固化成功后，`_sweep_shadowed_sticky` 会用 `match()` 对**当前全部粘性条目**重新判定一遍（`app.rules` 此时已是固化后热重载的最新快照），凡是命中任意规则的一律清除，被固化的 host 除外（它已经单独处理，避免重复入队）。用 `match()` 而不是自己解析条件字符串去比对：判断「是否被规则覆盖」正是路由决策本身要回答的问题，另写一份匹配逻辑必然与真实行为漂移，也会漏掉「被表里另一条早已存在、只是这次才生效」的规则覆盖的情形。
 
 #### 8.9.3 响应
 
@@ -1223,10 +1231,13 @@ async def promote_sticky(host: HostPath, body: StickyPromoteRequest,
   "revision": 8,
   "rules_enabled": true,
   "sticky_cleared": true,
+  "swept_hosts": ["api-inference.modelscope.cn"],
   "previous_match": { "position": 3, "condition": "*.github.com" },
   "issues": []
 }
 ```
+
+`swept_hosts` 是除被固化的 host 外、因新规则生效而被连带清除的其余粘性映射，空列表说明没有连带影响。它们与被固化的 host 走同一条 `sticky_delete` 落盘路径，界面据此在成功提示里说明「同时清除了 N 条已被该规则覆盖的粘性映射」，避免用户以为规则页与粘性页状态不一致。
 
 `previous_match` 非空说明表里本来就有一条更宽的规则管着这个 host，新规则从此优先于它——界面据此提示，避免用户在规则页看到两条都能匹配的规则时以为出了错。`rules_enabled` 为 `false` 时规则写进去了但不生效（`[rules] enabled = false`），提示语必须说出来，否则用户会以为固化失败。
 
@@ -1296,6 +1307,7 @@ async def promote_sticky(host: HostPath, body: StickyPromoteRequest,
 | `hosts` 超过 1000 条 | `422` | — |
 | 固化一条粘性映射 | 规则进表首（`position` 为 0）、`revision` +1、热重载后立即生效 | — |
 | 固化后原粘性条目 | 内存与 `state.db` 都清掉，响应 `sticky_cleared` 为 `true` | — |
+| 表里其他 host 恰好落进新规则覆盖范围 | 一并从内存与 `state.db` 清掉，响应 `swept_hosts` 列出这些 host；不受覆盖的条目不受影响 | — |
 | 固化时条目已被 LRU 淘汰 | 照写规则，`sticky_cleared` 为 `false` | — |
 | 固化的条件与表里已有条件重复 | `409 RULE_EXISTS`，库未改动（`[2001:0db8::1]` 与 `[2001:db8::1]` 算重复） | — |
 | 固化到禁用的出口 | `409`，规则未写 | — |

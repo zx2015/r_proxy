@@ -57,6 +57,7 @@ def switch_context(
     replayable: bool = True,
     response_started: bool = False,
     host: str = "example.com",
+    client_body_timeout: bool = False,
 ) -> SwitchContext:
     return SwitchContext(
         method=method,
@@ -65,6 +66,7 @@ def switch_context(
         replayable=replayable,
         response_started=response_started,
         host=host,
+        client_body_timeout=client_body_timeout,
     )
 
 
@@ -178,6 +180,30 @@ class TestChainWalking:
         assert fake.tried == ["a", "b"]
         assert result.delivered is not None
         assert result.delivered.outcome.ok is True
+
+    async def test_client_body_timeout_does_not_advance_to_the_next_upstream(
+        self, clock: Clock
+    ) -> None:
+        """客户端读 body 超时后换哪个出口都等不到剩下的数据：继续遍历候选链
+        只会让每个出口各自重复同一次超时，因此判据必须直接终止候选链。"""
+        snap = make_snapshot(upstream("a"), upstream("b"), routing=ROUTING)
+        state = RuntimeState.from_snapshot(snap)
+        client_timeout = AttemptResult(
+            outcome=AttemptOutcome(upstream="a", ok=False, error="TimeoutError"),
+            switch_context=switch_context(request_sent=False, client_body_timeout=True),
+        )
+        fake = FakeAttempts({"a": [client_timeout], "b": [ok_result("b")]})
+
+        result = await build(clock, state).execute(
+            target(),
+            Decision(chain=("a", "b"), source="priority"),
+            snap,
+            attempt=fake.attempt,
+            discard=fake.discard,
+        )
+
+        assert fake.tried == ["a"]
+        assert result.delivered is None
 
     async def test_exhausted_chain_reports_no_deliverable_result(self, clock: Clock) -> None:
         snap = make_snapshot(upstream("a"), upstream("b"), routing=ROUTING)

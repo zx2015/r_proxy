@@ -89,7 +89,10 @@ async def read_head(reader: asyncio.StreamReader, *, timeout: float) -> RawHead:
     except asyncio.LimitOverrunError as exc:
         raise HeaderTooLarge(f"请求头超过 {MAX_HEAD_BYTES} 字节上限") from exc
     except ValueError as exc:
-        # readuntil 在缓冲区超过 limit 时抛 LimitOverrunError（ValueError 子类）。
+        # 防御性兜底：``asyncio.LimitOverrunError`` 在当前 Python 版本下不是
+        # ``ValueError`` 的子类（已用 ``issubclass()`` 验证），上一条分支已经
+        # 单独接住它；这里接的是 ``readuntil`` 理论上可能抛出的其他
+        # ``ValueError``（如实现变化导致的边界情形），而不是它的子类。
         raise HeaderTooLarge(f"请求头超过 {MAX_HEAD_BYTES} 字节上限") from exc
     except asyncio.IncompleteReadError as exc:
         raise ClientDisconnected("客户端在请求头读完前断开") from exc

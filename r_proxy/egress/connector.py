@@ -178,7 +178,9 @@ class UpstreamConnector:
                 else:
                     # 退化为按 getaddrinfo 返回顺序串行尝试。
                     reader, writer = await asyncio.open_connection(host, port)
-        except (OSError, TimeoutError) as exc:
+        except OSError as exc:
+            # `TimeoutError` 是 `OSError` 的子类（含 `asyncio.timeout()` 抛出的那个），
+            # 单独列出纯属冗余，这里不重复写。
             raise ConnectorError(
                 classify_transport(exc, is_direct=is_direct), error_name(exc)
             ) from exc

@@ -117,6 +117,10 @@ class ClientConnection:
         # 因为客户端不会再发一遍。
         self._body_consumed = False
         self._request_sent = False
+        # 读客户端请求体超时后置位，且不再复位：客户端既然已经不再发送数据，
+        # 后续任何一次尝试重新读它都会以同样的方式再超时一次。见 `_send_body`
+        # 与 `SwitchContext.client_body_timeout` 的注释。
+        self._client_body_timeout = False
 
     async def handle(self) -> None:
         try:
@@ -405,7 +409,8 @@ class ClientConnection:
         except BadRequest:
             await conn.close()
             raise
-        except (OSError, TimeoutError, EOFError, ValueError, asyncio.IncompleteReadError) as exc:
+        except (OSError, EOFError, ValueError, asyncio.IncompleteReadError) as exc:
+            # `TimeoutError` 是 `OSError` 的子类，单独列出纯属冗余，这里不重复写。
             await conn.close()
             return AttemptResult(
                 outcome=AttemptOutcome(
@@ -476,6 +481,10 @@ class ClientConnection:
                 self.request_id,
                 self._head_read_timeout,
             )
+            # 客户端本身不再发数据，换出口重试注定以同样的方式再超时一次
+            # （见 `SwitchContext.client_body_timeout`）；标记后交给判据层
+            # 直接终止候选链，避免逐个出口重复等满这个超时才拿到最终 502。
+            self._client_body_timeout = True
             raise
         self._body_consumed = True
         return sent
@@ -488,6 +497,7 @@ class ClientConnection:
             replayable=self._replay.replayable,
             response_started=self._response_started,
             host=target.host,
+            client_body_timeout=self._client_body_timeout,
         )
 
     # -- 收尾 ----------------------------------------------------------------

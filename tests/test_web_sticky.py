@@ -341,6 +341,28 @@ class TestPromotion:
         assert app.state.sticky.get("a.example") is None
         await _wait_until_gone(app.storage.state_reader, exists)
 
+    async def test_other_hosts_now_covered_by_the_new_rule_are_swept_too(
+        self, app: Application, client: httpx.AsyncClient
+    ) -> None:
+        """`*.modelscope.cn` 固化后，`api-inference.modelscope.cn` 这类同域名下的
+        粘性映射会被新规则短路，留着只会显示一批不再变化的绑定，应一并清掉。"""
+        app.state.sticky.record_success(
+            "api-inference.modelscope.cn", "proxy-a", now=time.monotonic()
+        )
+        app.state.sticky.record_success("unrelated.example", "proxy-a", now=time.monotonic())
+
+        body = (
+            await client.post(
+                "/api/sticky/www.modelscope.cn/promote",
+                json={"condition": "*.modelscope.cn", "upstream": "proxy-a"},
+            )
+        ).json()
+
+        assert body["swept_hosts"] == ["api-inference.modelscope.cn"]
+        assert app.state.sticky.get("api-inference.modelscope.cn") is None
+        # 不受新规则覆盖的条目必须原样保留，不能被连带清掉。
+        assert app.state.sticky.get("unrelated.example") is not None
+
     async def test_the_host_is_normalised_before_clearing(
         self, app: Application, client: httpx.AsyncClient
     ) -> None:

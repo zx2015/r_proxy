@@ -173,7 +173,6 @@ function renderCards(status) {
     ["出口尝试总数", String(status.requests.attempts)],
     ["成功率", percent(status.requests.success_rate)],
     ["活跃连接", `${status.connections.active} / ${status.connections.limit}`],
-    ["拒绝连接", String(status.connections.rejected)],
     ["运行时长", duration(status.uptime_seconds)],
     ["监听地址", `${status.proxy.host}:${status.proxy.port}`],
     ["写队列", `${status.storage.queue_size} / ${status.storage.queue_capacity}`],

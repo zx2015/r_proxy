@@ -10,6 +10,7 @@
 | v1.5.0 | 2026-09-05 | 代码评审整改两处：①§4.3 补「读取客户端请求体」超时行——`_send_body` 此前读客户端 body 完全没有超时，慢速/挂起的客户端会让连接与已建立的出口 socket 一起永久挂起，`max_client_connections` 防不了这种单连接卡死，现复用 `head_read_timeout` 兜底；②§5.2 新增 §5.2.1「1xx 中间响应必须跳过」——`_attempt_http` 此前把上游的 `100 Continue`/`103 Early Hints` 当成最终响应转发，真正的响应被当成它的 body 混入客户端，现循环跳过 1xx 直至读到最终响应。新增 §11「已知限制与后续工作」记录评审中发现但暂未修的两处待观察点。两处修复均新增端到端回归测试（`tests/test_protocol_server.py`） | Agent |
 | v1.6.0 | 2026-09-24 | 新增 §4.4「客户端来源地址的采集」：`ProxyServer._on_client` 在 `Accepted` 状态即取 `writer.get_extra_info("peername")`，随连接对象一路传给 `ClientConnection` 与 `AttemptExecutor`，落盘见 [DD_STORAGE §4.9](./DD_STORAGE.md)；本模块只负责采集与传递，不做可信度判断（准确性依赖容器网络模式，见该节说明） | Agent |
 | v1.7.0 | 2026-09-24 | **流量统计已实现并上线**（见 [WEBUI_SPEC §2.1](../requirements/WEBUI_SPEC.md)）：新增 §5.2.2「HTTP 侧字节数的产出」与 §6.4「隧道字节数的去向」——协议层此前已经准确统计字节（§5.2、§6.3），但只喂给早夭判定，从不外传；本次把这两处已有的统计接到执行器新增的 `note_traffic()` 门面，一份进 `HealthTable` 的内存累计（出口健康看板），一份进 `logs.db` 新表 `traffic_log`（今日主机流量榜，见 [DD_STORAGE §3](./DD_STORAGE.md) / [§4.3b](./DD_STORAGE.md)）。`HttpAttempt` 新增 `bytes_up` 字段承载请求侧字节数 | Agent |
+| v1.8.0 | 2026-09-30 | 代码评审修复：读客户端请求体超时（`_send_body` 的 `TimeoutError`）此前虽然被 v1.5.0 兜住不会永久挂起，但仍会被判据当成普通传输层失败无条件切到下一个出口重试——客户端既已停止发送，每个后续出口都会各自重复同一次超时，浪费连接与出口资源才等到最终 502。新增 `self._client_body_timeout` 标记，随 `_switch_context()` 传给判据层，判据一命中即直接终止候选链（详见 [DD_SWITCHING.md](./DD_SWITCHING.md) v1.5.0）。**收窄 §11.1**：该已知限制原描述「body 读到一半失败后重试可能重放位置对不上」的两个触发源之一——读超时——已随本次修复关闭（不再重试，谈不上重放位置对不上）；仍未关闭的是「写往出口 socket 中途失败（如 `BrokenPipeError`）」这一触发源，§11.1 保留并更新措辞 | Agent |
 
 **对应需求**：[PRD §4.1](../requirements/PRD_OVERVIEW.md)、[§4.3.11](../requirements/PRD_OVERVIEW.md)、[§4.3.13](../requirements/PRD_OVERVIEW.md)、[§7.2](../requirements/PRD_OVERVIEW.md)
 
@@ -321,6 +322,8 @@ async def handle(self) -> None:
 per-upstream 超时覆盖对应 [PRD §4.3.12](../requirements/PRD_OVERVIEW.md)：`direct` 配 3 秒可以让被墙站点快速失败并切换，而不是卡满 10 秒。
 
 **读取客户端请求体为何此前没有超时、又为何补上（v1.5.0 修复）**：`stream_body()` 从客户端读 body 时，早期实现只有响应阶段（`pump`）与读响应头阶段设了超时，`_send_body` 里对客户端的读取是裸的 `reader.read(...)`——客户端声明 `Content-Length`/chunked 之后慢吞吞地发、或干脆不再发，这个读取会无限期挂起。`max_client_connections` 限的是**同时存在多少个连接**，挡不住「每个连接各自卡死在读 body 这一步」——少量慢体请求就能把连接槽位占满，是一个真实的资源枯竭点。现在用 `head_read_timeout` 包一层：超时按普通传输层失败处理（`request_sent` 仍是 `False`，候选链可以正常切到下一个出口），并记一条 `WARNING`。之所以复用 `head_read_timeout` 而不新增一个专门的配置项：两者本质都是「愿意等客户端把这次请求交代清楚多久」，没有必要为同一语义拆两个旋钮。
+
+**超时后为什么不该「正常切到下一个出口」（v1.8.0 修复）**：v1.5.0 只解决了「不再永久挂起」，但超时后仍会被判据当成普通传输层失败，无条件切换到下一个出口——问题是这次超时的根因在客户端（它已经不再发送数据），换出口对此无能为力，候选链里的每一个出口都会重新调用 `_send_body`、重新等满一次 `head_read_timeout`、重新超时，只是把最终的 502 拖慢了 N 倍并多占用 N 个出口连接。现在 `_send_body` 捕获到这个 `TimeoutError` 时置位 `self._client_body_timeout`，随 `_switch_context()` 带给判据层；判据一（`outcome.status is None`）新增一条分支，命中该标记直接终止候选链（`KeepReason.CLIENT_BODY_TIMEOUT`），详见 [DD_SWITCHING.md](./DD_SWITCHING.md) v1.5.0。
 
 ### 4.4 客户端来源地址的采集
 
@@ -726,13 +729,20 @@ def _send_error(self, status: int, message: str, request_id: str) -> None:
 
 ## 11. 已知限制与后续工作（2026-09-05 代码评审）
 
-以下两项在评审中一并发现，评估后判定优先级低于本次已修复的三处（详见 v1.5.0 修订说明与 [DD_SWITCHING.md](./DD_SWITCHING.md) v1.4.0），暂不改动，记录在此以便后续排期。
+以下事项在评审中一并发现，评估后判定优先级低于当时已修复的三处（详见 v1.5.0 修订说明与 [DD_SWITCHING.md](./DD_SWITCHING.md) v1.4.0），暂不改动，记录在此以便后续排期。
 
-### 11.1 请求体部分发出后失败重试，重放位置可能对不上
+### 11.1 请求体部分发出后失败重试，重放位置可能对不上（读超时触发源已于 v1.8.0 关闭）
 
-`_send_body` 用 `self._body_consumed` 标记「客户端 body 是否已经完整读完」：完整读完之后的重试一律从 `ReplayBuffer` 回放，不再碰客户端连接。但如果**第一次转发在 body 读到一半时就失败**（例如写往出口的 socket 中途 `BrokenPipeError`，或本次新增的 body 读超时在 body 读了一部分之后触发），`self._body_consumed` 仍是 `False`；此时若判据允许重试（该场景下 `request_sent` 为 `False`，判据判定「字节没真正发出去」，允许切换），下一次尝试会再次调用 `stream_body(self._reader, sink, plan)`，但 `self._reader`（客户端连接）此刻已经被消费掉了一部分字节——对 `Content-Length` 定长 body 而言，第二次尝试会用完整的 `plan.length` 去读，实际能读到的字节比这个数小（客户端总共只发了那么多），造成第二次尝试挂起等待客户端不会再发的字节，或读到 EOF 提前判为失败；对 chunked body 而言，问题更直接——第二次尝试会从「客户端连接当前的字节位置」开始按 chunk 长度行解析，而这个位置很可能落在上一次尝试还没读完的某个 chunk 数据中间，不是一个合法的 chunk 长度行起点，直接解析失败。
+`_send_body` 用 `self._body_consumed` 标记「客户端 body 是否已经完整读完」：完整读完之后的重试一律从 `ReplayBuffer` 回放，不再碰客户端连接。但如果**第一次转发在 body 读到一半时就失败**，`self._body_consumed` 仍是 `False`；此时若判据允许重试（该场景下 `request_sent` 为 `False`，判据判定「字节没真正发出去」，允许切换），下一次尝试会再次调用 `stream_body(self._reader, sink, plan)`，但 `self._reader`（客户端连接）此刻已经被消费掉了一部分字节——对 `Content-Length` 定长 body 而言，第二次尝试会用完整的 `plan.length` 去读，实际能读到的字节比这个数小（客户端总共只发了那么多），造成第二次尝试挂起等待客户端不会再发的字节，或读到 EOF 提前判为失败；对 chunked body 而言，问题更直接——第二次尝试会从「客户端连接当前的字节位置」开始按 chunk 长度行解析，而这个位置很可能落在上一次尝试还没读完的某个 chunk 数据中间，不是一个合法的 chunk 长度行起点，直接解析失败。
 
-**影响范围与为什么暂不修**：只在「body 转发到一半时出口才失败」这一条件窗口内触发，比本次修复的三处（尤其是非幂等重投）更窄；而且第二次尝试大概率会因为读到畸形数据或提前 EOF 而快速失败（属于「重试注定失败但不会误伤」，不是「悄悄产生错误结果」），业务影响远低于「非幂等请求被悄悄重复执行」。修正需要在 `ReplayBuffer`/`stream_body` 之间引入「已消费但未完整」的精确位置追踪与相应的判据豁免，改动面比本次三处大，留待后续单独设计（建议先在 `study/` 下补一份方案对比：是「彻底禁止 body 读到一半后失败重试」更简单安全，还是「精确追踪已消费字节」收益更大）。
+这个「读到一半就失败」有两个触发源，v1.8.0 之后只剩一个仍然可能重试：
+
+| 触发源 | v1.8.0 之后是否还会重试 |
+|--------|----------|
+| **读客户端 body 超时**（`_send_body` 的 `TimeoutError`，见 §4.3、[DD_SWITCHING.md](./DD_SWITCHING.md) v1.5.0） | **不会**。判据一改为命中 `client_body_timeout` 时直接终止候选链，连第二次 `_attempt_http` 都不会发生，本节描述的重放位置问题因此无从触发 |
+| **写往出口 socket 中途失败**（如转发 body 时 `BrokenPipeError`/`ConnectionResetError`，出口连接被对端断开） | **仍会**。这类失败仍归为普通传输层失败（`request_sent=False`），判据允许切换，下一次尝试仍会带着「客户端连接已消费一部分」的状态重新调用 `stream_body`，本节描述的问题依旧成立 |
+
+**为什么剩下这一条暂不修**：只在「body 转发到一半、写往出口的这一侧才失败」这一条件窗口内触发，比此前已修复的几处（尤其是非幂等重投、读超时无限等待）更窄；而且重试大概率会因为读到畸形数据或提前 EOF 而快速失败（属于「重试注定失败但不会误伤」，不是「悄悄产生错误结果」），业务影响远低于「非幂等请求被悄悄重复执行」。修正需要在 `ReplayBuffer`/`stream_body` 之间引入「已消费但未完整」的精确位置追踪与相应的判据豁免，或者索性把「body 读到一半后任何失败都不可切换」当成统一规则（类似 v1.8.0 给读超时开的这个口子，直接扩大到覆盖所有『部分消费』场景，而不必区分失败原因）——这个更简单的方案值得优先评估，改动面比精确位置追踪小得多，留待后续单独设计（建议先在 `study/` 下补一份方案对比）。
 
 ### 11.2 `OPTIONS *`（asterisk-form）请求落进 origin-form 分支，拼出畸形 URL
 

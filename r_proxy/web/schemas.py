@@ -486,12 +486,17 @@ class StickyPromoteResponse(Model):
     `previous_match` 是固化**之前**该 host 命中的规则：非空说明表里已经有一条更
     宽的规则管着它，新规则从此优先于它。界面据此提示，避免用户在规则页看到两条
     都能匹配的规则时以为出了错。
+
+    `swept_hosts` 是**除**当前固化的 host 外、因新规则生效而被顺带清掉的其余
+    粘性映射（例如固化 `*.modelscope.cn` 后，表里 `api-inference.modelscope.cn`
+    这类会被规则短路，一并清除）。空列表说明没有连带影响。
     """
 
     position: int
     revision: int
     rules_enabled: bool
     sticky_cleared: bool
+    swept_hosts: list[str]
     previous_match: MatchedRule | None
     issues: list[IssueItem]
 

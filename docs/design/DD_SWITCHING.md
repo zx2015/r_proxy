@@ -6,7 +6,8 @@
 | v1.1.0 | 2026-08-14 | M2 实现回填：明确限流配额与候选链剩余长度无关 | Agent |
 | v1.2.0 | 2026-08-15 | 修正缺陷：CONNECT 握手超时原记 `upstream_error`，导致被墙目标熔断健康出口；§3.2 补齐握手阶段的分界（有无可解析字节）与四条具体归类 | Agent |
 | v1.3.0 | 2026-08-16 | 依生产日志修正隧道早夭判定：新增「上游先关闭」条件，消除浏览器预连接造成的假标记（实测占负面记忆 45%）；§8.1 记录 `bytes_up` 方案为何不成立；§8.2 明确早夭走 stderr 而非 `request_log` 及其理由；§9 补失败尝试与候选链耗尽的日志 | Agent |
-| v1.4.0 | 2026-09-05 | 修正缺陷：判据一（`outcome.status is None`）此前无条件切换，未检查 `ctx.request_sent`/方法幂等性/`response_started`——请求（含非幂等 POST 的请求体）已完整发出后再遇到等响应超时、连接被对端悄悄断开等传输层失败，会被当作「字节没发出去」一样无条件重投到下一个出口，等价于让一次下单/扣款类调用被悄悄执行两次，与 AGENTS.md/CLAUDE.md 的红线「非幂等方法已发出后不得重试」矛盾。§3 判定链与伪代码补齐这一分支，检查顺序与判据三保持一致（`response_started` 优先于幂等门控）；`replayable` 不参与该分支（沿用既有测试 `test_transport_failure_ignores_replayability` 的既定语义：传输层失败时是否切换只看字节发没发出去、方法幂不幂等，不看能不能重放——重放缓冲只影响「切换后往新连接发什么」，不影响「该不该切换」这个决定） | Agent |
+| v1.4.0 | 2026-09-05 | 修正缺陷：判据一（`outcome.status is None`）此前无条件切换，未检查 `ctx.request_sent`/方法幂等性/`response_started`——请求（含非幂等 POST 的请求体）已完整发出后再遇到等响应超时、连接被对端悄悄断开等传输层失败，会被当作「字节没发出去」一样无条件重投到下一个出口，等价于让一次下单/扣款类调用被悄悄执行两次，与 AGENTS.md/CLAUDE.md 的红线「非幂等方法已发出后不得重试」矛盾。§3 判定链与伪代码补齐这一分支，检查顺序与判据三保持一致（`response_started` 优先于幂等门控）；`replayable` 不参与该分支（沿用既有测试 `test_transport_failure_ignores_replayability` 的既定语义：传输层失败时是否切换只看字节发没发出去、方法幂不幂等，不看能不能重放——重放缓冲只影响「切换后往新连接发什么」，不影响「该不该切换」这个决定） |
+| v1.5.0 | 2026-09-30 | 代码评审修复：读客户端请求体超时（`_send_body` 的 `TimeoutError`）此前落进判据一的默认分支，被当成普通传输层失败无条件切换——但客户端本身已经停止发送，换哪个出口都等不到剩下的字节，候选链里每个出口都会各自重复同一次 `head_read_timeout` 超时，白白浪费连接与出口资源，最终仍是 502。新增 `SwitchContext.client_body_timeout` 与 `KeepReason.CLIENT_BODY_TIMEOUT`，判据一命中该标记时直接终止候选链；`ClientConnection._send_body` 捕获 `TimeoutError` 时置位该标记（不复位，客户端不会突然又开始发送）。**与 `replayable` 分开建模**：`switch_buffer_bytes=0` 时 `replayable` 从一开始就是 `False`，但那种「字节还没发出」的传输层失败仍要能切换（`test_transport_failure_ignores_replayability`）——复用 `replayable` 会把这条既有规则连带破坏，因此必须是独立信号 | Agent |
 
 **对应需求**：[PRD §4.3.1](../requirements/PRD_OVERVIEW.md)–[§4.3.5](../requirements/PRD_OVERVIEW.md)、[§4.3.11](../requirements/PRD_OVERVIEW.md)、[§4.3.13](../requirements/PRD_OVERVIEW.md)
 
@@ -50,6 +51,12 @@ class SwitchContext:
     response_started: bool      # 是否已向客户端写出响应体字节
     host: str
     attempt_index: int
+    # 读客户端请求体超时。与 replayable 语义不同——replayable 回答「已转发的
+    # 字节能不能重放给下一个出口」，这里回答「客户端本身还会不会再发数据」；
+    # 换出口对后者无能为力，即便 replayable 仍为 True 也不该切换（见 §3、
+    # v1.5.0）。两者必须分开建模：合并会打破 switch_buffer_bytes=0 时
+    # 「传输层失败仍可切换」的既有语义（见 test_transport_failure_ignores_replayability）
+    client_body_timeout: bool = False
     limiter: SwitchRateLimiter  # 有状态，唯一的可变依赖
 
 
@@ -70,6 +77,7 @@ class KeepReason(Enum):
     RESPONSE_STARTED = auto()       # 已向客户端写出响应体
     RATE_LIMITED = auto()           # 频率超限
     IDLE_CONNECTION_RECYCLED = auto()  # 408 空闲连接回收，重试同一出口
+    CLIENT_BODY_TIMEOUT = auto()    # 读客户端请求体超时，换出口无济于事
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,7 +104,9 @@ flowchart TD
     T1 -->|是| K0[不切换<br/>RESPONSE_STARTED]
     T1 -->|否| T2{请求已发出<br/>且方法非幂等?}
     T2 -->|是| K9[不切换<br/>NON_IDEMPOTENT]
-    T2 -->|否| SW1[切换<br/>TRANSPORT_FAILURE]
+    T2 -->|否| T3{读客户端<br/>请求体超时?}
+    T3 -->|是| K10[不切换<br/>CLIENT_BODY_TIMEOUT]
+    T3 -->|否| SW1[切换<br/>TRANSPORT_FAILURE]
 
     B -->|是| C{408 且请求未发出?}
     C -->|是| R[重试同一出口<br/>IDLE_CONNECTION_RECYCLED<br/>不计失败]
@@ -145,6 +155,17 @@ def should_switch(self, outcome, ctx, cfg, *, now) -> SwitchVerdict:
             return SwitchVerdict(
                 switch=False,
                 keep_reason=KeepReason.NON_IDEMPOTENT,
+                failure_kind=outcome.kind,
+            )
+        # 客户端读 body 超时：客户端本身不再发数据，换哪个出口都等不到剩下
+        # 的字节，继续遍历候选链只会让每个出口各自重复同一次超时。与
+        # replayable 分开判断（见 §2 SwitchContext.client_body_timeout 的
+        # 注释）：switch_buffer_bytes=0 时 replayable 天然为 False，但那种
+        # 「字节还没发出」的传输层失败仍要能切换，不能把两者混为一谈。
+        if ctx.client_body_timeout:
+            return SwitchVerdict(
+                switch=False,
+                keep_reason=KeepReason.CLIENT_BODY_TIMEOUT,
                 failure_kind=outcome.kind,
             )
         return SwitchVerdict(
@@ -687,6 +708,8 @@ if not verdict.switch:
 | POST 已发出后收到 `503` | **不切换**，但记 `route_error` | SW-10 |
 | POST 在 TCP 连接阶段失败 | **切换**（字节未发出） | — |
 | PATCH 读超时 | 不切换 | — |
+| 读客户端请求体超时（`_send_body` 的 `TimeoutError`） | 不切换，`CLIENT_BODY_TIMEOUT`，候选链直接终止 | — |
+| 读客户端请求体超时且 `switch_buffer_bytes: 0`（`replayable` 天然为 `False`） | 仍按 `CLIENT_BODY_TIMEOUT` 判定，与 `NOT_REPLAYABLE` 互不影响 | — |
 | 请求体 100KB（>64KB） | 标记不可重放，失败时不切换 | SW-16 |
 | 请求体 10KB | 可重放，失败时正常切换并重放 | — |
 | `switch_buffer_bytes: 0` | 请求发出后一律不可切换 | — |

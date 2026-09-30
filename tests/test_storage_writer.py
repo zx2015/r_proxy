@@ -364,12 +364,10 @@ class TestMerge:
         assert merged[0].payload[1:6] == (3, 3, 3, 40, "open")
         assert merged[0].payload[9:11] == (150, 225)
 
-    def test_route_block_upserts_are_not_summed(self) -> None:
-        """fail_count 的自增在 SQL 侧（+1 per 语句），payload 里没有增量列。
-
-        合并成一条会少记一次失败——这里保留最后一条，与设计一致：负面记忆
-        的精确计数不影响路由，TTL 才影响。
-        """
+    def test_route_block_upserts_are_summed(self) -> None:
+        """`fail_count_delta` 是 delta 列：同批次内同一 `(host, upstream)` 被
+        block 多次时相加，而不是只保留最后一次——否则库里的失败计数会比实际
+        少，Web 界面「这个出口对这个 host 失败过几次」的诊断价值就没了。"""
         ops = [
             route_block_upsert(
                 host="a.com", upstream="a", reason="timeout", now_unix=1, blocked_until=601
@@ -380,7 +378,23 @@ class TestMerge:
         ]
         merged = merge(ops)
         assert len(merged) == 1
-        assert merged[0].payload[2] == "reset"
+        # payload: (host, upstream, fail_count_delta, reason, now_unix, blocked_until)
+        assert merged[0].payload[2] == 2
+        assert merged[0].payload[3] == "reset"
+
+    def test_sticky_upsert_hit_counts_are_summed(self) -> None:
+        """同批次内同一 host 连续换绑（多次 `sticky_upsert`）时 `hit_count`
+        的增量同样要相加，不能因为 `upstream`/`status` 只取最后一次的值就
+        连带把 `hit_count` 也只取最后一次。"""
+        ops = [
+            sticky_upsert(host="a.com", upstream="a", url=None, now_unix=1, status=200),
+            sticky_upsert(host="a.com", upstream="b", url=None, now_unix=2, status=200),
+        ]
+        merged = merge(ops)
+        assert len(merged) == 1
+        # payload: (host, upstream, url, now_unix, status, hit_delta, now_unix)
+        assert merged[0].payload[1] == "b"
+        assert merged[0].payload[5] == 2
 
 
 class TestWriterThread:
@@ -559,6 +573,24 @@ class TestWriterThread:
             w.queue.put(route_block_delete(host="a.com", upstream="a"))
             w.flush()
             assert w.state_rows("SELECT COUNT(*) FROM route_block") == [(0,)]
+
+    def test_route_block_fail_count_accumulates_within_one_batch(self, tmp_path: Path) -> None:
+        """同一批次里同一 `(host, upstream)` 连续 block 三次，落盘的
+        `fail_count` 必须是 3，而不是被批次合并压成 1。"""
+        now = int(time.time())
+        with RunningWriter(tmp_path) as w:
+            for reason in ("timeout", "reset", "timeout"):
+                w.queue.put(
+                    route_block_upsert(
+                        host="a.com",
+                        upstream="a",
+                        reason=reason,
+                        now_unix=now,
+                        blocked_until=now + 600,
+                    )
+                )
+            w.flush()
+            assert w.state_rows("SELECT fail_count FROM route_block") == [(3,)]
 
     def test_request_logs_are_appended(self, tmp_path: Path) -> None:
         with RunningWriter(tmp_path) as w:

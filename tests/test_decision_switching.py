@@ -48,6 +48,7 @@ def context(
     replayable: bool = True,
     response_started: bool = False,
     host: str = "example.com",
+    client_body_timeout: bool = False,
 ) -> SwitchContext:
     return SwitchContext(
         method=method,
@@ -56,6 +57,7 @@ def context(
         replayable=replayable,
         response_started=response_started,
         host=host,
+        client_body_timeout=client_body_timeout,
     )
 
 
@@ -167,6 +169,36 @@ class TestGateOneTransportFailure:
             limiter,
             outcome(error="TimeoutError"),
             context(method=Method.GET, request_sent=True),
+        )
+        assert verdict.switch is True
+
+    def test_client_body_timeout_does_not_switch(
+        self, policy: SwitchPolicy, limiter: SwitchRateLimiter
+    ) -> None:
+        """客户端读 body 超时：换哪个出口都等不到客户端补发数据，换出口只会
+        让每个出口各自重复同一次超时，因此必须直接终止候选链。"""
+        verdict = decide(
+            policy,
+            limiter,
+            outcome(error="TimeoutError"),
+            context(request_sent=False, client_body_timeout=True),
+        )
+        assert verdict.switch is False
+        assert verdict.keep_reason is KeepReason.CLIENT_BODY_TIMEOUT
+
+    def test_client_body_timeout_is_distinct_from_replayability(
+        self, policy: SwitchPolicy, limiter: SwitchRateLimiter
+    ) -> None:
+        """``switch_buffer_bytes: 0`` 时 ``replayable`` 从一开始就是 False，
+        但传输层失败（字节还没发出）仍要能切换（
+        ``test_transport_failure_ignores_replayability``）。`client_body_timeout`
+        必须是独立信号，不能靠复用 `replayable` 来实现，否则会把那条既有
+        规则连带破坏。"""
+        verdict = decide(
+            policy,
+            limiter,
+            outcome(error="TimeoutError"),
+            context(replayable=False, client_body_timeout=False),
         )
         assert verdict.switch is True
 

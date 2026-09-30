@@ -67,6 +67,17 @@ class SwitchPolicy:
                     keep_reason=KeepReason.NON_IDEMPOTENT,
                     failure_kind=outcome.kind,
                 )
+            # 客户端请求体读超时：换哪个出口都等不到客户端补发剩下的数据，
+            # 继续遍历候选链只会让每个出口各自重复同一次超时。与
+            # `replayable` 分开判断（见 `SwitchContext.client_body_timeout`
+            # 的注释）：`switch_buffer_bytes: 0` 时 `replayable` 天然为
+            # False，但那种「字节还没发出」的传输层失败仍要能切换。
+            if ctx.client_body_timeout:
+                return SwitchVerdict(
+                    switch=False,
+                    keep_reason=KeepReason.CLIENT_BODY_TIMEOUT,
+                    failure_kind=outcome.kind,
+                )
             return SwitchVerdict(
                 switch=True,
                 switch_reason=SwitchReason.TRANSPORT_FAILURE,
