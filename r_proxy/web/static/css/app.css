@@ -67,6 +67,13 @@ body {
   letter-spacing: 0.04em;
 }
 
+.brand-version {
+  font-weight: 400;
+  font-size: 12px;
+  color: var(--text-muted, #8a8f98);
+  letter-spacing: normal;
+}
+
 .nav-link {
   display: block;
   padding: 8px 10px;

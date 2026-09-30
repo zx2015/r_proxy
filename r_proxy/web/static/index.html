@@ -9,7 +9,7 @@
   <body>
     <div class="layout">
       <nav class="sidebar" aria-label="主导航">
-        <div class="brand">r-proxy</div>
+        <div class="brand">r-proxy <span id="brand-version" class="brand-version"></span></div>
         <a class="nav-link" href="/" data-page="dashboard">监控看板</a>
         <a class="nav-link" href="/upstreams" data-page="upstreams">上级代理</a>
         <a class="nav-link" href="/sticky" data-page="sticky">粘性映射</a>
@@ -22,7 +22,6 @@
           </label>
           <button type="button" id="refresh-now" class="ghost">立即刷新</button>
           <button type="button" id="forget-token" class="ghost">清除 token</button>
-          <span id="version" class="muted"></span>
         </div>
       </nav>
       <main class="content">

@@ -137,10 +137,10 @@ function updatePollState() {
 async function loadVersion() {
   try {
     const status = await api.status();
-    document.getElementById("version").textContent = `v${status.version}`;
+    document.getElementById("brand-version").textContent = `v${status.version}`;
   } catch (err) {
     if (err instanceof ApiError && err.status === 401 && !hasToken()) return;
-    document.getElementById("version").textContent = "";
+    document.getElementById("brand-version").textContent = "";
   }
 }
 
