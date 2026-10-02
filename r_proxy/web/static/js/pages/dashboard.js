@@ -178,7 +178,6 @@ function renderCards(status) {
     ["写队列", `${status.storage.queue_size} / ${status.storage.queue_capacity}`],
     ["队列峰值", String(status.storage.queue_high_water)],
     ["落盘 p99", millis(status.storage.flush_duration_p99_ms)],
-    ["写入错误", String(status.storage.write_errors)],
   ];
   const container = clear(nodes.cards);
   for (const [label, value] of items) {

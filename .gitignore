@@ -40,6 +40,7 @@ ENV/
 # ===== 本地知识库与待办（项目规范强制不入库） =====
 # 见 CLAUDE.md §4.2：TODO.md 不入 Git；§1.1：.learnings/ 本地知识库不入库
 .learnings/
+.gemini/
 TODO.md
 
 # ===== Claude / Cursor 个人配置 =====
