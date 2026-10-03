@@ -10,6 +10,7 @@ import logging
 import socket
 import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -17,6 +18,7 @@ from r_proxy import cli
 from r_proxy.app import Application, StartupError
 from r_proxy.egress.capability import probe_ipv6_egress
 from r_proxy.storage.rules_store import RulesStore
+from r_proxy.storage.schema import StorageError
 
 MINIMAL = """
 [listen]
@@ -126,6 +128,26 @@ enabled = false
         with pytest.raises(StartupError) as e:
             await app.start()
         assert "E_NO_UPSTREAM" in str(e.value)
+
+    async def test_storage_startup_failure_cleans_up_without_leaving_thread(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """存储层启动失败时，整个 Application 必须妥善清理，不遗留写者线程。"""
+        from r_proxy.storage.writer import WriterThread
+
+        def mock_fail(self: Any, **_kw: Any) -> None:
+            raise StorageError("模拟打开库超时")
+
+        cfg_path = write_config(tmp_path)
+        app = Application(config_path=cfg_path)
+        monkeypatch.setattr(WriterThread, "start_and_wait", mock_fail)
+        with pytest.raises(StartupError) as exc_info:
+            await app.start()
+        assert "模拟打开库超时" in str(exc_info.value)
+        assert app._storage is None
+        # 确认没有残留活跃的 r-proxy-writer 线程
+        threads = [t for t in threading.enumerate() if t.name == "r-proxy-writer" and t.is_alive()]
+        assert threads == []
 
     async def test_warnings_do_not_block_startup(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture

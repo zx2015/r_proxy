@@ -55,7 +55,11 @@ class StorageService:
 
     def start(self) -> None:
         """打开两个库并启动写者线程。库打不开时抛 ``StorageError``，拒绝启动。"""
-        self._thread.start_and_wait()
+        try:
+            self._thread.start_and_wait()
+        except Exception:
+            self.stop()
+            raise
 
     def metrics(self) -> StorageMetrics:
         """队列与写者的计数汇成一份截面。供日志上报与 Web 状态接口共用。

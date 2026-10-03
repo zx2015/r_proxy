@@ -665,6 +665,20 @@ class TestWriterThread:
             thread.start_and_wait()
         thread.stop()
 
+    def test_start_and_wait_timeout_stops_thread_and_raises_storage_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """超时必须抛出 StorageError 并回收写者线程，防止孤儿线程导致进程假死。"""
+        cfg = db_config(tmp_path)
+        thread = WriterThread(WriteQueue(maxsize=10), cfg)
+        monkeypatch.setattr(thread._opened, "wait", lambda _timeout: False)
+        with pytest.raises(StorageError) as exc_info:
+            thread.start_and_wait(timeout=0.01)
+        assert "超时" in str(exc_info.value)
+        # 等待线程自行退出
+        thread.join(timeout=2.0)
+        assert not thread.is_alive()
+
     def test_metrics_track_merging(self, tmp_path: Path) -> None:
         with RunningWriter(tmp_path, flush_interval_ms=50) as w:
             for _ in range(10):

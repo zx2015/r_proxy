@@ -153,14 +153,15 @@ class Application:
             snapshot.limits,
             sticky_policy=StickyExpiryPolicy(ttl_seconds=float(snapshot.routing.sticky_ttl)),
         )
-        initial = storage.load_initial_state()
-        try:
-            storage.start()
-        except StorageError as exc:
-            raise StartupError(str(exc)) from exc
         self._storage = storage
+        initial = storage.load_initial_state()
 
         try:
+            try:
+                storage.start()
+            except (StorageError, TimeoutError) as exc:
+                raise StartupError(str(exc)) from exc
+
             self._server = ProxyServer(snapshot, rule_set=loaded.rule_set, sink=storage.queue)
             apply_initial_state(self._server.state, initial)
             # 决策层禁止 I/O，探测结果只能从这里注入。

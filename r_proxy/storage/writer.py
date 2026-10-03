@@ -18,7 +18,7 @@ from dataclasses import dataclass, field, replace
 from r_proxy.config.model import DatabaseConfig
 from r_proxy.storage.queue import OpKind, WriteOp, WriteQueue
 from r_proxy.storage.retention import Retention
-from r_proxy.storage.schema import Database, open_write
+from r_proxy.storage.schema import Database, StorageError, open_write
 
 logger = logging.getLogger(__name__)
 
@@ -205,7 +205,7 @@ class WriterThread(threading.Thread):
             for conn in connections.values():
                 conn.close()
 
-    def start_and_wait(self, *, timeout: float = 10.0) -> None:
+    def start_and_wait(self, *, timeout: float = 30.0) -> None:
         """启动线程并等到两个库都打开成功，打不开就抛错。
 
         建库失败必须在启动阶段暴露：让代理带着一个死掉的写者线程继续跑，
@@ -213,9 +213,13 @@ class WriterThread(threading.Thread):
         """
         self.start()
         if not self._opened.wait(timeout):
-            raise TimeoutError("写者线程未能在超时内打开数据库")
+            self.stop(timeout=1.0)
+            raise StorageError(f"写者线程未能在 {timeout:.1f}s 超时内打开数据库")
         if self._open_error is not None:
-            raise self._open_error
+            self.stop(timeout=1.0)
+            if isinstance(self._open_error, StorageError):
+                raise self._open_error
+            raise StorageError(f"写者线程打开数据库失败: {self._open_error}") from self._open_error
 
     def wait_until_drained(self, *, timeout: float = 5.0) -> bool:
         """阻塞到调用时刻之前入队的写入全部落盘。
@@ -234,7 +238,10 @@ class WriterThread(threading.Thread):
         self._stopping.set()
         # 唤醒可能正阻塞在时间窗上的 drain，否则 join 要等满 flush_interval_ms。
         self._queue.interrupt()
-        self.join(timeout)
+        try:
+            self.join(timeout)
+        except RuntimeError:
+            return
         if self.is_alive():
             logger.error("写者线程未能在 %.1fs 内退出，可能有未落盘的写入", timeout)
 
