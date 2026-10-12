@@ -262,6 +262,19 @@ class TestConnectivityProbe:
         assert opened == [(probing.PROBE_HOST, probing.PROBE_PORT)]
         assert result.ok is True
 
+    async def test_a_socks5_probe_reaches_target_via_socks5(self) -> None:
+        from tests.mocks.mock_socks5 import start_mock_socks5
+
+        mock = await start_mock_socks5()
+        cfg = UpstreamConfig(name="socks-proxy", type="socks5", address=f"127.0.0.1:{mock.port}")
+        try:
+            result = await probing.probe(cfg)
+            assert result.ok is True
+            assert result.http_status == 200
+            assert mock.received_targets == [(probing.PROBE_HOST, probing.PROBE_PORT)]
+        finally:
+            await mock.close()
+
 
 class _ClosedWriter:
     """只需要满足 ``UpstreamConn.close()`` 的调用形状。"""

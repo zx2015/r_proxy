@@ -243,6 +243,24 @@ class TestCreateUpstream:
         assert rows[0]["actor"] == "127.0.0.1"
         assert rows[0]["version_after"] == version(app)
 
+    async def test_a_socks5_upstream_is_created(
+        self, client: httpx.AsyncClient, app: Application
+    ) -> None:
+        body = {
+            "config_version": version(app),
+            "name": "socks5-a",
+            "type": "socks5",
+            "address": "127.0.0.1:1080",
+            "priority": 25,
+        }
+        response = await client.post("/api/upstreams", json=body)
+        assert response.status_code == 201
+        cfg = app.snapshot.upstream("socks5-a")
+        assert cfg is not None
+        assert cfg.type == "socks5"
+        assert cfg.is_socks5 is True
+        assert cfg.address == "127.0.0.1:1080"
+
 
 class TestUpdateUpstream:
     async def test_the_priority_change_is_effective(

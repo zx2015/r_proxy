@@ -534,11 +534,12 @@ class ClientConnection:
 def build_request(target: RequestTarget, head: RawHead, upstream: UpstreamConfig) -> bytes:
     """构造发往出口的请求。
 
-    出口类型决定请求行形式，这是 ``direct`` 与上级代理的**唯一**协议差异：
-    向目标服务器发 absolute-form 时不少服务器会返回 400；反过来向上级代理发
-    origin-form，代理无从知道目标是谁。
+    出口类型决定请求行形式：
+    - ``direct`` 与 ``socks5`` 都连接到目标对端（L4 透明代理），必须发 origin-form；
+      向目标服务器发 absolute-form 时不少服务器会返回 400。
+    - 只有上级 ``http`` 代理发 absolute-form，供上级代理知晓目标。
     """
-    if upstream.is_direct:
+    if upstream.is_direct or upstream.type == "socks5":
         request_line = f"{head.method} {_path_qs(target, head)} HTTP/1.1"
     else:
         request_line = f"{head.method} {target.url} HTTP/1.1"

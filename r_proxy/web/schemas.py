@@ -355,7 +355,7 @@ class VersionedRequest(Model):
 
 class UpstreamCreateRequest(VersionedRequest):
     name: str = UPSTREAM_NAME
-    type: Literal["http", "direct"]
+    type: Literal["http", "socks5", "direct"]
     address: str | None = Field(None, max_length=255)
     priority: int = Field(100, ge=1, le=999)
     enabled: bool = True

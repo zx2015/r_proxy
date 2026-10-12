@@ -10,6 +10,7 @@
 ## 特性
 
 - **HTTP / HTTPS 正向代理**：支持 `GET`/`POST` 等常规方法与 `CONNECT` 隧道
+- **多协议上级出口**：支持 HTTP 与 SOCKS5（RFC 1928/1929 用户名密码认证）上级代理以及 direct 直连，支持 L4 隧道、origin-form 转发与盲转发
 - **多上级代理与优先级故障切换**：出口按 `priority`（数字越小越优先）排序，同优先级组内轮询；出口不可用时按判据自动切换到下一个
 - **稳健的切换判据**：区分传输层失败与 HTTP 响应、区分"代理不可用"与"目标已处理"、非幂等方法不重试、大请求体流式转发后不可切换、CONNECT 建立前的客户端字节会缓存并在新隧道重放
 - **规则路由**：按主机名的有序规则表，支持精确匹配、`*.domain` 域名及子域、`host.*` 通配符、IP/IPv6 字面量、正则六种条件类型，首条命中即强制路由（跳过粘性与切换逻辑），只经 Web 界面维护
@@ -216,6 +217,14 @@ name = "home-proxy"
 type = "http"
 address = "198.51.100.100:7890"
 priority = 10
+
+[[upstreams]]
+name = "socks5-proxy"
+type = "socks5"
+address = "192.0.2.1:1080"
+username = "user"         # 可选
+password = "secret"       # 可选
+priority = 20
 ```
 
 路由规则不写在配置文件里，只能通过 Web 界面维护并存入 `rules.db`；这是为了支持首匹配胜出的有序表语义与在线编辑，详见 [`docs/requirements/RULES_CONFIG.md`](docs/requirements/RULES_CONFIG.md)。

@@ -18,8 +18,9 @@
 | v3.7.0 | 2026-08-18 | DD_DEPLOY v1.7.0 新增 §11.8：新增上级代理报 500 的根因是属主修复只 chown 文件未 chown 目录；诊断中修复代码级安全缺陷——`config_writer.py` 原子写会把含明文 `auth_token` 的 `config.toml` 权限从 600 重置为 644，配置备份同样受影响，已修复并补测试；记录 `DOCKER_BUILDKIT=0` 绕过 BuildKit DNS 解析失败的现象。DD_WEB v2.1.5 §6.1 同步补记原子写权限收紧的实现要点 | Agent |
 | v3.8.0 | 2026-09-05 | HTTP/HTTPS 协议处理专项代码评审，修复三处缺陷并回填文档：①DD_SWITCHING v1.4.0——传输层失败判据（`outcome.status is None`）此前无条件切换，未检查请求是否已发出与方法幂等性，非幂等 POST 请求体完整发出后遇超时/断连会被无脑重投到下一个出口，与「非幂等方法已发出后不得重试」的红线矛盾，现补齐 `response_started`/`request_sent`+幂等门控；②③DD_PROXY v1.5.0——`_attempt_http` 补齐 1xx（`100 Continue`/`103 Early Hints`）中间响应跳过逻辑（§5.2.1），此前会把 1xx 当最终响应转发、真正响应被当成其 body 混入客户端；`_send_body` 补齐读客户端请求体的超时兜底（§4.3），此前慢速/挂起客户端可让连接与出口 socket 一起永久挂起。DD_PROXY 新增 §11 记录两处评估后暂不修的已知限制（body 部分发出后失败重试的重放位置偏差、`OPTIONS *` asterisk-form 处理不完整）。三处修复均新增端到端/单元回归测试 | Agent |
 | v3.9.0 | 2026-09-28 | 粘性映射加时间老化：DD_ROUTING v1.7.0 新增 §7.7 `get_live` 与 `get` 分离、`auto` 30 天未访问即惰性过期、`manual` 永存、`reconfigure` 不主动清空旧条目、与磁盘侧构成最终一致；DD_STORAGE v1.11.0 §5.1 回填过滤加 `MAX(last_success_at, updated_at)` fallback、新增 §6.4 粘性老化清理；DD_CONFIG v2.1.0 加 `routing.sticky_ttl`（默认 2_592_000，`0` 表示禁用）；新增 `storage/expiry.py` 作为分层边界 | Agent |
+| v4.0.0 | 2026-10-12 | 新增 [DD_SOCKS5.md](./DD_SOCKS5.md) v1.0.0：SOCKS5 出口协议支持（标准库无第三方依赖、RFC 1928/1929 二进制状态机、错误映射矩阵、L4 透明代理与 origin-form 转发、WebUI 探活与 Mock 测试策略） | Agent |
 
-设计文档依据 [需求文档](../requirements/index.md) v1.5.0 编写。规则部分依据 [RULES_CONFIG.md](../requirements/RULES_CONFIG.md) v2.0.0 与 [WEBUI_SPEC.md](../requirements/WEBUI_SPEC.md) v2.0.0。
+设计文档依据 [需求文档](../requirements/index.md) 编写。
 
 ## 文档列表
 
@@ -31,6 +32,7 @@
 | [DD_ROUTING.md](./DD_ROUTING.md) | 路由决策：候选链构造、粘性映射、健康与熔断状态机、负面记忆、地址族能力过滤 |
 | [DD_SWITCHING.md](./DD_SWITCHING.md) | 切换判据：三道判据链、状态码分类、`502/503/504` 来源判定、幂等门控、字节重放 |
 | [DD_PROXY.md](./DD_PROXY.md) | 协议层：请求解析与 host 规范化、HTTP 转发、CONNECT 隧道、背压与资源限制 |
+| [DD_SOCKS5.md](./DD_SOCKS5.md) | SOCKS5 出口：零依赖二进制协议客户端、RFC 1928/1929 握手与认证、REP 错误映射、L4 转发契约 |
 | [DD_STORAGE.md](./DD_STORAGE.md) | 存储层：三库 schema、唯一写者线程、批量事务与合并、有界队列、规则整表替换、启动回填、清理 |
 | [DD_WEB.md](./DD_WEB.md) | Web 界面：可选依赖隔离、单进程装配、`to_thread` 边界、认证、配置写回与规则写入、审计、XSS 与 SSRF 防护、无构建单页应用 |
 | [DD_DEPLOY.md](./DD_DEPLOY.md) | 容器部署：host 网络与访问控制、镜像构建、卷布局与备份目录派生、从裸跑迁移的顺序、持久化验证记录 |
@@ -73,6 +75,7 @@ flowchart LR
 | 从现在的代码怎么走到目标形态 | [MIGRATION.md](./MIGRATION.md) |
 | 怎么用容器部署、数据放在哪 | [DD_DEPLOY.md](./DD_DEPLOY.md) |
 | 为什么容器用 host 网络而不是发布端口 | [DD_DEPLOY §2](./DD_DEPLOY.md) |
+| SOCKS5 出口是如何握手与转发的 | [DD_SOCKS5 §2](./DD_SOCKS5.md)、[§5](./DD_SOCKS5.md) |
 
 ## 需求到设计的映射
 
@@ -80,6 +83,7 @@ flowchart LR
 |----------|-------------|
 | [PRD §4.1](../requirements/PRD_OVERVIEW.md) 代理服务 | [DD_PROXY](./DD_PROXY.md) |
 | [PRD §4.2](../requirements/PRD_OVERVIEW.md) 上级代理池与优先级 | [DD_CONFIG](./DD_CONFIG.md)、[DD_ROUTING §3](./DD_ROUTING.md) |
+| [SOCKS5_UPSTREAM](../requirements/SOCKS5_UPSTREAM.md) 上级 SOCKS5 代理 | [DD_SOCKS5](./DD_SOCKS5.md)、[DD_PROXY §7](./DD_PROXY.md) |
 | [PRD §4.2.4](../requirements/PRD_OVERVIEW.md) 地址族范围 | [DD_ROUTING §5](./DD_ROUTING.md)、[DD_PROXY §3.3](./DD_PROXY.md) |
 | [PRD §4.3.1–4.3.5](../requirements/PRD_OVERVIEW.md) 切换判据 | [DD_SWITCHING](./DD_SWITCHING.md) |
 | [PRD §4.3.6–4.3.7](../requirements/PRD_OVERVIEW.md) 故障归类与候选链 | [DD_ROUTING §3](./DD_ROUTING.md)、[§4](./DD_ROUTING.md) |

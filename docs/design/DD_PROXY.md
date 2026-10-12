@@ -11,6 +11,7 @@
 | v1.6.0 | 2026-09-24 | 新增 §4.4「客户端来源地址的采集」：`ProxyServer._on_client` 在 `Accepted` 状态即取 `writer.get_extra_info("peername")`，随连接对象一路传给 `ClientConnection` 与 `AttemptExecutor`，落盘见 [DD_STORAGE §4.9](./DD_STORAGE.md)；本模块只负责采集与传递，不做可信度判断（准确性依赖容器网络模式，见该节说明） | Agent |
 | v1.7.0 | 2026-09-24 | **流量统计已实现并上线**（见 [WEBUI_SPEC §2.1](../requirements/WEBUI_SPEC.md)）：新增 §5.2.2「HTTP 侧字节数的产出」与 §6.4「隧道字节数的去向」——协议层此前已经准确统计字节（§5.2、§6.3），但只喂给早夭判定，从不外传；本次把这两处已有的统计接到执行器新增的 `note_traffic()` 门面，一份进 `HealthTable` 的内存累计（出口健康看板），一份进 `logs.db` 新表 `traffic_log`（今日主机流量榜，见 [DD_STORAGE §3](./DD_STORAGE.md) / [§4.3b](./DD_STORAGE.md)）。`HttpAttempt` 新增 `bytes_up` 字段承载请求侧字节数 | Agent |
 | v1.8.0 | 2026-09-30 | 代码评审修复：读客户端请求体超时（`_send_body` 的 `TimeoutError`）此前虽然被 v1.5.0 兜住不会永久挂起，但仍会被判据当成普通传输层失败无条件切到下一个出口重试——客户端既已停止发送，每个后续出口都会各自重复同一次超时，浪费连接与出口资源才等到最终 502。新增 `self._client_body_timeout` 标记，随 `_switch_context()` 传给判据层，判据一命中即直接终止候选链（详见 [DD_SWITCHING.md](./DD_SWITCHING.md) v1.5.0）。**收窄 §11.1**：该已知限制原描述「body 读到一半失败后重试可能重放位置对不上」的两个触发源之一——读超时——已随本次修复关闭（不再重试，谈不上重放位置对不上）；仍未关闭的是「写往出口 socket 中途失败（如 `BrokenPipeError`）」这一触发源，§11.1 保留并更新措辞 | Agent |
+| v1.9.0 | 2026-10-12 | 出口连接器扩展：支持 `socks5` 类型出口。§7 补充 SOCKS5 握手连接与隧道建立分支，普通 HTTP 请求发往 SOCKS5 时保持 origin-form（与 direct 一致），详细协议设计见 [DD_SOCKS5.md](./DD_SOCKS5.md) | Agent |
 
 **对应需求**：[PRD §4.1](../requirements/PRD_OVERVIEW.md)、[§4.3.11](../requirements/PRD_OVERVIEW.md)、[§4.3.13](../requirements/PRD_OVERVIEW.md)、[§7.2](../requirements/PRD_OVERVIEW.md)
 
@@ -570,7 +571,12 @@ class UpstreamConnector:
         return TunnelConn(conn, status=status)
 ```
 
-`direct` 的 CONNECT 处理需要注意：直连时没有上级代理可以发 CONNECT 请求，直接建立 TCP 连接到目标即可，`status` 人为置为 200。把它统一到 `TunnelConn` 接口下，让上层的切换逻辑不必区分两种情况。
+`direct` 与 `socks5` 的 CONNECT 处理需要注意：
+- `direct`：直连时没有上级代理可以发 CONNECT 请求，直接建立 TCP 连接到目标即可，`status` 人为置为 200。
+- `socks5`：连接到 SOCKS5 代理后，执行 RFC 1928 / RFC 1929 二进制握手并向代理发送 CONNECT 命令，成功后同样将 `status` 人为置为 200，以便与 HTTP 代理的 CONNECT 成功隧道统一在 `TunnelConn` 抽象下。
+- 普通 HTTP 转发差异：`direct` 与 `socks5` 打通的均为端到端原始 TCP 通道，发出的请求行格式均为 **origin-form**（`GET /path HTTP/1.1`）；只有 `http` 代理使用 **absolute-form**。
+
+详细协议二进制流与错误映射参见 [DD_SOCKS5.md](./DD_SOCKS5.md)。
 
 ### 7.1 地址族错误的识别
 

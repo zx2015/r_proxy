@@ -10,6 +10,7 @@
 | v1.5.0 | 2026-08-13 | 明确地址族的入向/出向不对称：入向收窄为 IPv4-only，出向支持 IPv6，定位为应用层 IPv4→IPv6 网关（§1.1、§4.2.4）；补充「DNS 解析归属决定地址族归因能力」这一架构前提；`direct` 增加 IPv6 出口能力探测，纯 IPv6 目标在无能力时于候选链构造阶段跳过且不计失败（§4.3.6、§4.3.7）；启用 Happy Eyeballs 并说明其适用场景；明确不提供上级代理 `supports_ipv6` 字段及理由；新增 AF 组验收场景 | Agent |
 | v1.6.0 | 2026-08-13 | 设计评审回写，三项定案：**配置格式由 YAML 改为 TOML**（§4.2.1、§4.2.1b、§4.8），使代理核心真正零第三方运行时依赖（`tomllib` 为标准库），写回用 `tomlkit` 保留注释；**规则指向不可用出口的处理拆分为两种情况**（[RULES_CONFIG.md](./RULES_CONFIG.md) §4.3.1）：名字不存在拒绝启动、已禁用仅告警；**`manual` 粘性不因失败清除**并新增 §4.6.1 明确「粘性是偏好、规则才是硬约束」 | Agent |
 | v1.7.0 | 2026-08-15 | **规则系统重构**（详见 [RULES_CONFIG.md](./RULES_CONFIG.md) v2.0.0）：规则由文本文件改为 `rules.db` + Web 表格界面，`[rules] files` 换成 `enabled` 救场开关，`[database]` 新增 `rules_path`；§4.5 改为首匹配胜出、只匹配主机名；§4.9.5 写入路径明确「每库一个写者」并纳入配置写入器；§5 文件布局移除 `rules/` 目录 | Agent |
+| v1.8.0 | 2026-10-12 | 引入上级 SOCKS5 代理支持（详见 [SOCKS5_UPSTREAM.md](./SOCKS5_UPSTREAM.md)）：出口类型扩充 `socks5`，激活 `auth` 用户名密码认证，明确 L4 透明代理与普通 HTTP origin-form 契约 | Agent |
 
 ## 1. 背景与目标
 
@@ -397,13 +398,13 @@ connect_timeout = 3                  # 覆盖全局值：直连要么很快通�
 | 字段 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | `name` | string | 是 | — | 全局唯一，规则与 SQLite 的引用标识 |
-| `type` | enum | 是 | — | `http` 或 `direct` |
-| `address` | string | `type=http` 时必填 | — | `host:port` |
+| `type` | enum | 是 | — | `http`、`socks5` 或 `direct` |
+| `address` | string | `type in ("http", "socks5")` 时必填 | — | `host:port` |
 | `priority` | integer | 否 | `100` | 数字越小优先级越高，取值范围 `1`–`999` |
 | `enabled` | boolean | 否 | `true` | 关闭后不参与任何自动路由；规则显式指定已禁用的出口时启动告警、命中时返回 `502`，见 [RULES_CONFIG.md](./RULES_CONFIG.md) §4.4.1 |
 | `connect_timeout` | integer | 否 | 继承 `routing.connect_timeout` | 该出口的连接超时覆盖值，秒 |
 | `read_timeout` | integer | 否 | 继承 `routing.read_timeout` | 该出口的读超时覆盖值，秒 |
-| `auth` | object | 否 | `null` | 上级代理认证，本期预留字段 |
+| `auth` | object | 否 | `null` | 上级代理认证。SOCKS5 出口支持 RFC 1929 用户名密码认证；HTTP 代理本期预留 |
 
 #### 4.2.3 约束
 

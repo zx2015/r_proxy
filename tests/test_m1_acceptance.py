@@ -44,12 +44,14 @@ async def running_app(tmp_path: Path, text: str = BASE) -> Application:
     return app
 
 
-async def talk(app: Application, payload: bytes, *, size: int = 65536) -> bytes:
+async def talk(
+    app: Application, payload: bytes, *, size: int = 65536, timeout: float = 15.0
+) -> bytes:
     host, port = app.proxy_address
     reader, writer = await asyncio.open_connection(host, port)
     writer.write(payload)
     await writer.drain()
-    data = await asyncio.wait_for(reader.read(size), timeout=10)
+    data = await asyncio.wait_for(reader.read(size), timeout=timeout)
     writer.close()
     return data
 

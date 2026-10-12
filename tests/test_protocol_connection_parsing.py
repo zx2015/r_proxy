@@ -24,3 +24,43 @@ class TestParseResponseHead:
     def test_a_missing_status_code_falls_back_to_502(self) -> None:
         status, _ = parse_response_head(b"garbage\r\n\r\n")
         assert status == 502
+
+
+class TestBuildRequest:
+    def test_request_line_forms_by_upstream_type(self) -> None:
+        from r_proxy.config.model import UpstreamConfig
+        from r_proxy.contracts import AddressFamily, Headers, Method, RequestTarget
+        from r_proxy.protocol.connection import build_request
+        from r_proxy.protocol.parse import RawHead
+
+        target = RequestTarget(
+            host="example.com",
+            port=80,
+            method=Method.GET,
+            url="http://example.com/api/v1",
+            is_connect=False,
+            family=AddressFamily.IPV4_ONLY,
+        )
+        head = RawHead(
+            method="GET",
+            target="http://example.com/api/v1",
+            version="HTTP/1.1",
+            headers=Headers([("User-Agent", "curl/7.88.1")]),
+        )
+
+        http_up = UpstreamConfig(name="http_proxy", type="http", address="127.0.0.1:8080")
+        direct_up = UpstreamConfig(name="direct", type="direct", address=None)
+        socks5_up = UpstreamConfig(name="socks_proxy", type="socks5", address="127.0.0.1:1080")
+
+        # 1. http 出口必须发 absolute-form
+        http_req = build_request(target, head, http_up).decode("latin-1")
+        assert http_req.startswith("GET http://example.com/api/v1 HTTP/1.1\r\n")
+
+        # 2. direct 出口必须发 origin-form
+        direct_req = build_request(target, head, direct_up).decode("latin-1")
+        assert direct_req.startswith("GET /api/v1 HTTP/1.1\r\n")
+
+        # 3. socks5 出口与 direct 一致，必须发 origin-form（端到端 L4 代理）
+        socks5_req = build_request(target, head, socks5_up).decode("latin-1")
+        assert socks5_req.startswith("GET /api/v1 HTTP/1.1\r\n")
+

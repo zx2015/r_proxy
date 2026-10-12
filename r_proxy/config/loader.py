@@ -472,10 +472,12 @@ def _build_upstream(item: Any, index: int) -> UpstreamConfig:
     type_: UpstreamType
     if raw_type == "http":
         type_ = "http"
+    elif raw_type == "socks5":
+        type_ = "socks5"
     elif raw_type == "direct":
         type_ = "direct"
     else:
-        raise ConfigError(f"{loc}.type 必须是 'http' 或 'direct'，得到 {raw_type!r}")
+        raise ConfigError(f"{loc}.type 必须是 'http'、'socks5' 或 'direct'，得到 {raw_type!r}")
 
     return UpstreamConfig(
         name=name,

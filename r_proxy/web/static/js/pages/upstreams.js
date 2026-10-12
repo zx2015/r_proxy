@@ -71,6 +71,7 @@ function createForm() {
     "new-type",
     [
       { value: "http", label: "http（上级代理）" },
+      { value: "socks5", label: "socks5（SOCKS5 代理）" },
       { value: "direct", label: "direct（本机直连）" },
     ],
     "http",
@@ -85,7 +86,7 @@ function createForm() {
   const form = el("form", { class: "form-grid" }, [
     field("名称", name, "字母或数字开头，可含 . _ -"),
     field("类型", type),
-    field("地址", address, "http 类型写成 host:port；direct 类型留空"),
+    field("地址", address, "http / socks5 类型写成 host:port；direct 类型留空"),
     field("优先级", priority, "1–999，越小越优先"),
     field("启用", enabled),
     el("div", { class: "field" }, [
@@ -294,8 +295,8 @@ async function savePriorities(groups) {
 
 /** 挡住漏写端口这一最常见手误，省一次往返。地址合法性仍以后端校验为准。 */
 function addressComplaint(type, address) {
-  if (type !== "http") return null;
-  if (!address) return "http 类型必须填写地址。";
+  if (type !== "http" && type !== "socks5") return null;
+  if (!address) return `${type} 类型必须填写地址。`;
   if (!PORT_SUFFIX.test(address)) {
     return "地址缺少端口，需写成 host:port，如 192.168.1.100:8080。";
   }

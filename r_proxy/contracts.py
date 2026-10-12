@@ -48,6 +48,19 @@ class FailureKind(Enum):
     NOT_A_FAILURE = auto()  # 如空闲连接回收的 408
 
 
+class ConnectorError(Exception):
+    """无法建立到出口的连接。
+
+    ``error`` 只存异常类型名或 errno 名，**不含地址**——它可能被拼进
+    响应体，泄露内网拓扑（ARCH「跨层数据契约」约定）。
+    """
+
+    def __init__(self, kind: FailureKind, error: str) -> None:
+        super().__init__(f"出口连接失败: {error}")
+        self.kind = kind
+        self.error = error
+
+
 class AddressFamily(Enum):
     """目标 host 的地址族。UNKNOWN 表示域名且尚未解析。"""
 

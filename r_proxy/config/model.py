@@ -16,7 +16,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Literal
 
-UpstreamType = Literal["http", "direct"]
+UpstreamType = Literal["http", "socks5", "direct"]
 
 DIRECT_NAME = "direct"
 
@@ -82,7 +82,7 @@ def split_host_port(address: str) -> tuple[str, int] | None:
 
 @dataclass(frozen=True, slots=True)
 class UpstreamAuth:
-    """上级代理认证。本期预留，不参与连接建立。"""
+    """上级代理认证（SOCKS5 RFC 1929 用户名密码认证）。"""
 
     username: str
     password: str = field(repr=False)
@@ -102,6 +102,10 @@ class UpstreamConfig:
     @property
     def is_direct(self) -> bool:
         return self.type == "direct"
+
+    @property
+    def is_socks5(self) -> bool:
+        return self.type == "socks5"
 
     @property
     def endpoint(self) -> tuple[str, int] | None:

@@ -14,7 +14,15 @@ import errno
 from dataclasses import dataclass, field
 
 from r_proxy.config.model import RoutingConfig, UpstreamConfig
-from r_proxy.contracts import FailureKind, Headers, RequestTarget
+from r_proxy.contracts import (
+    ConnectorError as ConnectorError,
+)
+from r_proxy.contracts import (
+    FailureKind,
+    Headers,
+    RequestTarget,
+)
+from r_proxy.egress.socks5 import socks5_handshake
 
 # 明确表示地址族不可达。归为 CAPABILITY_MISMATCH：记入日志便于诊断，
 # 但不写负面记忆、不累加熔断计数（PRD §4.3.6）。
@@ -30,19 +38,6 @@ CAPABILITY_ERRNOS = frozenset(
 )
 
 MAX_HANDSHAKE_BYTES = 8192
-
-
-class ConnectorError(Exception):
-    """无法建立到出口的连接。
-
-    ``error`` 只存异常类型名或 errno 名，**不含地址**——它可能被拼进
-    响应体，泄露内网拓扑（ARCH「跨层数据契约」约定）。
-    """
-
-    def __init__(self, kind: FailureKind, error: str) -> None:
-        super().__init__(f"出口连接失败: {error}")
-        self.kind = kind
-        self.error = error
 
 
 @dataclass(slots=True)
@@ -121,15 +116,22 @@ class UpstreamConnector:
         if upstream.is_direct:
             return await self._open(target.host, target.port, timeout, routing, is_direct=True)
         host, port = self._upstream_endpoint(upstream)
-        return await self._open(host, port, timeout, routing, is_direct=False)
+        conn = await self._open(host, port, timeout, routing, is_direct=False)
+        if upstream.type == "socks5":
+            try:
+                await socks5_handshake(conn.reader, conn.writer, target, upstream.auth, timeout)
+            except BaseException:
+                await conn.close()
+                raise
+        return conn
 
     async def connect_tunnel(
         self, upstream: UpstreamConfig, target: RequestTarget, routing: RoutingConfig
     ) -> TunnelConn:
         """为 CONNECT 建立隧道。
 
-        直连时没有上级代理可握手，``status`` 人为置 200，好让上层的切换
-        逻辑不必区分两种情况。
+        直连或 SOCKS5 出口握手成功时没有上级 HTTP 代理可返回 status，
+        ``status`` 人为置 200，好让上层的切换逻辑不必区分这些情况。
         """
         timeout = upstream.connect_timeout or routing.connect_timeout
         if upstream.is_direct:
@@ -138,6 +140,14 @@ class UpstreamConnector:
 
         host, port = self._upstream_endpoint(upstream)
         conn = await self._open(host, port, timeout, routing, is_direct=False)
+        if upstream.type == "socks5":
+            try:
+                await socks5_handshake(conn.reader, conn.writer, target, upstream.auth, timeout)
+            except BaseException:
+                await conn.close()
+                raise
+            return TunnelConn(conn=conn, status=200)
+
         try:
             status, headers = await self._handshake(conn, target, timeout)
         except BaseException:

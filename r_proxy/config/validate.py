@@ -159,7 +159,7 @@ def _check_address(
     if not u.address:
         issues.append(
             ValidationIssue(
-                "error", "E_ADDRESS_REQUIRED", 'type = "http" 的出口必须提供 address', where
+                "error", "E_ADDRESS_REQUIRED", f'type = "{u.type}" 的出口必须提供 address', where
             )
         )
         return

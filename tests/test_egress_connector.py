@@ -467,3 +467,56 @@ class TestConnHelpers:
 
     def test_headers_default_to_empty(self) -> None:
         assert len(Headers()) == 0
+
+
+class TestSocks5Connect:
+    async def test_socks5_connect_succeeds(self, routing: RoutingConfig) -> None:
+        from tests.mocks.mock_socks5 import start_mock_socks5
+
+        mock = await start_mock_socks5()
+        up = UpstreamConfig(name="socks_up", type="socks5", address=mock.address)
+        tgt = target("example.com", 80)
+
+        conn = await UpstreamConnector().connect(up, tgt, routing)
+        try:
+            assert mock.received_targets == [("example.com", 80)]
+            conn.writer.write(b"ping")
+            await conn.writer.drain()
+            assert await conn.reader.readexactly(4) == b"ping"
+        finally:
+            await conn.close()
+            await mock.close()
+
+    async def test_socks5_connect_tunnel_returns_200(self, routing: RoutingConfig) -> None:
+        from tests.mocks.mock_socks5 import start_mock_socks5
+
+        mock = await start_mock_socks5()
+        up = UpstreamConfig(name="socks_up", type="socks5", address=mock.address)
+        tgt = target("example.com", 443, connect=True)
+
+        tunnel = await UpstreamConnector().connect_tunnel(up, tgt, routing)
+        try:
+            assert tunnel.status == 200
+            assert mock.received_targets == [("example.com", 443)]
+        finally:
+            await tunnel.close()
+            await mock.close()
+
+    async def test_socks5_connect_failure_propagates_and_closes(
+        self, routing: RoutingConfig
+    ) -> None:
+        from r_proxy.egress.socks5 import Socks5Reply
+        from tests.mocks.mock_socks5 import start_mock_socks5
+
+        # 模拟目标拒绝连接
+        mock = await start_mock_socks5(rep=Socks5Reply.CONNECTION_REFUSED)
+        up = UpstreamConfig(name="socks_up", type="socks5", address=mock.address)
+        tgt = target("refused.org", 80)
+
+        with pytest.raises(ConnectorError) as exc_info:
+            await UpstreamConnector().connect(up, tgt, routing)
+
+        assert exc_info.value.kind is FailureKind.ROUTE_ERROR
+        assert exc_info.value.error == "SOCKS5_REP_05"
+        await mock.close()
+
