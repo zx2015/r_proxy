@@ -2,6 +2,7 @@
 
 | 版本号 | 日期 | 变更说明 | 作者 |
 | :--- | :--- | :--- | :--- |
+| v1.10.0 | 2026-10-22 | §12.1 记录 `r-proxy` 从 v0.2.0 更新至 v0.3.0：传统 builder 构建、Compose 仅重建服务、保留现有配置与数据卷，并核验容器健康、CLI 版本与 `body_streamed` 代码标记 | Agent |
 | v1.9.0 | 2026-10-22 | 新增 §12：记录 mini-server 上由当前工作区重建并更新 `r-proxy` 容器的过程、镜像 ID、健康检查和状态码接口验证；传统 builder 构建时 PyPI 下载曾超时重试，最终成功 | Agent |
 | v1.0.0 | 2026-08-16 | 初始版本：Dockerfile、docker-compose、host 网络选型、卷布局与迁移流程、验证记录 | Agent |
 | v1.1.0 | 2026-08-16 | §9.1 计数翻倍缺陷已修复：`HealthPersister` 增加 `initial` 基线播种，补充修复理由、测试与端到端验证结果 | Agent |
@@ -687,6 +688,25 @@ docker compose up -d r-proxy
 #### 部署后补充核验
 
 首次重建后，容器内核对发现工作区的 `decision.model` / `decision.switching` 两处后续改动尚未进入该镜像。为确保确实更新到工作区最新代码，保留首次镜像 tag `r-proxy:0.2.0-before-update-20261022`，再从首次镜像增量构建并覆盖两个 Python 模块，最终镜像 ID 为 `sha256:c070549cd82ac11b4ea499e188eef0ad329c77965a837eac26d10d3767a3d65d`。最终容器 `running` / `healthy`；容器内 `SwitchContext.body_streamed` 检查为 True；认证访问 `/api/logs/status-codes` 返回 200 和当前状态码列表。
+
+### 12.1 更新到 v0.3.0（2026-10-22）
+
+此次从已提交版本 `739e13a` 构建并部署：
+
+```bash
+DOCKER_BUILDKIT=0 docker compose build r-proxy
+docker compose up -d r-proxy
+```
+
+构建中 PyPI 下载较慢，但最终成功；Compose 只重建 `r-proxy` 服务。配置与数据继续使用原有挂载 `/media/data/r-proxy-docker/config:/config`、`/media/data/r-proxy-docker/data:/data`，没有执行数据库迁移或清理数据。
+
+| 项 | 方法 | 结果 |
+|---|---|---|
+| 镜像 | `docker inspect` | `r-proxy:0.3.0`，image ID `sha256:c8d1a750af78c9d6cd9108e0d5a336b955399e41cba145f63eea36172c7af68a` |
+| 服务状态 | `docker inspect` | `running` / `healthy`；启动时间 `2026-10-22T11:51:34.844984228Z` |
+| 应用版本 | `docker exec r-proxy r-proxy --version` | `r-proxy 0.3.0` |
+| 最新代码标记 | 容器内检查 `SwitchPolicy.should_switch` | `body_streamed_guard=True` |
+| Compose 工作区与数据卷 | `docker inspect` | Compose 工作目录为本仓库；`/config`、`/data` 挂载路径与更新前一致 |
 
 ## 13. 相关文档
 
