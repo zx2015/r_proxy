@@ -49,6 +49,7 @@ def context(
     response_started: bool = False,
     host: str = "example.com",
     client_body_timeout: bool = False,
+    body_streamed: bool = False,
 ) -> SwitchContext:
     return SwitchContext(
         method=method,
@@ -58,6 +59,7 @@ def context(
         response_started=response_started,
         host=host,
         client_body_timeout=client_body_timeout,
+        body_streamed=body_streamed,
     )
 
 
@@ -114,13 +116,21 @@ class TestGateOneTransportFailure:
         )
         assert verdict.switch is True
 
-    def test_transport_failure_is_not_rate_limited(
+    def test_body_streamed_blocks_switch_for_transport_failure(
         self, policy: SwitchPolicy, limiter: SwitchRateLimiter
     ) -> None:
-        """M2-15：限流只管状态码触发的切换，不能削弱链路故障的自愈。"""
-        for _ in range(20):
-            verdict = decide(policy, limiter, outcome(error="TimeoutError"), context())
-            assert verdict.switch is True
+        """请求体已开始流式转发到上游后发生传输层失败，不得切换。
+
+        即使方法是 PUT（幂等），也不能切换：字节已经发出，无法收回去重放
+        给另一个出口。"""
+        verdict = decide(
+            policy,
+            limiter,
+            outcome(error="ConnectionResetError"),
+            context(method=Method.PUT, request_sent=True, body_streamed=True),
+        )
+        assert verdict.switch is False
+        assert verdict.keep_reason is KeepReason.NOT_REPLAYABLE
 
     def test_transport_failure_ignores_replayability(
         self, policy: SwitchPolicy, limiter: SwitchRateLimiter

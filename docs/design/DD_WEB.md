@@ -2,6 +2,9 @@
 
 | 版本 | 日期 | 变更说明 | 作者 |
 | :--- | :--- | :--- | :--- |
+| v2.2.7 | 2026-10-22 | 状态码候选轮询重建下拉选项时保留 DOM 当前选择（含尚未提交的选择）；仅当候选已消失时回退到已生效筛选值，避免 30 秒刷新覆盖用户编辑 | Agent |
+| v2.2.6 | 2026-10-22 | 代码评审修复：新增 §5.1.1「内建文档端点必须关掉」。FastAPI 自己注册的 `/docs` 与 `/openapi.json` 不经过任何 router 的 `dependencies`，`require_token` 根本不会被调用——实测启用认证后这两条路径仍回 `200`，等于把全部接口路径与数据结构白送给任何人。改为 `docs_url=None, redoc_url=None, openapi_url=None` 关掉内建路由，另挂一条受 token 保护的 `/api/openapi.json`（认证口径与其它 `/api/*` 一致）；Swagger UI 另有一层理由：它的 HTML 依赖 CDN 资源，被本应用自己的 CSP 拦掉，本就是坏页 | Agent |
+| v2.2.5 | 2026-10-22 | 请求日志状态码筛选改为下拉框：新增 `GET /api/logs/status-codes`，从 `request_log` 只读查询非空状态码并去重升序；前端独立 30 秒刷新候选项，失败保留现有候选；补充对应查询/API测试 | Agent |
 | v2.2.4 | 2026-09-30 | §5.3 补部署拓扑警告：`AuthThrottle` 按对端地址限流的前提是 Web 界面直接暴露给客户端，反向代理前置会让限流失效/误伤，交叉引用 [DD_DEPLOY §2.1](./DD_DEPLOY.md) 的详细分析与规避方向 | Agent |
 | v2.2.3 | 2026-09-30 | §8.9 固化粘性为规则新增「连带清扫」：固化成功后除清掉被固化的 host 外，还用 `match()` 重新扫描其余粘性条目，把恰好落进新规则覆盖范围的一并清除（如固化 `*.modelscope.cn` 后 `api-inference.modelscope.cn` 同步清掉），响应新增 `swept_hosts` 字段；§8.9.2 约束表补一行 | Agent |
 | v2.1.7 | 2026-09-24 | 新增 `request_log.client_addr`（客户端来源地址）的 Web 侧接入：§4.2 `_COLUMNS`、`LogItem` 补该列，`LogQuery` 补可选精确匹配过滤；§7.1 前端转义清单补该字段（同样来自不可信流量，与 `host`/`url` 同等对待）；§10.7 看板日志表补「来源」列。落盘与容器网络前提见 [DD_STORAGE §4.9](./DD_STORAGE.md)、[DD_PROXY §4.4](./DD_PROXY.md) | Agent |
@@ -261,6 +264,14 @@ def query_logs(pool: ReadOnlyPool, q: LogQuery) -> list[sqlite3.Row]:
     return pool.query(sql, (*args, q.page_size + 1, q.offset))
 
 
+def query_log_status_codes(pool: ReadOnlyPool) -> list[int]:
+    rows = pool.query(
+        "SELECT DISTINCT http_status FROM request_log "
+        "WHERE http_status IS NOT NULL ORDER BY http_status"
+    )
+    return [int(row["http_status"]) for row in rows]
+
+
 def _where(q: LogQuery, *, extra: Sequence[str] = ()) -> tuple[str, tuple[object, ...]]:
     where: list[str] = list(extra)
     args: list[object] = []
@@ -281,6 +292,8 @@ def _where(q: LogQuery, *, extra: Sequence[str] = ()) -> tuple[str, tuple[object
 ```
 
 `clause` 由**固定的字符串字面量**拼接而成，用户输入全部走 `?` 参数。这是唯一安全的动态 WHERE 构造方式——把列名或值直接拼进 SQL 是注入的入口。`_where` 的 `extra` 也只接受代码里写死的字面量条件（目前只有 `attempt_index > 0`），不接受任何来自请求的片段。
+
+状态码下拉候选由 `GET /api/logs/status-codes` 提供，响应为 `{"status_codes": [200, 502]}`。该只读查询也必须经 `asyncio.to_thread`；前端每 30 秒独立刷新，不加入 3 秒请求日志轮询。查询只返回日志中实际存在的非空状态码，值去重并升序排列；空选项表示不按状态码筛选。查询失败时保留上次候选，候选刷新不影响 `/api/logs` 的分页和筛选。
 
 `client_addr` 的过滤是**精确匹配**，不做前缀/网段匹配：`LogQuery` 只增加一个 `client_addr: str | None`（校验规则与 `host` 一致，`Field(None, max_length=255)`），语义是「只看这一个来源」，不实现 CIDR 解析——那需要额外依赖或手写网段判断，而看板的筛选场景一般是「盯着某个 IP 的可疑流量」，精确匹配已经够用；真要按网段分析，日志本来就能导出去用别的工具处理。
 
@@ -440,6 +453,50 @@ def by_priority(upstreams) -> list[UpstreamConfig]              # (priority, nam
 | `/`、`/static/*` | 否（静态资源本身不含敏感数据） |
 
 **只读接口同样需要 token**（[WEBUI §7.1.1](../requirements/WEBUI_SPEC.md)）。`/api/logs` 会返回用户访问过的全部 URL，`/api/upstreams` 会返回内网代理地址——这些比写接口更值得保护。
+
+#### 5.1.1 内建文档端点必须关掉（v2.2.6）
+
+FastAPI 自己在 `FastAPI(...)` 构造时注册 `/docs`（Swagger UI）与 `/openapi.json` 两条路由。它们**不经过任何 router 的 `dependencies`**——`require_token` 根本不会被调用。实测启用认证后：
+
+```
+GET /api/docs          → 200   （完整 Swagger UI 页面）
+GET /api/openapi.json  → 200   （全部接口路径与数据结构）
+GET /api/status        → 401
+```
+
+也就是说，认证形同虚设：任何人都能拿到全部接口清单、参数结构与返回字段。OpenAPI schema 里还包含出口相关的路径与字段名，与 §5.3「Web 界面绑定非回环地址必须配置 `auth_token`」的防护意图直接冲突。
+
+修法：
+
+```python
+# r_proxy/web/app.py
+
+app = FastAPI(
+    title="r-proxy 管理界面",
+    version=__version__,
+    docs_url=None,      # 关掉内建 Swagger UI
+    redoc_url=None,
+    openapi_url=None,   # 关掉内建 schema 路由
+)
+```
+
+Swagger UI 顺带一并去掉还有第二个理由：它的 HTML 从 `cdn.jsdelivr.net` 拉脚本与样式，会被本应用自己的 CSP（`script-src 'self'; style-src 'self'`，见 §7.2）拦掉——**本来就是打不开的坏页**。留着只会让人以为「文档访问不了是浏览器的问题」。
+
+机器可读的 schema 改由自己挂一条受保护的路由提供，认证口径与其它 `/api/*` 完全一致：
+
+```python
+def _install_openapi(app: FastAPI) -> None:
+    @app.get("/api/openapi.json", include_in_schema=False, dependencies=[Authenticated])
+    async def openapi_json() -> JSONResponse:
+        return JSONResponse(app.openapi())
+```
+
+`include_in_schema=False`：schema 里不该再出现 schema 自己这条路由。`app.openapi()` 在 `openapi_url=None` 时仍然可用（FastAPI 只是不再自动注册路由），返回的 schema 与此前完全一致。
+
+两条守护：
+
+- `tests/test_web_app.py::TestApiDocs`：`/api/docs` → 404；`/api/openapi.json` 无 token → 401，有 token → 200 且 schema 里含 `/api/status`；未配置 token 时 → 200（与其它 `/api/*` 口径一致）。
+- `tests/test_web_app.py::TestApiRouteAuthCoverage`：**遍历 `app.routes`**，断言每一条 `/api/*` 路由（`/api/healthz` 除外）的依赖树里都含 `require_token`。这条守护把「新增路由时忘了加 `dependencies=[Authenticated]`」也一并挡住——它正是本次缺陷的同族。
 
 ### 5.2 校验实现
 
@@ -1473,11 +1530,13 @@ token 面板只在收到 `401` 后出现，不在启动时无条件索要：默�
 
 **主机流量榜不进这套 3 秒轮询**：`/api/status`、`/api/health`、`/api/logs` 三个端点都是内存读取或命中索引的小分页查询，3 秒一次的成本可以忽略；`/api/traffic/hosts` 是一次 `GROUP BY` 聚合查询，即便有 `idx_tl_created` 收窄范围，单次开销也明显高于前三者一个数量级。给它单独一档更低频的刷新（默认 30 秒，同样遵守隐藏即暂停、失败不清空、重入跳过这三条规则），避免「看板一次网络往返」被最贵的那块数据拖慢观感。
 
+状态码候选同样独立于 3 秒轮询，每 30 秒调用一次 `/api/logs/status-codes`。它是全日志表的 `DISTINCT` 查询，不能随着日志分页每 3 秒重复执行；首次页面刷新时加载，后续更新失败时保留已显示的选项。成功刷新并重建选项时，先保留下拉框 DOM 当前值（包括尚未点击「筛选」的编辑值）；当前值已不在最新候选中时，回退到已生效筛选值，若该值也已消失则回到「全部状态码」。
+
 ### 10.7 各页要点
 
 | 页面 | 值得说明的实现 |
 |------|----------------|
-| 看板 | 四块数据来自四个端点（`/status`、`/health`、`/logs`、`/traffic/hosts`），前三个一轮里并发发出、3 秒一次；`/traffic/hosts`独立 30 秒一档（§10.6）。失败的那块单独降级，不影响其他块。请求日志表新增「来源」列（`client_addr`），值随容器网络模式变化——`network_mode: host` 下是真实客户端 IP，`bridge`+端口映射下是 Docker 网桥地址，见 [DD_PROXY §4.4](./DD_PROXY.md)；**不展示** URL 与尝试序号两列（v2.2.1）——URL 与 host 高度重复且占横向空间，尝试序号只在切换事件流里有诊断价值，`LogItem` 仍保留这两个字段（切换链等其他视图要用），只是看板表格不画。出口健康表新增「流量」列（`bytes_up_total`/`bytes_down_total`，人类可读格式化在前端做）；「主机流量榜」是新增的独立卡片，列为 host / 上行 / 下行 / 请求数，按总流量降序，默认取当日前 20 |
+| 看板 | 四块数据来自四个端点（`/status`、`/health`、`/logs`、`/traffic/hosts`），前三个一轮里并发发出、3 秒一次；`/traffic/hosts`独立 30 秒一档（§10.6）。状态码候选由 `/logs/status-codes` 独立每 30 秒刷新。失败的板块保留上次数据，不影响其他块。请求日志表新增「来源」列（`client_addr`），值随容器网络模式变化——`network_mode: host` 下是真实客户端 IP，`bridge`+端口映射下是 Docker 网桥地址，见 [DD_PROXY §4.4](./DD_PROXY.md)；**不展示** URL 与尝试序号两列（v2.2.1）——URL 与 host 高度重复且占横向空间，尝试序号只在切换事件流里有诊断价值，`LogItem` 仍保留这两个字段（切换链等其他视图要用），只是看板表格不画。状态码筛选从日志现存状态码动态构造下拉项（含「全部状态码」空选项）；出口健康表新增「流量」列（`bytes_up_total`/`bytes_down_total`，人类可读格式化在前端做）；「主机流量榜」列为 host / 上行 / 下行 / 请求数，按总流量降序，默认取当日前 20 |
 | 出口 | 拖拽的单位是**优先级组**而非单行（需求 §2.2）。同时给每组 ↑/↓ 按钮：拖拽在键盘上不可达，而需求 §5 要求关键操作可键盘访问 |
 | 粘性 | 每行三个动作：改绑、固化、清除。改绑与固化都是就地展开的面板，两者互斥，见 §10.7.2 |
 | 规则 | 两列表格 + 只读兜底行，见下 |
@@ -1561,3 +1620,9 @@ token 面板只在收到 `401` 后出现，不在启动时无条件索要：默�
 | §2.4 规则语法高亮 | 只做行号 + 错误行标红，不做 token 着色 | 文本域里做着色要用镜像 `<pre>` 覆盖层，依赖字体度量与滚动同步逐像素对齐；对不齐时编辑器直接不可用。着色的收益（颜色）远小于错误定位（已由校验接口给出行号） |
 | §2.1 平均延迟 | 不展示 | 内存里尚未统计延迟（切片 b 的待办），显示 `0ms` 比缺这一项更误导 |
 | §2.1 实时请求日志 | ~~表格已就绪，但当前为空~~ **2026-08-16 已接通** | 生产者原先缺失（`request_log` 只有表结构）。现由 `AttemptExecutor` 每次尝试写一行，见 [DD_STORAGE §4.9](./DD_STORAGE.md)。前端未改动 |
+
+### 13.1 配置校验与重载一致性补充（2026-10-22）
+
+Web 写入前的候选配置校验使用与当前进程启动相同的 CLI overrides。写盘后若重载仍因运行时错误失败，配置写入器恢复旧文本并重载旧配置，避免磁盘文件与仍在服务的内存快照分裂。手工 `/api/reload` 与配置/规则写入共享同一把进程内锁；读取规则库、确保其 schema 的 SQLite 操作放在 `asyncio.to_thread` 中，避免事件循环被 `busy_timeout` 阻塞。
+
+审计 diff 在入库前脱敏。完整 TOML 使用结构化遍历覆盖普通键、inline table 与数组内嵌表；diff 中的凭据赋值也在入库前遮蔽。审计表受与普通日志相同的时间和行数保留策略约束。

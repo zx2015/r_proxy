@@ -12,6 +12,7 @@
 | v1.7.0 | 2026-09-24 | **流量统计已实现并上线**（见 [WEBUI_SPEC §2.1](../requirements/WEBUI_SPEC.md)）：新增 §5.2.2「HTTP 侧字节数的产出」与 §6.4「隧道字节数的去向」——协议层此前已经准确统计字节（§5.2、§6.3），但只喂给早夭判定，从不外传；本次把这两处已有的统计接到执行器新增的 `note_traffic()` 门面，一份进 `HealthTable` 的内存累计（出口健康看板），一份进 `logs.db` 新表 `traffic_log`（今日主机流量榜，见 [DD_STORAGE §3](./DD_STORAGE.md) / [§4.3b](./DD_STORAGE.md)）。`HttpAttempt` 新增 `bytes_up` 字段承载请求侧字节数 | Agent |
 | v1.8.0 | 2026-09-30 | 代码评审修复：读客户端请求体超时（`_send_body` 的 `TimeoutError`）此前虽然被 v1.5.0 兜住不会永久挂起，但仍会被判据当成普通传输层失败无条件切到下一个出口重试——客户端既已停止发送，每个后续出口都会各自重复同一次超时，浪费连接与出口资源才等到最终 502。新增 `self._client_body_timeout` 标记，随 `_switch_context()` 传给判据层，判据一命中即直接终止候选链（详见 [DD_SWITCHING.md](./DD_SWITCHING.md) v1.5.0）。**收窄 §11.1**：该已知限制原描述「body 读到一半失败后重试可能重放位置对不上」的两个触发源之一——读超时——已随本次修复关闭（不再重试，谈不上重放位置对不上）；仍未关闭的是「写往出口 socket 中途失败（如 `BrokenPipeError`）」这一触发源，§11.1 保留并更新措辞 | Agent |
 | v1.9.0 | 2026-10-12 | 出口连接器扩展：支持 `socks5` 类型出口。§7 补充 SOCKS5 握手连接与隧道建立分支，普通 HTTP 请求发往 SOCKS5 时保持 origin-form（与 direct 一致），详细协议设计见 [DD_SOCKS5.md](./DD_SOCKS5.md) | Agent |
+| v1.10.0 | 2026-10-22 | 代码评审修复：新增 §3.1.2「`readuntil` 的超限异常必须逐点接住」。`asyncio.LimitOverrunError` 直接继承 `Exception`，既非 `OSError` 也非 `ValueError` 的子类——`connection.py`（上游响应头超 64KB）、`body.py`（客户端 chunk 长度行超 64KB）、`connector.py`（上级代理 CONNECT 应答头超 64KB）三处的 `except` 元组都漏了它，异常一路逃出连接处理函数，客户端只看到连接被关闭（`<empty: no response>`）。三处分别归 `ROUTE_ERROR` / `BadRequest` / `UPSTREAM_ERROR`，并加 AST 守护测试防复发 | Agent |
 
 **对应需求**：[PRD §4.1](../requirements/PRD_OVERVIEW.md)、[§4.3.11](../requirements/PRD_OVERVIEW.md)、[§4.3.13](../requirements/PRD_OVERVIEW.md)、[§7.2](../requirements/PRD_OVERVIEW.md)
 
@@ -103,6 +104,31 @@ if any("\r" in line or "\n" in line for line in lines):
 ```
 
 按字面 `"\r\n"` 切分后，任何一行还残留 `\r` 或 `\n`，就说明存在没有配对的控制字符——不管它出现在请求行的 target 里，还是某个头部的名字或值里，一律拒绝。选在这里而不是在 `connector.py`/`connection.py` 各自转义，是因为客户端可控的字符串不止 `host` 一条路径会被拼进出口请求（头部值同样会被 `build_request` 原样转发），下游拼接点越多，逐一堵漏就越容易漏一个；单一入口校验才能保证「凡是通过 `parse_head` 的字符串都不含裸露换行」这个不变量始终成立。
+
+#### 3.1.2 `readuntil` 的超限异常必须逐点接住（v1.9.0 修复）
+
+`asyncio.LimitOverrunError` 直接继承 `Exception`——它**既不是 `OSError` 也不是 `ValueError` 的子类**：
+
+```
+LimitOverrunError.__mro__ == (LimitOverrunError, Exception, BaseException, object)
+```
+
+因此凡是调用 `readuntil`/`readline` 的地方，只要 `except` 元组里没有显式列出它，异常就会一路逃出连接处理函数。逃逸的后果不是「归类错一点」，而是**客户端收不到任何响应**：连接被直接关闭，抓包表现为 `<empty: no response>`，服务端日志里只剩一条没有上下文的栈。
+
+全项目一共 5 处 `readuntil` 调用，各自的处置如下（`StreamReader` 的 `limit` 缺省为 65536，与 `MAX_HEAD_BYTES` 同值）：
+
+| 调用点 | 触发条件 | 归类 | 理由 |
+|--------|----------|------|------|
+| `protocol/parse.py` `read_head` | 客户端请求头超 64KB | `HeaderTooLarge` → `431` | 已有正确处理（§3.1） |
+| `protocol/connection.py` `_attempt_http` | **上游**响应头超 64KB | `ROUTE_ERROR` | 与同块里的 `ValueError` 一致：「经这个出口到不了这个目标」，只记 `(host, upstream)` 负面记忆，**不熔断整个出口** |
+| `protocol/body.py` `_read_line` | 客户端 chunk 长度行超 64KB | `BadRequest` → `400` | 与既有的 `MAX_CHUNK_LINE`（8192）检查是同一类问题，只是先被 reader 拦下了 |
+| `egress/connector.py` `_handshake` | **上级代理**的 CONNECT 应答头超 64KB | `UPSTREAM_ERROR` / `HandshakeTooLarge` | 代理回的不是正常 HTTP 应答；与同块里的 `ValueError` 分支同义 |
+
+`readuntil` 抛 `LimitOverrunError` 时，reader 的缓冲区里已积累的行**不完整**，不能当普通数据继续用——所以这些分支都必须终止本次尝试，而不是重试。
+
+这条不变量由 `tests/test_architecture.py::test_readuntil_callers_handle_limit_overrun` 守护：用 AST 扫出所有 `readuntil`/`readline` 调用点，检查它们所在的 `try` 是否接住了 `LimitOverrunError`。新增调用点而忘了接住，守护测试立刻失败。
+
+> ⚠️ 历史遗漏（v1.9.0 修复前）：`connection.py` / `body.py` / `connector.py` 三处都只写了 `except (OSError, EOFError, ValueError, ...)`，其中 `body.py` 与 `connector.py` 的 `except ValueError` 实为近乎死代码——`readuntil` 只在分隔符为空（`b""`）时抛 `ValueError`，真正的大小上限异常是 `LimitOverrunError`，两者不是一回事。
 
 ### 3.2 host 规范化
 
@@ -427,7 +453,7 @@ async def pump(src: StreamReader, dst: StreamWriter, *,
 
 读上游响应头此前只做一次 `readuntil(b"\r\n\r\n")`：读到第一个以空行结尾的头部就当成了这次请求的最终响应。这个假设对绝大多数响应成立，但 HTTP/1.1 允许服务器在最终响应之前先回一个或多个 **1xx 信息性响应**（最常见的是客户端带 `Expect: 100-continue` 时服务器回的 `100 Continue`，其次是 `103 Early Hints`）——`Expect` 头不在 `HOP_BY_HOP` 剥离列表里，会原样转发给上游，因此上游完全可能按这个头的存在决定回一个 1xx。
 
-r-proxy 从不实现 `Expect: 100-continue` 的握手优化（`_send_body` 无条件把请求体全部发出去，不等上游确认），但这不妨碍上游仍然按标准礼节先回一个 `100 Continue`。此前的实现会把这个 `100 Continue` 当成最终响应转发给客户端，而紧随其后的真正响应（状态行 + 头 + body）会被当作这次「响应」的 body 一并转发出去——客户端看到的状态码是 `100`，body 里却混进一段 HTTP 头部文本，是一个能被真实站点触发的协议正确性缺陷，不是假设场景。
+此前 r-proxy 没有实现 `Expect: 100-continue` 握手优化，且会把 `Expect` 原样转发给上游。上游可能按该头先回 `100 Continue`；旧实现会把它当成最终响应转发给客户端，而紧随其后的真正响应（状态行 + 头 + body）会被当成这次「响应」的 body 一并转发出去——客户端看到的状态码是 `100`，body 里却混进一段 HTTP 头部文本，是一个能被真实站点触发的协议正确性缺陷，不是假设场景。2026-10-22 起代理在客户端请求体前完成一次 100 握手，并剥除转发头中的 `Expect`；上游仍可能主动返回其他 1xx，因此响应循环继续保留。
 
 修复：读到响应头后先判断状态码，若落在 `[100, 200)` 区间就继续读下一段头部，循环直到拿到真正的最终响应，全程仍在同一个 `read_timeout` 窗口内（不会因为多跳 1xx 而无界等待）；连续跳过的 1xx 超过 8 次视为上游行为异常，判为失败。跳过 1xx 时记一条 `INFO` 日志，便于观察这条路径是否被频繁触发（正常情况下应当很少见到）。
 
@@ -755,3 +781,15 @@ def _send_error(self, status: int, message: str, request_id: str) -> None:
 `parse_target` 只识别 CONNECT 的 authority-form、含 `://` 的 absolute-form、其余一律按 origin-form 处理（要求 `Host` 头）。RFC 9112 §3.2.4 定义的 asterisk-form（仅 `OPTIONS *` 使用）落进 origin-form 分支时，`url = f"http://{host_header}{target}"` 会拼出类似 `http://example.com*` 的字符串（`target` 是字面量 `"*"`，前面没有 `/`）。这个畸形 URL 会被转发给出口，多数服务器要么按路径 `*`（罕见但部分服务器容忍）处理要么返回 `400`，不会造成安全问题，但语义上不正确。
 
 **为什么暂不修**：`OPTIONS *` 通过正向代理转发在实践中极其罕见（主要用于服务器直连的探活场景，代理场景下客户端很少这么发），影响面小；修正需要明确「asterisk-form 经 `direct`/经上级代理时请求行分别该怎么写」这一未被当前设计文档覆盖的问题，属于需要先补设计再改代码的范畴，不适合顺手改掉。后续若排期，建议先在本节或 §3.3 补一小节设计，再实现。
+
+## 12. 背压等待与 Expect 握手补充（2026-10-22）
+
+每段 relay 将 `read`、`write` 和 `drain` 纳入同一个 `idle_timeout`。超时因此同时限制源端空闲与目的端 TCP 零窗口造成的写阻塞；持续有数据进展的大文件传输会在每个 chunk 重新获得完整空闲窗口，不受固定总时长限制。普通 HTTP 的请求头、请求体和最终 `drain` 受出口 `read_timeout` 总期限约束。
+
+连接超限响应与 CONNECT 的 `200 Connection Established` 写入也有上限。前者使用代理 idle timeout，后者使用连接 idle timeout；超时后关闭连接以释放槽位。
+
+客户端发送 `Expect: 100-continue` 时，代理在准备消费请求体时回复一次 `100 Continue`，并从转发头剥离 `Expect`。重试时不会重复发送中间响应。上游自行返回的其他 1xx 仍由 §5.3 的响应处理循环吸收。
+
+绝对形式 URL 的 authority 在拆分前剥除 URI userinfo；host/port 从剩余 authority 解析。日志 URL 将 userinfo 替换为 `***`，避免凭据落盘。
+
+`_request_sent` 在请求头第一次交给 `StreamWriter.write()` 后立即置位，而不是等请求体和 `drain()` 全部完成。对非幂等请求采用保守语义：即使随后写入或 drain 失败，部分请求字节也可能已到达上游，不能把它当成「未发送」重试。请求体流式发送另外逐块等待 `drain()`，且 `body_streamed` 阻止幂等请求在部分请求体已离开代理后切换。

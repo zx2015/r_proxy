@@ -21,7 +21,7 @@ from r_proxy.decision.model import AttemptOutcome, Decision, SwitchContext
 from r_proxy.decision.router import Router
 from r_proxy.egress.connector import ConnectorError, TunnelConn, UpstreamConn, UpstreamConnector
 from r_proxy.egress.executor import AttemptExecutor, AttemptResult
-from r_proxy.protocol.body import BodyPlan, plan_body, stream_body
+from r_proxy.protocol.body import BodyPlan, BodyReadTimeout, plan_body, stream_body
 from r_proxy.protocol.parse import (
     BadRequest,
     ClientDisconnected,
@@ -116,7 +116,11 @@ class ClientConnection:
         # 请求体是否已从客户端读完。读完之后的重试必须走重放缓冲，
         # 因为客户端不会再发一遍。
         self._body_consumed = False
+        # 请求体字节是否已开始写往当前出口。即使尚未触及 switch_buffer_bytes
+        # 的上限，字节一旦流式转发到上游就无法收回去重放给下一个出口。
+        self._body_streamed = False
         self._request_sent = False
+        self._continue_sent = False
         # 读客户端请求体超时后置位，且不再复位：客户端既然已经不再发送数据，
         # 后续任何一次尝试重新读它都会以同样的方式再超时一次。见 `_send_body`
         # 与 `SwitchContext.client_body_timeout` 的注释。
@@ -223,7 +227,7 @@ class ClientConnection:
         # 先回 200、再进入透传：tunnel_established 与 200 的发出严格对齐，
         # 不存在「已发 200 但标志未置」的中间态（DD_PROXY §6.1）。
         self._writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        await self._writer.drain()
+        await self._drain_client()
         self._response_started = True
 
         upstream_name = delivered.outcome.upstream
@@ -334,7 +338,7 @@ class ClientConnection:
         bytes_down = 0
         try:
             self._writer.write(sanitize_response_head(attempted.raw_head))
-            await self._writer.drain()
+            await self._drain_client()
             self._response_started = True
             self._replay.give_up()
             bytes_down = await pump(
@@ -374,19 +378,26 @@ class ClientConnection:
 
         _, read_timeout = self._cfg.timeout_for(upstream.name)
         try:
-            request_head = build_request(target, head, upstream)
-            conn.writer.write(request_head)
-            body_bytes = await self._send_body(conn, plan)
-            await conn.writer.drain()
-            self._request_sent = True
-
             async with asyncio.timeout(read_timeout):
+                request_head = build_request(target, head, upstream)
+                if (
+                    plan.kind != "none"
+                    and (head.headers.get("expect") or "").lower() == "100-continue"
+                    and not self._continue_sent
+                ):
+                    self._writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+                    await self._drain_client()
+                    self._continue_sent = True
+                conn.writer.write(request_head)
+                self._request_sent = True
+                body_bytes = await self._send_body(conn, plan)
+                await conn.writer.drain()
                 raw_head = await conn.reader.readuntil(b"\r\n\r\n")
                 status, headers = parse_response_head(raw_head)
                 # 1xx（100 Continue、103 Early Hints 等）是中间响应，不是这次
-                # 请求的最终结果。我们从不实现 Expect: 100-continue 握手优化
-                # ——请求体在 ``_send_body`` 里已经无条件全部发出——但上游仍可能
-                # 主动回一个 1xx。若把它当成最终响应转发，客户端会把紧随其后的
+                # 请求的最终结果。客户端的 Expect 握手已由代理终止，且该头不会
+                # 转发给上游；上游仍可能主动返回 1xx。若把它当成最终响应转发，
+                # 客户端会把紧随其后的
                 # 真正响应（状态行 + 头 + 体）整段误当成这次 1xx 响应的 body 收下：
                 # 表现为客户端看到的状态码是 100/103，body 里却混进一段 HTTP
                 # 头部文本——这是能被真实网站触发的协议正确性缺陷，而不是假设
@@ -409,8 +420,21 @@ class ClientConnection:
         except BadRequest:
             await conn.close()
             raise
-        except (OSError, EOFError, ValueError, asyncio.IncompleteReadError) as exc:
+        except (
+            OSError,
+            EOFError,
+            ValueError,
+            asyncio.IncompleteReadError,
+            asyncio.LimitOverrunError,
+        ) as exc:
             # `TimeoutError` 是 `OSError` 的子类，单独列出纯属冗余，这里不重复写。
+            #
+            # `asyncio.LimitOverrunError` 必须显式列出：它只继承 `Exception`，既不是
+            # `OSError` 也不是 `ValueError` 的子类，漏掉它异常会一路逃出本函数，
+            # 客户端只看到连接被关闭、收不到任何响应（响应头超过 reader 的 64KB
+            # 上限就会触发）。归 `ROUTE_ERROR` 与同块里的 `ValueError` 一致：
+            # 「经这个出口到不了这个目标」，只记 `(host, upstream)` 负面记忆，
+            # 不该把整个出口熔断掉。
             await conn.close()
             return AttemptResult(
                 outcome=AttemptOutcome(
@@ -466,16 +490,18 @@ class ClientConnection:
 
         sent = 0
 
-        def sink(chunk: bytes) -> None:
+        async def sink(chunk: bytes) -> None:
             nonlocal sent
+            if not self._body_streamed:
+                self._body_streamed = True
             sent += len(chunk)
             self._replay.append(chunk)
             conn.writer.write(chunk)
+            await conn.writer.drain()
 
         try:
-            async with asyncio.timeout(self._head_read_timeout):
-                await stream_body(self._reader, sink, plan)
-        except TimeoutError:
+            await stream_body(self._reader, sink, plan, idle_timeout=self._head_read_timeout)
+        except BodyReadTimeout:
             logger.warning(
                 "请求 %s 读取客户端请求体超时（>%.0fs），放弃该次尝试",
                 self.request_id,
@@ -498,9 +524,15 @@ class ClientConnection:
             response_started=self._response_started,
             host=target.host,
             client_body_timeout=self._client_body_timeout,
+            body_streamed=self._body_streamed,
         )
 
     # -- 收尾 ----------------------------------------------------------------
+
+    async def _drain_client(self) -> None:
+        """对客户端的每次写入都受空闲期限约束，避免慢读端占住连接槽位。"""
+        async with asyncio.timeout(self._idle_timeout):
+            await self._writer.drain()
 
     async def _send_error(self, status: int, message: str) -> None:
         if self._response_started:
@@ -517,7 +549,7 @@ class ClientConnection:
         self._response_started = True
         try:
             self._writer.write(head + body)
-            await self._writer.drain()
+            await self._drain_client()
         except (OSError, ConnectionError):
             pass
 

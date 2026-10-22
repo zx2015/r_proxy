@@ -30,6 +30,7 @@ from r_proxy.web.schemas import (
     LogItem,
     LogPage,
     LogQuery,
+    LogStatusCodesResponse,
     ProxyInfo,
     RequestsInfo,
     StatusResponse,
@@ -101,6 +102,13 @@ async def list_logs(params: LogQueryDep, app: AppDep) -> LogPage:
         page_size=params.page_size,
         has_more=len(rows) > params.page_size,
     )
+
+
+@router.get("/logs/status-codes", dependencies=[Authenticated])
+async def list_log_status_codes(app: AppDep) -> LogStatusCodesResponse:
+    """状态码筛选候选项；低频调用，日志查询在线程池执行。"""
+    codes = await asyncio.to_thread(queries.query_log_status_codes, app.storage.logs_reader)
+    return LogStatusCodesResponse(status_codes=codes)
 
 
 @router.get("/logs/switches", dependencies=[Authenticated])

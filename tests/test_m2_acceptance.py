@@ -8,6 +8,8 @@ M2 未完成。判据与状态机的细节由各模块单元测试覆盖，这�
 from __future__ import annotations
 
 import asyncio
+import socket
+import struct
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -338,6 +340,37 @@ class TestM2Acceptance:
         finally:
             await app.stop()
 
+    async def test_m2_10c_oversized_body_transport_reset_cannot_switch(
+        self, tmp_path: Path
+    ) -> None:
+        """已开始流式发送的大 body 遇上游 RST 时返回 502，不能触碰下一出口。"""
+        seen_b: list[str] = []
+
+        async def reset_during_body(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+            await r.readuntil(b"\r\n\r\n")
+            await r.readexactly(1)  # 确认代理已开始发送请求体，再复位 TCP 连接。
+            sock = w.get_extra_info("socket")
+            assert sock is not None
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            w.close()
+
+        a = await start_server(reset_during_body)
+        b = await start_server(responder(b"HTTP/1.1 200 OK", seen=seen_b))
+        app = await running_app(
+            tmp_path,
+            config(
+                http_upstream("a", a.address, priority=10),
+                http_upstream("b", b.address, priority=20),
+                routing="[routing]\nswitch_buffer_bytes = 4096\n",
+            ),
+        )
+        try:
+            response = await _put_body(app, b"r" * 100_000)
+            assert response.startswith(b"HTTP/1.1 502")
+            assert seen_b == []
+        finally:
+            await app.stop()
+
     async def test_m2_10b_small_body_is_replayed_on_the_next_upstream(self, tmp_path: Path) -> None:
         """反面：请求体在缓冲上限内时应当完整重放到新出口。"""
         received: list[bytes] = []
@@ -619,6 +652,29 @@ class TestM2Acceptance:
         try:
             body = await get(app)
             assert b"X-R-Proxy-Request-Id:" in body
+        finally:
+            await app.stop()
+
+    async def test_oversized_upstream_response_head_becomes_a_502(self, tmp_path: Path) -> None:
+        """上游响应头超过 reader 上限时，客户端必须收到 502，而不是空响应。
+
+        ``asyncio.LimitOverrunError`` 直接继承 ``Exception``：漏接时它会一路
+        逃出 ``_attempt_http``，连接处理函数异常退出，客户端只看到连接被关闭
+        （抓包是 ``<empty: no response>``），服务端日志里也只剩一条没有上下文的栈。
+        """
+
+        async def handler(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+            await r.readuntil(b"\r\n\r\n")
+            w.write(b"X" * 70000)  # 没有 CRLFCRLF，reader 先撞上 limit
+            await w.drain()
+            await asyncio.sleep(0.5)
+
+        srv = await start_server(handler)
+        app = await running_app(tmp_path, config(http_upstream("a", srv.address)))
+        try:
+            resp = await get(app)
+            assert resp.startswith(b"HTTP/1.1 502")
+            assert b"X-R-Proxy-Request-Id:" in resp
         finally:
             await app.stop()
 

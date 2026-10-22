@@ -338,6 +338,33 @@ class TestConnectTunnel:
         finally:
             await srv.close()
 
+    async def test_oversized_handshake_response_is_an_upstream_error(
+        self, routing: RoutingConfig
+    ) -> None:
+        """CONNECT 应答头超过 reader 上限时必须归为 ``upstream_error``。
+
+        ``asyncio.LimitOverrunError`` 只继承 ``Exception``，不是 ``ValueError``
+        的子类：漏接时它会一路逃出握手函数，调用方拿不到 ``ConnectorError``，
+        也就无从判断该不该换出口、该不该计入熔断。
+        """
+
+        async def handler(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+            await r.readuntil(b"\r\n\r\n")
+            w.write(b"X" * 70000)  # 没有 CRLFCRLF，reader 先撞上 limit
+            await w.drain()
+            await asyncio.sleep(0.2)
+
+        srv = await start_server(handler)
+        try:
+            with pytest.raises(ConnectorError) as e:
+                await UpstreamConnector().connect_tunnel(
+                    http_upstream(srv.address), target("example.com", 443, connect=True), routing
+                )
+            assert e.value.kind is FailureKind.UPSTREAM_ERROR
+            assert e.value.error == "HandshakeTooLarge"
+        finally:
+            await srv.close()
+
     async def test_handshake_response_headers_are_captured(self, routing: RoutingConfig) -> None:
         """来源判定需要看 Server / X-Squid-Error 等头。"""
 

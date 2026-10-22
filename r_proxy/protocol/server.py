@@ -120,7 +120,7 @@ class ProxyServer:
     async def _on_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         if len(self._active) >= self._cfg.limits.max_client_connections:
             self.rejected_connections += 1
-            await _reject(writer)
+            await _reject(writer, timeout=self._idle_timeout)
             return
 
         conn = ClientConnection(
@@ -155,11 +155,12 @@ def _client_addr(writer: asyncio.StreamWriter) -> str | None:
     return str(peer[0])
 
 
-async def _reject(writer: asyncio.StreamWriter) -> None:
+async def _reject(writer: asyncio.StreamWriter, *, timeout: float = DEFAULT_IDLE_TIMEOUT) -> None:
     try:
         writer.write(_OVERLOAD_RESPONSE)
-        await writer.drain()
-    except (OSError, ConnectionError):
+        async with asyncio.timeout(timeout):
+            await writer.drain()
+    except (OSError, ConnectionError, TimeoutError):
         pass
     finally:
         writer.close()

@@ -53,6 +53,13 @@ class SwitchPolicy:
         # 收到并可能已经处理了这次调用。此时仍无条件切换，会把同一个 POST
         # 重放到下一个出口，等价于让一次下单/扣款类调用被悄悄执行两次——这
         # 正是 AGENTS.md/CLAUDE.md 明确列为红线的「非幂等方法已发出后不得重试」。
+        #
+        # 另外：一旦请求体字节已经开始流式转发到某个出口（即使尚未超过
+        # ``switch_buffer_bytes`` 缓冲上限，甚至缓冲还在用），字节就已经离开
+        # 代理发往该出口，无法收回并重放给另一个出口。此时发生传输层失败再切换
+        # 会导致同一个请求体被发给下一个出口——对非幂等方法是灾难，对幂等方法
+        # 也可能导致副作用（已发出的请求已被上游处理）。因此一旦 ``body_streamed``
+        # 为 True，传输层失败也不得切换（AGENTS.md §5.1b）。
         # 检查顺序与判据三保持一致：response_started 是更强的约束，排在前面。
         if outcome.status is None:
             if ctx.response_started:
@@ -67,10 +74,16 @@ class SwitchPolicy:
                     keep_reason=KeepReason.NON_IDEMPOTENT,
                     failure_kind=outcome.kind,
                 )
+            if ctx.body_streamed:
+                return SwitchVerdict(
+                    switch=False,
+                    keep_reason=KeepReason.NOT_REPLAYABLE,
+                    failure_kind=outcome.kind,
+                )
             # 客户端请求体读超时：换哪个出口都等不到客户端补发剩下的数据，
             # 继续遍历候选链只会让每个出口各自重复同一次超时。与
             # `replayable` 分开判断（见 `SwitchContext.client_body_timeout`
-            # 的注释）：`switch_buffer_bytes: 0` 时 `replayable` 天然为
+            # 的注释）：`switch_buffer_bytes=0` 时 `replayable` 天然为
             # False，但那种「字节还没发出」的传输层失败仍要能切换。
             if ctx.client_body_timeout:
                 return SwitchVerdict(

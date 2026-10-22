@@ -18,6 +18,19 @@ async def connect(srv: FakeServer) -> tuple[asyncio.StreamReader, asyncio.Stream
 
 
 class TestPump:
+    async def test_stalled_destination_drain_times_out(self) -> None:
+        class StalledWriter:
+            def write(self, _data: bytes) -> None:
+                pass
+
+            async def drain(self) -> None:
+                await asyncio.Event().wait()
+
+        src = asyncio.StreamReader()
+        src.feed_data(b"payload")
+        with pytest.raises(TimeoutError):
+            await pump(src, StalledWriter(), idle_timeout=0.02)  # type: ignore[arg-type]
+
     async def test_copies_all_bytes(self, echo_server: FakeServer) -> None:
         reader, writer = await connect(echo_server)
         src = asyncio.StreamReader()

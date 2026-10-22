@@ -89,7 +89,7 @@ async def update_settings(
 
 
 @router.post("/reload", dependencies=[Authenticated])
-async def reload_config(request: Request, app: AppDep) -> ConfigVersionResponse:
+async def reload_config(request: Request, app: AppDep, writer: WriterDep) -> ConfigVersionResponse:
     """重新读取 `config.toml` 与 `rules.db` 中的规则表。
 
     失败时保留正在生效的快照——一次手滑的编辑不该让代理停摆——因此这里回 `400`
@@ -97,7 +97,7 @@ async def reload_config(request: Request, app: AppDep) -> ConfigVersionResponse:
     """
     before = app.snapshot.config_version
     try:
-        await app.reload()
+        await writer.reload()
     except StartupError as exc:
         raise HTTPException(
             400,

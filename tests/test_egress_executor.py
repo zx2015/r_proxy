@@ -58,6 +58,7 @@ def switch_context(
     response_started: bool = False,
     host: str = "example.com",
     client_body_timeout: bool = False,
+    body_streamed: bool = False,
 ) -> SwitchContext:
     return SwitchContext(
         method=method,
@@ -67,6 +68,7 @@ def switch_context(
         response_started=response_started,
         host=host,
         client_body_timeout=client_body_timeout,
+        body_streamed=body_streamed,
     )
 
 
@@ -368,6 +370,19 @@ class TestSwitchVerdictControlsTheLoop:
 
 
 class TestRuleForcedRouting:
+    async def test_relaxed_admission_bypasses_open_circuit_but_reserves_one_probe(
+        self, clock: Clock
+    ) -> None:
+        snap = make_snapshot(upstream("a"), routing=ROUTING)
+        state = RuntimeState.from_snapshot(snap)
+        for i in range(2):
+            state.health.record_result("a", ok=False, kind=FailureKind.UPSTREAM_ERROR, now=float(i))
+        executor = build(clock, state)
+        decision = Decision(chain=("a",), source="priority", relaxed=True)
+        clock.now = 1.0
+        assert executor._admit("a", decision) is True
+        assert executor._admit("a", decision) is False
+
     async def test_unswitchable_decision_never_advances(self, clock: Clock) -> None:
         """规则强制路由失败不切换，原样返回错误。"""
         snap = make_snapshot(upstream("a"), upstream("b"), routing=ROUTING)

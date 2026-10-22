@@ -262,11 +262,33 @@ class WriterThread(threading.Thread):
                 conn.executemany(_SQL[kind], rows)
             conn.commit()
         except sqlite3.Error as exc:
+            if isinstance(exc, sqlite3.IntegrityError):
+                # executemany 在约束错误处会留下前半批已执行的语句；先整体回滚，
+                # 再按原顺序逐条重放，才能隔离坏行且不打乱 delete/upsert 等顺序。
+                _rollback(conn)
+                self._write_isolated(conn, ops)
+                return
             # 写入失败不重试：数据可丢，代理不能停。重试会阻塞队列消费，
             # 让内存跟着涨。
             _rollback(conn)
             self.metrics.write_errors += 1
             logger.error("批量写入失败，丢弃 %d 条: %s", len(ops), exc)
+
+    def _write_isolated(self, conn: sqlite3.Connection, ops: list[WriteOp]) -> None:
+        """遇到行级完整性约束错误时保留同批其他有效记录。"""
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for op in ops:
+                try:
+                    conn.execute(_SQL[op.kind], op.payload)
+                except sqlite3.IntegrityError as exc:
+                    self.metrics.write_errors += 1
+                    logger.error("单条写入违反完整性约束，已跳过 kind=%s: %s", op.kind.value, exc)
+            conn.commit()
+        except sqlite3.Error as exc:
+            _rollback(conn)
+            self.metrics.write_errors += 1
+            logger.error("逐条隔离写入失败，丢弃 %d 条: %s", len(ops), exc)
 
 
 def merge(ops: list[WriteOp]) -> list[WriteOp]:
@@ -280,23 +302,22 @@ def merge(ops: list[WriteOp]) -> list[WriteOp]:
     # 被 delete 抹掉的槽位。标记而不是从 out 里删除：删除会让其余槽位下标
     # 全部失效，而 slots 里存的就是下标。
     dropped: set[int] = set()
-    slots: dict[tuple[str, tuple[object, ...]], dict[OpKind, int]] = {}
-
     for op in ops:
         row = op.row_key
         if row is None:
             out.append(op)  # INSERT 类不合并，每条都要保留
             continue
-        group = slots.setdefault(row, {})
         if op.spec.deletes_row:
-            dropped.update(group.values())
-            group.clear()
-        slot = group.get(op.kind)
-        if slot is None:
-            group[op.kind] = len(out)
-            out.append(op)
+            dropped.update(i for i, prior in enumerate(out) if prior.row_key == row)
+        if (
+            out
+            and len(out) - 1 not in dropped
+            and out[-1].row_key == row
+            and out[-1].kind is op.kind
+        ):
+            out[-1] = _combine(out[-1], op)
         else:
-            out[slot] = _combine(out[slot], op)
+            out.append(op)
 
     return [op for index, op in enumerate(out) if index not in dropped]
 

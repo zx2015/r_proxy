@@ -105,6 +105,11 @@ class TestParseTargetConnect:
 
 
 class TestParseTargetAbsoluteForm:
+    def test_userinfo_credentials_do_not_break_authority_and_are_redacted(self) -> None:
+        target = parse_target("GET", "http://alice:secret@example.com:8080/path", Headers())
+        assert (target.host, target.port) == ("example.com", 8080)
+        assert target.url == "http://***@example.com:8080/path"
+
     def test_http_defaults_to_80(self) -> None:
         t = parse_target("GET", "http://example.com/a/b", Headers())
         assert (t.host, t.port, t.is_connect) == ("example.com", 80, False)
@@ -169,6 +174,10 @@ class TestMethodAndFamily:
 
 
 class TestStripHopByHop:
+    def test_expect_continue_is_terminated_at_the_proxy(self) -> None:
+        headers = strip_hop_by_hop(Headers([("Expect", "100-continue"), ("Host", "x")]))
+        assert headers.get("expect") is None
+
     def test_removes_standard_hop_headers(self) -> None:
         h = strip_hop_by_hop(
             Headers(

@@ -2,6 +2,8 @@
 
 | 版本 | 日期 | 变更说明 | 作者 |
 | :--- | :--- | :--- | :--- |
+| v1.14.0 | 2026-10-22 | 写入错误恢复细化：批量 `executemany` 遇到 `IntegrityError` 时回滚后按原操作顺序逐条隔离，跳过违反约束的单行并提交同批有效行；锁、磁盘等其他 SQLite 错误仍整批回滚且不重试，避免阻塞队列 | Agent |
+| v1.13.0 | 2026-10-22 | 代码评审修复：`logs.db` schema 3 → 4，新增 `_LOGS_V4`（只加索引，不动表结构）。三条索引各自对应一条实测过的慢查询——状态码下拉的候选集（46ms → 6.7ms）、请求日志与流量统计的联表（138ms → 0.1ms）、切换事件流（50ms → 31ms）。详见新增的 §3.2.1 | Agent |
 | v1.12.0 | 2026-09-30 | 代码评审修复：`route_block_upsert`/`sticky_upsert` 的 `fail_count`/`hit_count` 补 `delta_slots`（新增 `fail_count_delta`/`hit_delta` 参数，默认 1），SQL 由 `route_block.fail_count + 1`/`host_upstream.hit_count + 1` 改为 `+ excluded.fail_count`/`+ excluded.hit_count`；此前同批次内同一 `(host, upstream)`/同一 host 被多次写入时，合并只留最后一条，计数会比实际少（§4.4、§4.4a） | Agent |
 | v1.9.0 | 2026-09-24 | 新增 `request_log.client_addr`（客户端来源地址）：§3 schema 补列，§3.1 补取舍说明，§3.2 补 `logs.db` schema 版本 1→2 的迁移步骤示例，§4.9 补字段来源（`ProxyServer._on_client` 的 `peername`）与容器网络前提（依赖 `network_mode: host`，见 [DD_DEPLOY.md](./DD_DEPLOY.md)） | Agent |
 | v1.10.0 | 2026-09-24 | **流量统计已实现并上线**（见 [WEBUI_SPEC §2.1](../requirements/WEBUI_SPEC.md)）：①`state.db` 的 `upstream_health` 新增 `bytes_up_total`/`bytes_down_total`（`STATE` schema 1→2），供出口健康看板；②`logs.db` 新增 `traffic_log` 表（`LOGS` schema 2→3），每个成功交付的请求关闭/结束时落一行，供「当日主机流量榜」按 `created_at` 有界聚合，不依赖全表扫描；③§4.3 新增 §4.3b 关键 SQL；④§5 启动回填新增两个字节字段；⑤§6 清理任务把 `traffic_log` 并入既有的 `request_log` 保留策略。生产端见 [DD_PROXY §5.2.2/§6.4](./DD_PROXY.md)，内存侧见 [DD_ROUTING §4.8](./DD_ROUTING.md) | Agent |
@@ -200,6 +202,12 @@ CREATE TABLE IF NOT EXISTS traffic_log (
 
 CREATE INDEX IF NOT EXISTS idx_tl_created ON traffic_log(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tl_host    ON traffic_log(host, created_at DESC);
+
+-- 见 §3.2 的「三条查询索引」
+CREATE INDEX IF NOT EXISTS idx_rl_status  ON request_log(http_status);
+CREATE INDEX IF NOT EXISTS idx_rl_attempt ON request_log(request_id, created_at DESC)
+    WHERE attempt_index > 0;
+CREATE INDEX IF NOT EXISTS idx_tl_reqid   ON traffic_log(request_id);
 ```
 
 ```sql
@@ -276,6 +284,28 @@ def migrate(conn: sqlite3.Connection, target: int = SCHEMA_VERSION) -> None:
 - `Database.LOGS` 由 2 升到 3：`_LOGS_V3` 是整段 `CREATE TABLE IF NOT EXISTS traffic_log (...)` DDL（新表，不是给已有表加列，因此用 `CREATE TABLE` 而非 `ALTER TABLE`）
 
 两处都遵循同一条既有规则：**迁移脚本只增不改**，`_STATE_V1`/`_LOGS_V1`/`_LOGS_V2` 的定义原样保留，新步骤各自成一个新的字典条目。
+
+#### 3.2.1 三条查询索引（`logs.db` 3 → 4）
+
+`logs.db` 由 3 升到 4：`_LOGS_V4` 只加三条索引，不动任何表结构。三条索引各自对应一条**实测过**的慢查询——Web 看板的轮询间隔是 3 秒，20 万行日志下这三条查询原本都在几十到上百毫秒量级：
+
+> **测量条件**：20 万行 `request_log` + 20 万行 `traffic_log`，`ANALYZE` 之后取 5 次最优。基准脚本是评审期的本地制品（不入库），选型对比与全部变体数据见 `.learnings/knowledge/sqlite-index-selection-by-measurement.md`。
+
+| 索引 | 服务的查询 | 实测（20 万行） |
+|------|------------|-----------------|
+| `idx_rl_status ON request_log(http_status)` | 状态码下拉的候选集：`SELECT DISTINCT http_status FROM request_log WHERE http_status IS NOT NULL ORDER BY http_status` | 46ms → **6.7ms** |
+| `idx_tl_reqid ON traffic_log(request_id)` | 请求日志与流量统计的联表：`LEFT JOIN (SELECT request_id, bytes_up, bytes_down FROM traffic_log) ON traffic.request_id = request_log.request_id` | 138ms → **0.1ms** |
+| `idx_rl_attempt ON request_log(request_id, created_at DESC) WHERE attempt_index > 0` | 切换事件流：`WHERE attempt_index > 0 GROUP BY request_id ORDER BY MAX(created_at) DESC` | 50ms → **31ms** |
+
+几点取舍：
+
+- **`idx_rl_reqid` 是联表的关键**。没有它时 SQLite 会为联表临时建一个 `AUTOMATIC COVERING INDEX`（每条语句重建一遍）；有了它，联表退化成一次索引查找。这也是为什么 §4.3 的 `_TRAFFIC_JOIN` 子查询只取三列——索引覆盖后不必回表。
+- **`idx_rl_attempt` 是部分索引**。切换的判据是「存在 `attempt_index > 0` 的尝试行」：第 0 次尝试是首选出口，不参与判定，因此不必进索引。索引列顺序是 `(request_id, created_at DESC)`——分组键在前、组内按时间倒序，让 `MAX(created_at)` 直接落在索引的首行上。实测过两个变体：`(created_at DESC, attempt_index)` **根本没被查询计划选中**（48.6ms，与无索引同级），`(request_id)` 单列也无收益（49.4ms）。
+- **`idx_rl_status` 用普通索引而非部分索引**（`WHERE http_status IS NOT NULL`）。二者在当前查询下耗时相同（6.72ms），但部分索引只在查询的 `WHERE` 子句蕴含索引的 `WHERE` 时才会被选中——一旦查询条件改成 `http_status > 0`，部分索引会静默失效。普通索引多存 NULL 行，代价可忽略。
+- **三条都用 `CREATE INDEX IF NOT EXISTS`**。迁移经 `executescript` 执行，里面的语句是一条条生效的：中途失败时已经执行过的那几条已经落库，重跑同一 步时裸 `CREATE INDEX` 会以「index already exists」中断整个迁移，把一个可恢复的故障变成死局。`IF NOT EXISTS` 让重跑幂等。
+- **写侧代价**：每条请求日志多维护三条索引项，其中 `idx_rl_attempt` 只覆盖真正换过出口的尝试行。相对联表查询省下的 138ms，这个写入成本可以接受。
+
+守护测试 `tests/test_storage_writer.py::test_the_query_planner_actually_picks_the_new_indexes` 用 `EXPLAIN QUERY PLAN` 断言查询计划里**确实出现**了索引名——索引建了不等于会被用上，计划文本比耗时稳定得多，也不受机器性能影响。
 
 ---
 
@@ -573,6 +603,8 @@ def _open(path: Path) -> sqlite3.Connection:
 | `daemon=False` | 守护线程会在主线程退出时被直接杀死，可能丢失最后一批写入 |
 | `synchronous=NORMAL` | WAL 模式下足够安全（崩溃不损坏，最多丢最后几个事务），比 `FULL` 快一个数量级 |
 | 写入失败**不重试** | 数据可丢，代理不能停。重试会阻塞队列消费，导致内存增长 |
+
+**行级完整性错误的隔离例外**：如果批量语句因 `sqlite3.IntegrityError` 失败，写者先回滚整批，再按原始 `WriteOp` 顺序逐条执行。失败行单独记入 `write_errors` 并跳过，其余有效行仍可提交；保留原顺序是为了不改变同一行上的 delete/upsert 语义。`OperationalError`、磁盘错误等仍按上表整批回滚、不重试，避免把真正的存储故障变成逐行重试风暴。
 
 **`BEGIN IMMEDIATE` 不可省略。** 默认的 deferred 事务在读取时只拿共享锁，写入时才升级为排他锁；两个连接同时持有共享锁并请求升级时会死锁，`busy_timeout` 对这种情况无效（退避后重试还是同样的局面）。实测丢失 75% 更新。`IMMEDIATE` 在事务开始时就拿写锁，从根本上避免升级。
 
@@ -1081,3 +1113,11 @@ Web 界面只回答「现在怎么样」。长期后台运行还需要回答「�
 | `rules.enabled = false` | 不打开、也不创建 `rules.db` | §4.8.3 |
 | `rules.db` 损坏或非 SQLite 文件 | 报错并指明是哪个库 | §4.8.3 |
 | 写者线程与配置写入器同时活动 | 各写自己的库，无 `SQLITE_BUSY` | §2.1 |
+
+### 10.10 迁移原子性、合并顺序与审计保留补充（2026-10-22）
+
+每个 schema 迁移步骤显式执行 `BEGIN IMMEDIATE`，逐条执行 SQL，并在同一事务中写入新版本号。`sqlite3.Connection` 采用 autocommit 时，`with conn` 不会自动开启事务，`executescript()` 也会隐式提交；不能用它们保证迁移与版本号原子更新。
+
+批次合并只压缩相邻的同主键、同类型操作。不能把非相邻的 `HIT → UPSERT → HIT` 合并成 `HIT(2) → UPSERT`，否则首次 HIT 的 UPDATE 会早于 UPSERT，目标行不存在而静默少计。DELETE 仍会抹除此前同键操作，之后的写入保持在 DELETE 之后。
+
+`config_audit` 与 `request_log`、`traffic_log` 共用 `database.retention_days` 和 `database.max_log_rows`。定时清理在日志写者线程的事务中先按时间删除，再裁剪到最大行数，保证审计数据也有界。

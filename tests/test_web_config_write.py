@@ -522,6 +522,21 @@ class TestReassignPureFunction:
 
 
 class TestSettings:
+    async def test_candidate_validation_applies_cli_overrides(self, tmp_path: Path) -> None:
+        path = write_files(tmp_path)
+        instance = Application(config_path=path, overrides={"webui.enabled": False})
+        await instance.start()
+        try:
+            candidate = (
+                config_text(instance)
+                .replace("port = 0", "port = 6061", 1)
+                .replace("enabled = false", "enabled = true", 1)
+            )
+            # 若候选校验漏传 CLI override，代理端口与启用的 Web 默认端口相同会失败。
+            await asyncio.to_thread(ConfigWriter(instance)._validate_config, candidate)
+        finally:
+            await instance.stop()
+
     async def test_the_etag_carries_the_config_version(
         self, client: httpx.AsyncClient, app: Application
     ) -> None:
@@ -696,6 +711,10 @@ class TestAuditMasking:
         assert "abcdef" not in masked and "alice" not in masked
         # 非敏感项要留原值，否则 diff 就没用了。
         assert "priority = 10" in masked
+
+        inline = mask_secrets('auth = { username = "alice", password = "secret" }') or ""
+        assert "alice" not in inline and "secret" not in inline
+        assert 'username = "***"' in inline and 'password = "***"' in inline
 
     async def test_the_audit_api_returns_the_records(
         self, client: httpx.AsyncClient, app: Application

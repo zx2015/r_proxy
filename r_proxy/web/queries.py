@@ -62,6 +62,15 @@ def query_logs(pool: ReadOnlyPool, q: LogQuery) -> list[sqlite3.Row]:
     return pool.query(sql, (*args, q.page_size + 1, q.offset))
 
 
+def query_log_status_codes(pool: ReadOnlyPool) -> list[int]:
+    """请求日志中已出现的 HTTP 状态码，去重后升序返回。"""
+    rows = pool.query(
+        "SELECT DISTINCT http_status FROM request_log "
+        "WHERE http_status IS NOT NULL ORDER BY http_status"
+    )
+    return [int(row["http_status"]) for row in rows]
+
+
 def query_switch_request_ids(pool: ReadOnlyPool, q: LogQuery) -> list[str]:
     """发生过切换的请求 ID，按最近一次尝试倒序；同样多取一条判断下一页。
 

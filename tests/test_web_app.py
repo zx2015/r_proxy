@@ -137,6 +137,58 @@ class TestAuthentication:
             assert "wrong-but-secret" not in record.getMessage()
 
 
+class TestApiDocs:
+    """内建文档端点的认证口径。
+
+    FastAPI 自己注册 `/docs` 与 `/openapi.json`，它们**不经过任何 router 的
+    ``dependencies``**——``require_token`` 根本不会被调用。实测启用认证后这两
+    条路径仍回 200，等于把全部接口路径与数据结构白送给任何人。
+    """
+
+    async def test_swagger_ui_is_gone(self, guarded: httpx.AsyncClient) -> None:
+        """内建 Swagger UI 必须不存在。
+
+        它的 HTML 从 CDN 拉脚本与样式，会被本应用自己的 CSP
+        （``script-src 'self'``）拦掉——本来就是打不开的坏页，留着只会让人
+        以为「文档访问不了是浏览器的问题」。
+        """
+        assert (await guarded.get("/api/docs")).status_code == 404
+
+    async def test_unknown_api_path_uses_the_standard_error_envelope(
+        self, open_access: httpx.AsyncClient
+    ) -> None:
+        response = await open_access.get("/api/not-a-route")
+        assert response.status_code == 404
+        assert response.json() == {"error": {"code": "NOT_FOUND", "message": "Not Found"}}
+
+    async def test_openapi_schema_needs_a_token(self, guarded: httpx.AsyncClient) -> None:
+        response = await guarded.get("/api/openapi.json")
+        assert response.status_code == 401
+        assert response.json() == {"error": {"code": "UNAUTHORIZED", "message": "认证失败"}}
+
+    async def test_openapi_schema_is_served_with_a_token(self, guarded: httpx.AsyncClient) -> None:
+        response = await guarded.get(
+            "/api/openapi.json", headers={"Authorization": f"Bearer {TOKEN}"}
+        )
+        assert response.status_code == 200
+        schema = response.json()
+        assert schema["openapi"].startswith("3.")
+        assert "/api/status" in schema["paths"]
+
+    async def test_openapi_schema_is_open_when_no_token_is_configured(
+        self, open_access: httpx.AsyncClient
+    ) -> None:
+        """未配置 token 时（仅回环绑定允许）不认证——口径与其它 `/api/*` 一致。"""
+        assert (await open_access.get("/api/openapi.json")).status_code == 200
+
+    async def test_openapi_schema_is_never_cached(self, guarded: httpx.AsyncClient) -> None:
+        """schema 里含全部接口路径与数据结构，不能落进磁盘缓存。"""
+        response = await guarded.get(
+            "/api/openapi.json", headers={"Authorization": f"Bearer {TOKEN}"}
+        )
+        assert response.headers["Cache-Control"] == "no-store"
+
+
 class TestAuthFailureLogging:
     """一次页面加载并发五个请求，五条一模一样的 WARNING 没有任何增量信息。"""
 
@@ -192,6 +244,58 @@ class TestAuthThrottle:
             throttle.record_failure(f"10.0.0.{index}")
         assert throttle.blocked("10.0.0.19") is True
         assert throttle.blocked("10.0.0.0") is False
+
+
+class TestApiRouteAuthCoverage:
+    """每一条 ``/api/*`` 路由都必须挂上 token 校验（AGENTS.md §5.3）。"""
+
+    async def test_every_api_route_requires_the_token(self, tmp_path: Path) -> None:
+        app = await running(tmp_path, token=TOKEN)
+        try:
+            web = create_app(app)
+            for route in web.routes:
+                path = getattr(route, "path", "")
+                if not path.startswith("/api/") or path == "/api/healthz":
+                    continue
+                assert "require_token" in _dependency_names(route), path
+        finally:
+            await app.stop()
+
+    async def test_the_guard_would_catch_a_route_without_the_token(self, tmp_path: Path) -> None:
+        """守护测试本身也要被守护：造一条没挂 token 的路由，它必须被报出来。"""
+        app = await running(tmp_path, token=TOKEN)
+        try:
+            web = create_app(app)
+
+            @web.get("/api/leak", include_in_schema=False)
+            async def leak() -> dict[str, str]:
+                return {"secret": "value"}
+
+            offenders = [
+                getattr(route, "path", "")
+                for route in web.routes
+                if getattr(route, "path", "").startswith("/api/")
+                and getattr(route, "path", "") != "/api/healthz"
+                and "require_token" not in _dependency_names(route)
+            ]
+            assert offenders == ["/api/leak"]
+        finally:
+            await app.stop()
+
+
+def _dependency_names(route: object) -> set[str]:
+    """收集一条路由的全部依赖（含子依赖）的可调用名。"""
+    names: set[str] = set()
+    stack = [getattr(route, "dependant", None)]
+    while stack:
+        current = stack.pop()
+        if current is None:
+            continue
+        call = getattr(current, "call", None)
+        if call is not None:
+            names.add(getattr(call, "__name__", type(call).__name__))
+        stack.extend(getattr(current, "dependencies", ()))
+    return names
 
 
 class TestThrottleIntegration:

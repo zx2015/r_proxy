@@ -247,6 +247,16 @@ class TestListenAndWebUI:
 
 
 class TestRoutingChecks:
+    def test_sticky_fail_threshold_must_be_positive(self) -> None:
+        assert "E_STICKY_FAIL_THRESHOLD" in codes(
+            check(snap(routing=RoutingConfig(sticky_fail_threshold=0))), "error"
+        )
+
+    def test_switch_buffer_size_cannot_be_negative(self) -> None:
+        assert "E_SWITCH_BUFFER_NEGATIVE" in codes(
+            check(snap(routing=RoutingConfig(switch_buffer_bytes=-1))), "error"
+        )
+
     def test_2xx_in_switch_on_status_is_rejected(self) -> None:
         s = snap(routing=RoutingConfig(switch_on_status=frozenset({200, 502})))
         assert "E_SWITCH_STATUS_2XX" in codes(check(s), "error")

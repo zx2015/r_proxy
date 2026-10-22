@@ -57,13 +57,13 @@ async def pump(
     while True:
         async with asyncio.timeout(idle_timeout):
             chunk = await src.read(CHUNK_SIZE)
-        if not chunk:
-            return total
-        total += len(chunk)
-        if on_bytes is not None:
-            on_bytes(len(chunk))
-        dst.write(chunk)
-        await dst.drain()
+            if not chunk:
+                return total
+            total += len(chunk)
+            if on_bytes is not None:
+                on_bytes(len(chunk))
+            dst.write(chunk)
+            await dst.drain()
 
 
 async def relay_bidirectional(

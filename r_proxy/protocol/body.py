@@ -9,7 +9,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+import inspect
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -26,6 +27,10 @@ BodyKind = Literal["none", "length", "chunked"]
 class BodyPlan:
     kind: BodyKind
     length: int | None
+
+
+class BodyReadTimeout(TimeoutError):
+    """客户端请求体未在每次读取期限内继续发送。"""
 
 
 def plan_body(headers: Headers) -> BodyPlan:
@@ -63,30 +68,39 @@ async def stream_body(
     reader: asyncio.StreamReader,
     sink: Callable[[bytes], object],
     plan: BodyPlan,
+    *,
+    idle_timeout: float | None = None,
 ) -> int:
     """按 ``plan`` 从 ``reader`` 读出请求体，逐块交给 ``sink``。返回总字节数。"""
     if plan.kind == "none":
         return 0
     if plan.kind == "length":
         assert plan.length is not None
-        return await _stream_fixed(reader, sink, plan.length)
-    return await _stream_chunked(reader, sink)
+        return await _stream_fixed(reader, sink, plan.length, idle_timeout)
+    return await _stream_chunked(reader, sink, idle_timeout)
 
 
 async def _stream_fixed(
-    reader: asyncio.StreamReader, sink: Callable[[bytes], object], length: int
+    reader: asyncio.StreamReader,
+    sink: Callable[[bytes], object],
+    length: int,
+    idle_timeout: float | None,
 ) -> int:
     remaining = length
     while remaining > 0:
-        chunk = await reader.read(min(CHUNK_SIZE, remaining))
+        chunk = await _read_with_timeout(reader.read(min(CHUNK_SIZE, remaining)), idle_timeout)
         if not chunk:
             raise EOFError(f"请求体在读满前结束，还差 {remaining} 字节")
-        sink(chunk)
+        result = sink(chunk)
+        if inspect.isawaitable(result):
+            await result
         remaining -= len(chunk)
     return length
 
 
-async def _stream_chunked(reader: asyncio.StreamReader, sink: Callable[[bytes], object]) -> int:
+async def _stream_chunked(
+    reader: asyncio.StreamReader, sink: Callable[[bytes], object], idle_timeout: float | None
+) -> int:
     """原样转发 chunked 编码。
 
     不解码再重新编码：上游同样按 chunked 解析，逐字节转发既省一次编解码，
@@ -94,9 +108,11 @@ async def _stream_chunked(reader: asyncio.StreamReader, sink: Callable[[bytes], 
     """
     total = 0
     while True:
-        line = await _read_line(reader)
+        line = await _read_line(reader, idle_timeout)
         total += len(line)
-        sink(line)
+        result = sink(line)
+        if inspect.isawaitable(result):
+            await result
 
         size_field = line[:-2].split(b";", 1)[0].strip()
         try:
@@ -107,37 +123,61 @@ async def _stream_chunked(reader: asyncio.StreamReader, sink: Callable[[bytes], 
             raise BadRequest("chunk 长度为负")
 
         if size == 0:
-            total += await _forward_trailer(reader, sink)
+            total += await _forward_trailer(reader, sink, idle_timeout)
             return total
 
         remaining = size + 2  # 数据 + 结尾的 CRLF
         while remaining > 0:
-            data = await reader.read(min(CHUNK_SIZE, remaining))
+            data = await _read_with_timeout(reader.read(min(CHUNK_SIZE, remaining)), idle_timeout)
             if not data:
                 raise EOFError("chunked 请求体在读满前结束")
-            sink(data)
+            result = sink(data)
+            if inspect.isawaitable(result):
+                await result
             total += len(data)
             remaining -= len(data)
 
 
-async def _forward_trailer(reader: asyncio.StreamReader, sink: Callable[[bytes], object]) -> int:
+async def _forward_trailer(
+    reader: asyncio.StreamReader, sink: Callable[[bytes], object], idle_timeout: float | None
+) -> int:
     """转发终止 chunk 之后的 trailer 段，直到空行。"""
     total = 0
     while True:
-        line = await _read_line(reader)
-        sink(line)
+        line = await _read_line(reader, idle_timeout)
+        result = sink(line)
+        if inspect.isawaitable(result):
+            await result
         total += len(line)
         if line == b"\r\n":
             return total
 
 
-async def _read_line(reader: asyncio.StreamReader) -> bytes:
+async def _read_line(reader: asyncio.StreamReader, idle_timeout: float | None = None) -> bytes:
     try:
-        line = await reader.readuntil(b"\r\n")
+        line = await _read_with_timeout(reader.readuntil(b"\r\n"), idle_timeout)
+    except BodyReadTimeout:
+        raise
     except asyncio.IncompleteReadError as exc:
         raise EOFError("chunked 请求体在读满前结束") from exc
+    except asyncio.LimitOverrunError as exc:
+        # 必须显式列出：它只继承 `Exception`，不是 `ValueError` 的子类，漏掉它
+        # 异常会一路逃出连接处理函数，客户端收不到任何响应。chunk 长度行超过
+        # reader 的 limit（64KB）时触发——与下面的长度检查是同一类问题，
+        # 只是先被 reader 拦下了。
+        raise BadRequest("chunk 长度行过长") from exc
     except ValueError as exc:
         raise BadRequest("chunk 长度行过长") from exc
     if len(line) > MAX_CHUNK_LINE:
         raise BadRequest("chunk 长度行过长")
     return line
+
+
+async def _read_with_timeout(awaitable: Awaitable[bytes], idle_timeout: float | None) -> bytes:
+    if idle_timeout is None:
+        return await awaitable
+    try:
+        async with asyncio.timeout(idle_timeout):
+            return await awaitable
+    except TimeoutError as exc:
+        raise BodyReadTimeout from exc

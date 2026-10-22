@@ -54,6 +54,15 @@ _TRIM_TRAFFIC_BY_ROWS = """
      )
 """
 
+_TRIM_AUDIT_BY_ROWS = """
+    DELETE FROM config_audit
+     WHERE id <= (
+         SELECT id FROM config_audit
+          ORDER BY id DESC
+          LIMIT 1 OFFSET ?
+     )
+"""
+
 
 class Retention:
     """按固定间隔在写者线程内执行清理。"""
@@ -107,6 +116,8 @@ class Retention:
                 (_TRIM_BY_ROWS, (self._cfg.max_log_rows,)),
                 ("DELETE FROM traffic_log WHERE created_at < ?", (cutoff,)),
                 (_TRIM_TRAFFIC_BY_ROWS, (self._cfg.max_log_rows,)),
+                ("DELETE FROM config_audit WHERE created_at < ?", (cutoff,)),
+                (_TRIM_AUDIT_BY_ROWS, (self._cfg.max_log_rows,)),
             ),
         )
 

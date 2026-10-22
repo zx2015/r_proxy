@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from r_proxy.config.model import DatabaseConfig
+from r_proxy.storage import schema as schema_module
 from r_proxy.storage.queue import (
     OpKind,
     WriteOp,
@@ -115,7 +116,35 @@ def _query(path: Path, sql: str, params: tuple[object, ...] = ()) -> list[tuple[
         conn.close()
 
 
+def _index_names(conn: sqlite3.Connection) -> set[str]:
+    return {
+        str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")
+    }
+
+
 class TestSchema:
+    def test_failed_migration_rolls_back_ddl_and_version(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        conn = sqlite3.connect(tmp_path / "migration.db", isolation_level=None)
+        monkeypatch.setitem(
+            schema_module._MIGRATIONS,
+            Database.STATE,
+            {1: "CREATE TABLE marker (id INTEGER); CREATE TABLE marker (id INTEGER);"},
+        )
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                migrate(conn, Database.STATE, target=1)
+            assert read_version(conn) == 0
+            assert (
+                conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='marker'"
+                ).fetchone()
+                is None
+            )
+        finally:
+            conn.close()
+
     def test_fresh_database_is_at_the_current_version(self, tmp_path: Path) -> None:
         conn = open_write(tmp_path / "state.db", Database.STATE)
         try:
@@ -190,6 +219,127 @@ class TestSchema:
                 r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
             }
             assert "traffic_log" in tables
+        finally:
+            conn.close()
+
+    def test_logs_db_migrates_the_log_indexes_in_place(self, tmp_path: Path) -> None:
+        """停在 v3 的库升级后必须自动补上三条索引。
+
+        三条索引各自对应一条实测过的慢查询（DD_STORAGE.md §3.2）：
+        状态码下拉的候选集、请求日志与流量统计的联表、切换事件流。
+        """
+        path = tmp_path / "logs.db"
+        conn = open_write(path, Database.LOGS)
+        conn.close()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("UPDATE schema_meta SET value = '3' WHERE key = 'schema_version'")
+            conn.execute("DROP INDEX idx_rl_status")
+            conn.execute("DROP INDEX idx_rl_attempt")
+            conn.execute("DROP INDEX idx_tl_reqid")
+            conn.commit()
+        finally:
+            conn.close()
+
+        conn = open_write(path, Database.LOGS)
+        try:
+            assert read_version(conn) == SCHEMA_VERSIONS[Database.LOGS]
+            indexes = _index_names(conn)
+            assert {"idx_rl_status", "idx_rl_attempt", "idx_tl_reqid"} <= indexes
+        finally:
+            conn.close()
+
+    def test_the_attempt_index_only_covers_switched_attempts(self, tmp_path: Path) -> None:
+        """``idx_rl_attempt`` 是部分索引：第 0 次尝试是首选出口，不该占索引空间。"""
+        conn = open_write(tmp_path / "logs.db", Database.LOGS)
+        try:
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_rl_attempt'"
+            ).fetchone()
+            assert row is not None
+            assert "attempt_index > 0" in str(row[0])
+        finally:
+            conn.close()
+
+    def test_the_index_migration_is_rerunnable(self, tmp_path: Path) -> None:
+        """迁移脚本里的 ``CREATE INDEX`` 必须带 ``IF NOT EXISTS``。
+
+        迁移经 ``executescript`` 执行，里面的语句是一条条生效的：中途失败时
+        已经执行过的那几条已经落库。裸 ``CREATE INDEX`` 会在重跑时报
+        「index already exists」并中断整个迁移，把一个可恢复的故障变成死局。
+        """
+        conn = open_write(tmp_path / "logs.db", Database.LOGS)
+        try:
+            # 手动把版本号拨回 v3 再迁移一次：等价于「上一步中途失败后重跑」。
+            conn.execute("UPDATE schema_meta SET value = '3' WHERE key = 'schema_version'")
+            assert migrate(conn, Database.LOGS) == SCHEMA_VERSIONS[Database.LOGS]
+            assert read_version(conn) == SCHEMA_VERSIONS[Database.LOGS]
+        finally:
+            conn.close()
+
+    @pytest.mark.parametrize(
+        ("sql", "expected_index"),
+        [
+            (
+                "SELECT DISTINCT http_status FROM request_log "
+                "WHERE http_status IS NOT NULL ORDER BY http_status",
+                "idx_rl_status",
+            ),
+            (
+                "SELECT request_log.request_id, traffic.bytes_up, traffic.bytes_down "
+                "FROM request_log LEFT JOIN "
+                "(SELECT request_id, bytes_up, bytes_down FROM traffic_log) traffic "
+                "ON traffic.request_id = request_log.request_id "
+                "ORDER BY created_at DESC, id DESC LIMIT 51 OFFSET 0",
+                "idx_tl_reqid",
+            ),
+            (
+                "SELECT request_id, MAX(created_at) AS last_at, MAX(id) AS last_id "
+                "FROM request_log WHERE attempt_index > 0 GROUP BY request_id "
+                "ORDER BY last_at DESC, last_id DESC LIMIT 51 OFFSET 0",
+                "idx_rl_attempt",
+            ),
+        ],
+    )
+    def test_the_query_planner_actually_picks_the_new_indexes(
+        self, tmp_path: Path, sql: str, expected_index: str
+    ) -> None:
+        """索引建了不等于会被用上——必须让查询计划真的选中它。
+
+        计划文本来自 ``EXPLAIN QUERY PLAN``，与 ``r_proxy/web/queries.py`` 里的
+        实际 SQL 逐字一致（参数以 ``?`` 占位）。这里断言的是「查询计划里出现
+        了这条索引的名字」，比断言耗时稳定得多，也不受机器性能影响。
+        """
+        conn = open_write(tmp_path / "logs.db", Database.LOGS)
+        try:
+            for index in range(200):
+                conn.execute(
+                    "INSERT INTO request_log(request_id, host, url, method, upstream_name,"
+                    " upstream_priority, attempt_index, decision_source, http_status,"
+                    " elapsed_ms, created_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        f"req{index // 3}",
+                        "host.test",
+                        "http://host.test/",
+                        "GET",
+                        "up",
+                        100,
+                        index % 3,
+                        "priority",
+                        200 + index % 7,
+                        5,
+                        1750000000 + index,
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO traffic_log(request_id, host, upstream_name,"
+                    " bytes_up, bytes_down, created_at) VALUES (?,?,?,?,?,?)",
+                    (f"req{index // 3}", "host.test", "up", 1, 2, 1750000000 + index),
+                )
+            conn.execute("ANALYZE")
+            plan = " ".join(row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + sql))
+            assert expected_index in plan, plan
         finally:
             conn.close()
 
@@ -284,6 +434,19 @@ class TestMerge:
         merged = merge(ops)
         assert len(merged) == 1
         assert merged[0].payload[0] == 5
+
+    def test_non_adjacent_hit_is_not_reordered_before_upsert(self) -> None:
+        ops = [
+            sticky_hit(host="a.com", now_unix=1),
+            sticky_upsert(host="a.com", upstream="a", url=None, now_unix=2, status=200),
+            sticky_hit(host="a.com", now_unix=3),
+        ]
+        merged = merge(ops)
+        assert [op.kind for op in merged] == [
+            OpKind.STICKY_HIT,
+            OpKind.STICKY_UPSERT,
+            OpKind.STICKY_HIT,
+        ]
 
     def test_increments_for_different_hosts_stay_separate(self) -> None:
         ops = [sticky_hit(host="a.com", now_unix=1), sticky_hit(host="b.com", now_unix=1)]
@@ -647,6 +810,19 @@ class TestWriterThread:
             w.flush()
             assert w.state_rows("SELECT host FROM host_upstream") == [("b.com",)]
 
+    def test_integrity_error_isolated_to_its_row(self, tmp_path: Path) -> None:
+        """一条 NOT NULL 违例不应丢弃同批其余合法请求日志。"""
+        good = request_log(request_id="good")
+        invalid_payload = list(request_log(request_id="bad").payload)
+        invalid_payload[2] = None  # request_log.host 为 NOT NULL
+        bad = WriteOp(OpKind.REQUEST_LOG, tuple(invalid_payload))
+        with RunningWriter(tmp_path) as w:
+            w.queue.put(good)
+            w.queue.put(bad)
+            w.flush()
+            assert w.log_rows("SELECT request_id FROM request_log ORDER BY id") == [("good",)]
+            assert w.thread.metrics.write_errors >= 1
+
     def test_a_failed_batch_does_not_take_the_other_database_down(self, tmp_path: Path) -> None:
         with RunningWriter(tmp_path) as w:
             w.queue.put(WriteOp(OpKind.STICKY_UPSERT, ("a.com",)))
@@ -712,6 +888,22 @@ class TestRetention:
             assert conns[Database.LOGS].execute("SELECT COUNT(*) FROM request_log").fetchone() == (
                 2,
             )
+        finally:
+            for c in conns.values():
+                c.close()
+
+    def test_audit_rows_share_log_retention(self, tmp_path: Path) -> None:
+        conns = self.open_both(tmp_path)
+        now = int(time.time())
+        try:
+            conns[Database.LOGS].executemany(
+                "INSERT INTO config_audit"
+                " (actor, action, target, created_at) VALUES ('x','y','z',?)",
+                [(now - 2 * 86400,), (now,)],
+            )
+            Retention(db_config(tmp_path, retention_days=1)).run(conns)
+            count = conns[Database.LOGS].execute("SELECT COUNT(*) FROM config_audit").fetchone()
+            assert count == (1,)
         finally:
             for c in conns.values():
                 c.close()

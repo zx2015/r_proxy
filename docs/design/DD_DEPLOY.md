@@ -2,6 +2,7 @@
 
 | 版本号 | 日期 | 变更说明 | 作者 |
 | :--- | :--- | :--- | :--- |
+| v1.9.0 | 2026-10-22 | 新增 §12：记录 mini-server 上由当前工作区重建并更新 `r-proxy` 容器的过程、镜像 ID、健康检查和状态码接口验证；传统 builder 构建时 PyPI 下载曾超时重试，最终成功 | Agent |
 | v1.0.0 | 2026-08-16 | 初始版本：Dockerfile、docker-compose、host 网络选型、卷布局与迁移流程、验证记录 | Agent |
 | v1.1.0 | 2026-08-16 | §9.1 计数翻倍缺陷已修复：`HealthPersister` 增加 `initial` 基线播种，补充修复理由、测试与端到端验证结果 | Agent |
 | v1.3.0 | 2026-08-17 | 新增 §10：第二个实例部署于 `host-a.example.internal`（Fedora 44 + Podman 5.8.2 + Quadlet，无 Docker）。记录既有代理链拓扑、与 Compose 部署的六项差异（`--format docker` 为硬要求，否则 HEALTHCHECK 被静默丢弃）、无防火墙与 SIEM 监控两项风险、验证记录 | Agent |
@@ -655,7 +656,39 @@ docker compose up -d                      # 传统 builder 不接 up --build 里
 
 ---
 
-## 12. 相关文档
+## 12. mini-server：更新 r-proxy 容器（2026-10-22）
+
+#### 更新方式
+
+`/media/data/git/r_proxy` 的 Compose 项目运行 `r-proxy` 容器（网络模式为 host）。本次从当前工作区构建镜像并只重建该服务，没有停止或重建同机其他容器。Compose 继续挂载宿主 `/media/data/r-proxy-docker/config` 与 `/media/data/r-proxy-docker/data`，配置和数据库未迁移或删除。
+
+项目此前在 BuildKit 上遇到 DNS 失败，因此本次使用传统 builder：
+
+```bash
+DOCKER_BUILDKIT=0 docker compose build r-proxy
+docker compose up -d r-proxy
+```
+
+构建期间 PyPI 首次连接超时并自动重试，依赖下载随后完成；镜像成功构建。下次构建若遇到短时 PyPI 超时，可先等 pip 重试结束，再决定是否排查网络。
+
+#### 验证记录
+
+| 项 | 方法 | 结果 |
+|---|---|---|
+| 更新前状态 | `docker ps`、`docker inspect` | `r-proxy:0.2.0`，healthy；Compose 工作目录为本仓库 |
+| 镜像构建 | `DOCKER_BUILDKIT=0 docker compose build r-proxy` | 成功；image ID `sha256:0f788661e9abba4101c2d65e1756643cfc7e1ca454c4b1a641e52fcf34fe4685` |
+| 服务更新 | `docker compose up -d r-proxy` | 仅 `r-proxy` 重建并启动 |
+| 容器健康 | `docker inspect` | `running` / `healthy` |
+| 新状态码接口 | 未带 token 请求 `/api/logs/status-codes` | `401`，认证按预期生效 |
+| 新状态码接口 | 带本机 token 的只读请求 | `200`，返回去重状态码数组；token 未输出 |
+
+该镜像由 HEAD `27dcf68` 加当时工作区修改构建，镜像 tag 仍为 `r-proxy:0.2.0`。
+
+#### 部署后补充核验
+
+首次重建后，容器内核对发现工作区的 `decision.model` / `decision.switching` 两处后续改动尚未进入该镜像。为确保确实更新到工作区最新代码，保留首次镜像 tag `r-proxy:0.2.0-before-update-20261022`，再从首次镜像增量构建并覆盖两个 Python 模块，最终镜像 ID 为 `sha256:c070549cd82ac11b4ea499e188eef0ad329c77965a837eac26d10d3767a3d65d`。最终容器 `running` / `healthy`；容器内 `SwitchContext.body_streamed` 检查为 True；认证访问 `/api/logs/status-codes` 返回 200 和当前状态码列表。
+
+## 13. 相关文档
 
 - [ARCH_OVERVIEW.md](./ARCH_OVERVIEW.md) — 启动与关闭时序
 - [DD_CONFIG.md](./DD_CONFIG.md) — 配置路径解析与 `R_PROXY_CONFIG`

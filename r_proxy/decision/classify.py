@@ -38,7 +38,7 @@ _EGRESS_RELATED = frozenset({403, 429, 451})
 # Cloudflare 源站错误：CDN 连上了，坏的是它到源站那一段。
 _CDN_ORIGIN = frozenset(range(520, 527))
 
-_PROXY_ERROR_HEADERS = frozenset({"x-squid-error", "x-cache", "x-tinyproxy", "proxy-connection"})
+_PROXY_ERROR_HEADERS = frozenset({"x-squid-error", "x-tinyproxy", "proxy-connection"})
 _PROXY_SERVER_PREFIXES = ("squid", "tinyproxy", "privoxy", "polipo", "mitmproxy")
 _PROXY_VIA_TOKENS = ("squid", "tinyproxy", "proxy")
 _TARGET_SERVER_PREFIXES = (

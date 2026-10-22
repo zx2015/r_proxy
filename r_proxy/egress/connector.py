@@ -222,6 +222,12 @@ class UpstreamConnector:
             raise ConnectorError(FailureKind.UPSTREAM_ERROR, error_name(exc)) from exc
         except asyncio.IncompleteReadError as exc:
             raise ConnectorError(FailureKind.UPSTREAM_ERROR, "IncompleteRead") from exc
+        except asyncio.LimitOverrunError as exc:
+            # 必须显式列出：它只继承 `Exception`，不是 `ValueError` 的子类，
+            # 漏掉它异常会一路逃出握手函数。上级代理的 CONNECT 应答头超过
+            # reader 的 limit（64KB）时触发——与下面 `ValueError` 分支的
+            # `HandshakeTooLarge` 是同一件事：代理回的不是正常 HTTP 应答。
+            raise ConnectorError(FailureKind.UPSTREAM_ERROR, "HandshakeTooLarge") from exc
         except ValueError as exc:
             raise ConnectorError(FailureKind.UPSTREAM_ERROR, "HandshakeTooLarge") from exc
 

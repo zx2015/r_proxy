@@ -161,6 +161,43 @@ async def fake_proxy() -> AsyncIterator[FakeServer]:
 
 
 class TestHttpForwarding:
+    async def test_expect_continue_is_acknowledged_and_not_forwarded_upstream(self) -> None:
+        received: list[bytes] = []
+
+        async def handler(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+            request_head = await r.readuntil(b"\r\n\r\n")
+            received.append(request_head.lower())
+            body = await r.readexactly(4)
+            received.append(body)
+            w.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            await w.drain()
+            w.close()
+
+        origin = await start_server(handler)
+        proxy = await run_proxy(snapshot())
+        try:
+            reader, writer = await proxy.open()
+            writer.write(
+                f"POST http://{origin.address}/ HTTP/1.1\r\n"
+                f"Host: {origin.address}\r\nContent-Length: 4\r\n"
+                "Expect: 100-continue\r\n\r\n".encode()
+            )
+            await writer.drain()
+            async with asyncio.timeout(2):
+                interim = await reader.readuntil(b"\r\n\r\n")
+            assert interim.startswith(b"HTTP/1.1 100 Continue")
+            writer.write(b"body")
+            await writer.drain()
+            async with asyncio.timeout(2):
+                response = await reader.read()
+            assert response.startswith(b"HTTP/1.1 200 OK")
+            assert received[1] == b"body"
+            assert b"expect:" not in received[0]
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await proxy.server.stop()
+
     async def test_direct_uses_origin_form(self, http_origin: FakeServer) -> None:
         proxy = await run_proxy(snapshot())
         try:

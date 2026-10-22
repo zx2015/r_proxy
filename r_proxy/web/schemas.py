@@ -136,6 +136,12 @@ class LogPage(Model):
     has_more: bool
 
 
+class LogStatusCodesResponse(Model):
+    """请求日志中当前已存在的状态码，供日志筛选控件使用。"""
+
+    status_codes: list[int]
+
+
 class HostTrafficQuery(Model):
     """主机流量榜的筛选条件。``since``/``until`` 缺省时取「今日」。
 

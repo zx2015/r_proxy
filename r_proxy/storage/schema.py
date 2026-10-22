@@ -28,7 +28,7 @@ class Database(StrEnum):
 # 它们自己的迁移步骤表而 KeyError。
 SCHEMA_VERSIONS: dict[Database, int] = {
     Database.STATE: 2,
-    Database.LOGS: 3,
+    Database.LOGS: 4,
     Database.RULES: 1,
 }
 
@@ -161,6 +161,40 @@ CREATE INDEX IF NOT EXISTS idx_tl_created ON traffic_log(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tl_host    ON traffic_log(host, created_at DESC);
 """
 
+# 三条索引，各自对应一条实测过的慢查询（DD_STORAGE.md §3.2、§4.9）。
+#
+# 全部用 ``CREATE INDEX IF NOT EXISTS``：迁移脚本经 ``executescript`` 执行，
+# 里面的语句是一条条生效的——中途失败时已经执行过的那几条已经落库，重跑同一
+# 步时裸 ``CREATE INDEX`` 会以「index already exists」中断整个迁移。加了
+# ``IF NOT EXISTS`` 后重跑是安全的（幂等）。
+#
+# 实测条件：20 万行 request_log + 20 万行 traffic_log，`ANALYZE` 之后取 5 次最优。
+# 基准脚本是评审期的本地制品（不入库），完整数据与选型对比见
+# DD_STORAGE.md §3.2.1 与 .learnings/knowledge/sqlite-index-selection-by-measurement.md：
+#   1. ``idx_rl_status``：状态码下拉的候选集
+#      ``SELECT DISTINCT http_status ... WHERE http_status IS NOT NULL ORDER BY http_status``
+#      46ms → 6.7ms。该索引是覆盖索引，扫描时不必回表。
+#   2. ``idx_tl_reqid``：请求日志与流量统计的联表
+#      ``... LEFT JOIN (SELECT request_id, bytes_up, bytes_down FROM traffic_log)
+#          ON traffic.request_id = request_log.request_id``
+#      138ms → 0.1ms。没有它时 SQLite 只能为联表临时建一个 AUTOMATIC COVERING
+#      INDEX，每次联表都重建一遍。
+#   3. ``idx_rl_attempt``：切换事件流
+#      ``... WHERE attempt_index > 0 GROUP BY request_id ORDER BY MAX(created_at) DESC``
+#      50ms → 31ms。部分索引（``WHERE attempt_index > 0``）只收录真正换过出口
+#      的尝试行——第 0 次尝试是首选出口，不参与判定。索引列顺序是
+#      ``(request_id, created_at DESC)``：分组键在前，组内按时间倒序，让
+#      ``MAX(created_at)`` 直接落在索引的首行上。实测过
+#      ``(created_at DESC, attempt_index)``（TODO 里最初的建议）与
+#      ``(request_id)`` 两个变体：前者根本没被查询计划选中（48.6ms，与无索引
+#      同级），后者也无收益（49.4ms）。
+_LOGS_V4 = """
+CREATE INDEX IF NOT EXISTS idx_rl_status  ON request_log(http_status);
+CREATE INDEX IF NOT EXISTS idx_rl_attempt ON request_log(request_id, created_at DESC)
+    WHERE attempt_index > 0;
+CREATE INDEX IF NOT EXISTS idx_tl_reqid   ON traffic_log(request_id);
+"""
+
 # 出口累计流量（DD_STORAGE.md §3.2、DD_ROUTING.md §4.8）：两列历史行补 0，
 # 与「还没测过」同义。
 _STATE_V2 = """
@@ -194,7 +228,7 @@ INSERT INTO rule_meta (key, value) VALUES ('revision', '0')
 
 _MIGRATIONS: dict[Database, dict[int, str]] = {
     Database.STATE: {1: _STATE_V1, 2: _STATE_V2},
-    Database.LOGS: {1: _LOGS_V1, 2: _LOGS_V2, 3: _LOGS_V3},
+    Database.LOGS: {1: _LOGS_V1, 2: _LOGS_V2, 3: _LOGS_V3, 4: _LOGS_V4},
     Database.RULES: {1: _RULES_V1},
 }
 
@@ -247,10 +281,31 @@ def migrate(conn: sqlite3.Connection, database: Database, *, target: int | None 
         )
     steps = _MIGRATIONS[database]
     for step in range(current + 1, target + 1):
-        with conn:  # 自动事务：迁移与版本号必须一起生效
-            conn.executescript(steps[step])
+        # isolation_level=None 是 autocommit；`with conn` 不会开启事务，且
+        # executescript 会先隐式提交。逐条执行迁移并显式包住版本号，保证崩溃
+        # 后要么整步提交，要么 DDL 与版本号一并回滚。
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            _execute_script(conn, steps[step])
             _write_version(conn, step)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
     return target
+
+
+def _execute_script(conn: sqlite3.Connection, script: str) -> None:
+    """在当前事务中逐条执行 SQL，避免 ``executescript`` 的隐式提交。"""
+    statement = ""
+    for char in script:
+        statement += char
+        if char == ";" and sqlite3.complete_statement(statement):
+            if statement.strip():
+                conn.execute(statement)
+            statement = ""
+    if statement.strip():
+        raise StorageError("迁移脚本包含未完成的 SQL 语句")
 
 
 def read_version(conn: sqlite3.Connection) -> int:

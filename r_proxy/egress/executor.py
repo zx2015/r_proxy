@@ -400,9 +400,9 @@ class AttemptExecutor:
         """
         if not decision.switchable:
             return True
-        if not self._state.health.is_available(name, now=self._clock()):
+        if not decision.relaxed and not self._state.health.is_available(name, now=self._clock()):
             return False
-        return self._state.health.acquire_probe(name)
+        return self._state.health.acquire_probe(name, allow_open=decision.relaxed)
 
     def _record_success(
         self,

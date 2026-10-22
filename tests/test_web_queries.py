@@ -14,6 +14,7 @@ import sqlite3
 import time
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -168,6 +169,19 @@ def pool(tmp_path: Path) -> ReadOnlyPool:
 
 
 class TestLogFilters:
+    def test_status_codes_are_distinct_sorted_and_exclude_null(self, tmp_path: Path) -> None:
+        seed_logs(
+            tmp_path / "logs.db",
+            [
+                log_row(request_id="a", http_status=502),
+                log_row(request_id="b", http_status=200),
+                log_row(request_id="c", http_status=502),
+                log_row(request_id="d", http_status=None),
+            ],
+        )
+        pool = ReadOnlyPool(tmp_path / "logs.db")
+        assert queries.query_log_status_codes(pool) == [200, 502]
+
     def test_no_filter_returns_everything_newest_first(self, pool: ReadOnlyPool) -> None:
         rows = queries.query_logs(pool, query())
         assert [row["created_at"] for row in rows] == [
@@ -382,6 +396,20 @@ async def logs_client(tmp_path: Path) -> AsyncIterator[httpx.AsyncClient]:
 
 
 class TestLogsEndpoint:
+    async def test_status_codes_endpoint_returns_query_result(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from r_proxy.web.routers import status
+
+        async def fake_to_thread(function, *args):
+            return function(*args)
+
+        monkeypatch.setattr(status.asyncio, "to_thread", fake_to_thread)
+        app = SimpleNamespace(storage=SimpleNamespace(logs_reader=object()))
+        monkeypatch.setattr(status.queries, "query_log_status_codes", lambda _reader: [200, 502])
+        response = await status.list_log_status_codes(app)
+        assert response.model_dump() == {"status_codes": [200, 502]}
+
     async def test_logs_need_a_token_when_one_is_configured(self, tmp_path: Path) -> None:
         """M4-05 的原始端点：``/api/logs`` 会返回访问过的全部 URL。"""
         logs = tmp_path / "logs.db"

@@ -38,7 +38,9 @@ import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+import tomlkit
 
 from r_proxy.config.loader import ConfigError, load_text
 from r_proxy.config.model import ConfigSnapshot
@@ -73,6 +75,10 @@ MAX_DIFF_LINES = 200
 _SECRET_LINE = re.compile(
     r"^(\s*[-+]?\s*(?:password|auth_token|token|secret|username)\s*=\s*).+$",
     re.IGNORECASE | re.MULTILINE,
+)
+_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)(\b(?:password|auth_token|token|secret|username)\s*=\s*)"
+    r'(?:"(?:\\.|[^"\\])*"|\'[^\']*\'|[^,}\]\s]+)'
 )
 
 
@@ -121,7 +127,31 @@ def mask_secrets(text: str | None) -> str | None:
     审计记录本身会被 `GET /api/audit` 返回，diff 里留明文等于把凭据存进了一张
     可查询的表。``username`` 一并脱敏：它单独也是有用的情报。
     """
-    return _SECRET_LINE.sub(r"\1***", text) if text else text
+    if not text:
+        return text
+    # 配置完整文本优先走 TOML 结构遍历，覆盖 inline table 与数组内嵌表。
+    try:
+        document = tomlkit.parse(text)
+    except (tomlkit.exceptions.ParseError, ValueError):
+        # 兼容历史调用方传入的 unified diff；完整 TOML 的审计路径在写入 diff
+        # 之前已分别结构化脱敏。
+        return _SECRET_ASSIGNMENT.sub(r'\1"***"', _SECRET_LINE.sub(r'\1"***"', text))
+    _mask_toml_item(document)
+    return tomlkit.dumps(document)
+
+
+def _mask_toml_item(item: Any) -> None:
+    secret_names = {"password", "auth_token", "token", "secret", "username"}
+    if hasattr(item, "items"):
+        for key, value in item.items():
+            if str(key).lower() in secret_names:
+                item[key] = "***"
+            else:
+                _mask_toml_item(value)
+        return
+    if isinstance(item, (list, tuple)) or item.__class__.__name__ == "Array":
+        for value in item:
+            _mask_toml_item(value)
 
 
 def version_of(data: bytes) -> str:
@@ -220,6 +250,11 @@ class ConfigWriter:
                 action=action,
                 target=target,
             )
+
+    async def reload(self) -> None:
+        """与配置和规则写入串行执行重载。"""
+        async with self._lock:
+            await self._app.reload()
 
     async def read_rules(self) -> RulesSnapshot:
         """库里的当前规则与 ``revision``。客户端接下来会在这份列表上编辑。"""
@@ -349,7 +384,17 @@ class ConfigWriter:
         after = version_of(text.encode("utf-8"))
         # 写回成功后立即热重载。重载走标准的 tomllib 读路径，因此「Web 写入的
         # 配置」与「用户手写的配置」经过完全相同的校验与构建流程。
-        await self._app.reload()
+        try:
+            await self._app.reload()
+        except Exception:
+            # 写前已完成语义校验；若运行时重载仍失败，恢复旧文件，避免磁盘与
+            # 当前快照分裂，并尝试重新装载恢复后的配置。
+            await asyncio.to_thread(self._replace, path, before)
+            try:
+                await self._app.reload()
+            except Exception:
+                logger.exception("配置重载失败后恢复旧配置也未能重载")
+            raise
         self._app.storage.queue.put(
             config_audit(
                 actor=actor,
@@ -395,7 +440,7 @@ class ConfigWriter:
         出口应该在这里就被拦住。
         """
         try:
-            candidate = load_text(text, self.path)
+            candidate = load_text(text, self.path, self._app.cli_overrides)
         except ConfigError as exc:
             raise ConfigInvalid(
                 [ValidationIssue("error", "E_PARSE", _strip_path(str(exc), self.path))]
@@ -531,13 +576,24 @@ class ConfigWriter:
         target = directory / f"{stem}-{stamp}{suffix}"
         # 同秒内的两次写入会撞名。加序号而不是覆盖：备份的意义就是每一版都留着。
         serial = 1
-        while target.exists():
-            target = directory / f"{stem}-{stamp}-{serial}{suffix}"
-            serial += 1
-        target.write_bytes(data)
-        # config 备份是明文全文快照，同样含 auth_token；与 _replace 保持一致
-        # 收到 600，不依赖 umask。
-        os.chmod(target, 0o600)
+        while True:
+            try:
+                # O_EXCL 同时处理同秒并发写入；创建时即用 0600，避免明文配置
+                # 在后续 chmod 前短暂按 umask 变成其他用户可读。
+                fd = os.open(
+                    target,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+            except FileExistsError:
+                target = directory / f"{stem}-{stamp}-{serial}{suffix}"
+                serial += 1
+                continue
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            break
         self._rotate(stem, keep=self._app.snapshot.database.backup_keep)
 
     def _rotate(self, stem: str, *, keep: int) -> None:

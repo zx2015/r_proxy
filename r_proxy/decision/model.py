@@ -28,6 +28,8 @@ class Decision:
     rule_position: int | None = None
     # 规则强制路由时为 False：候选链长度恒为 1，失败原样返回不顺延。
     switchable: bool = True
+    # 候选链是在忽略熔断与负面记忆后构造的；执行层仍需保留 half-open 探针配额。
+    relaxed: bool = False
     # 候选链为空时说明为什么，供日志与错误响应区分「没有出口」和「都不可用」。
     empty_reason: str | None = None
 
@@ -75,6 +77,15 @@ class SwitchContext:
     # False，但传输层失败（字节还没发出）仍可切换（DD_SWITCHING §7.6）——
     # 这条与 `replayable` 分开建模，才不会把那条既有规则连带破坏。
     client_body_timeout: bool = False
+    # 请求体字节已开始写往上游（首个 body chunk 已进入 sink 并写入
+    # ``conn.writer``）。即使尚未超过 ``switch_buffer_bytes`` 缓冲上限，
+    # 字节一旦发出就无法「收回」去重放给下一个出口——若此时发生传输层
+    # 失败（RST/超时），切换会把同一个请求体发给另一个出口，构成重复请求。
+    # 这与 ``replayable`` 不同：``switch_buffer_bytes: 0`` 时 ``replayable`` 从
+    # 一开始就是 ``False``，但「字节还没发出」的连接阶段失败（
+    # ``ECONNREFUSED``、TCP RST 在建连时）仍必须能切换；``body_streamed``
+    # 只有在真正开始转发 body 时才置 True。
+    body_streamed: bool = False
 
 
 class SwitchReason(Enum):

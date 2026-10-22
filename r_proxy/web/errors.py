@@ -15,6 +15,7 @@ import uuid
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from r_proxy.storage.rules_store import RulesConflict
 from r_proxy.web.config_writer import ConfigConflict, ConfigInvalid, RuleExists, issue_details
@@ -113,7 +114,7 @@ def invalid_rules(exc: ConfigInvalid) -> HTTPException:
 
 
 def install(app: FastAPI) -> None:
-    app.add_exception_handler(HTTPException, _http_error)
+    app.add_exception_handler(StarletteHTTPException, _http_error)
     app.add_exception_handler(RequestValidationError, _validation_error)
     app.add_exception_handler(sqlite3.OperationalError, _storage_busy)
     app.add_exception_handler(Exception, _unhandled_error)
@@ -122,7 +123,7 @@ def install(app: FastAPI) -> None:
 async def _http_error(request: Request, exc: Exception) -> JSONResponse:
     # 处理器按异常类型注册，签名却是宽的 Exception（Starlette 的约定）。
     # 类型不符时当成内部错误，而不是让 AttributeError 冒泡成另一个 500。
-    if not isinstance(exc, HTTPException):
+    if not isinstance(exc, StarletteHTTPException):
         return await _unhandled_error(request, exc)
     detail = exc.detail
     if isinstance(detail, dict):

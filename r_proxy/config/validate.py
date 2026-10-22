@@ -314,6 +314,21 @@ def _is_loopback(host: str) -> bool:
 def _check_routing(s: ConfigSnapshot, issues: list[ValidationIssue]) -> None:
     r = s.routing
 
+    if r.sticky_fail_threshold <= 0:
+        issues.append(
+            ValidationIssue(
+                "error", "E_STICKY_FAIL_THRESHOLD", "sticky_fail_threshold 必须大于 0",
+                "routing.sticky_fail_threshold",
+            )
+        )
+    if r.switch_buffer_bytes < 0:
+        issues.append(
+            ValidationIssue(
+                "error", "E_SWITCH_BUFFER_NEGATIVE", "switch_buffer_bytes 不能为负数",
+                "routing.switch_buffer_bytes",
+            )
+        )
+
     blocking = sorted(c for c in r.switch_on_status if 200 <= c < 400)
     if blocking:
         issues.append(

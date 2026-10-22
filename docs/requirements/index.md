@@ -4,7 +4,7 @@
 |------|------|------|
 | [PRD_OVERVIEW.md](./PRD_OVERVIEW.md) | v1.7.0 | 产品需求总览：实施路线图、优先级切换策略、并发与一致性、数据模型、性能基线与资源限制 |
 | [RULES_CONFIG.md](./RULES_CONFIG.md) | v2.0.0 | 路由规则说明：六种条件类型、首匹配胜出、只匹配主机名、`rules.db` 存储与救场开关 |
-| [WEBUI_SPEC.md](./WEBUI_SPEC.md) | v2.1.0 | Web 管理界面需求：五大功能模块、REST API、配置持久化与操作审计、安全要求、粘性映射固化为规则 |
+| [WEBUI_SPEC.md](./WEBUI_SPEC.md) | v2.2.4 | Web 管理界面需求：五大功能模块、REST API、动态请求日志状态码筛选、配置持久化与操作审计、安全要求（含内建文档端点的认证口径） |
 | [SOCKS5_UPSTREAM.md](./SOCKS5_UPSTREAM.md) | v1.0.0 | 上级 SOCKS5 代理需求：零运行时依赖协议规范、RFC 1928/1929 握手与子认证、故障归类与熔断契约、WebUI 适配 |
 
 主配置文件的完整结构以 PRD_OVERVIEW.md §4.2.1 为准，其余文档只引用不复制。

@@ -7,7 +7,7 @@
  */
 
 import { api } from "../api.js";
-import { badge, button, clear, el, emptyRow, input, table, td, text } from "../dom.js";
+import { badge, button, clear, el, emptyRow, input, select, table, td, text } from "../dom.js";
 import { ago, bytes, circuit, duration, millis, percent, timestamp } from "../format.js";
 import { clearNotice, confirmAction, describeError, notify, section, toolbar } from "../ui.js";
 
@@ -19,10 +19,13 @@ const TRAFFIC_COLUMNS = 4;
 // 主机流量榜是一次聚合查询，成本明显高于其余板块，独立走 30 秒一档，
 // 不跟随全局的 3 秒轮询（WEBUI_SPEC §2.1、DD_WEB §10.6）。
 const TRAFFIC_REFRESH_MS = 30000;
+// 状态码选项来自日志去重查询，避免跟随 3 秒日志轮询扫描日志表。
+const STATUS_CODES_REFRESH_MS = 30000;
 
 const nodes = {};
 const filters = { host: "", upstream: "", clientAddr: "", status: "", page: 1 };
 const traffic = { lastFetchedAt: 0 };
+const logStatusCodes = { lastFetchedAt: 0, pending: false };
 
 function mount(root) {
   nodes.notice = el("div", { hidden: true });
@@ -79,7 +82,7 @@ function filterForm() {
     placeholder: "203.0.113.1",
     maxlength: 255,
   });
-  nodes.status = input("filter-status", { type: "number", min: 100, max: 599, placeholder: "200" });
+  nodes.status = select("filter-status", [{ label: "全部状态码", value: "" }], "");
   const apply = button("筛选", () => {
     filters.host = nodes.host.value.trim();
     filters.upstream = nodes.upstream.value.trim();
@@ -141,6 +144,15 @@ async function refresh() {
   if (logs.status === "fulfilled") renderLogs(logs.value);
   if (switches.status === "fulfilled") renderSwitches(switches.value.items);
 
+  if (
+    !logStatusCodes.pending &&
+    Date.now() - logStatusCodes.lastFetchedAt >= STATUS_CODES_REFRESH_MS
+  ) {
+    logStatusCodes.lastFetchedAt = Date.now();
+    logStatusCodes.pending = true;
+    void refreshLogStatusCodes();
+  }
+
   const failure = results.find((result) => result.status === "rejected");
 
   // 独立节流，不占用上面那组结果的失败判定：这一块慢或暂时失败，不该让
@@ -155,6 +167,36 @@ async function refresh() {
   }
 
   if (failure) throw failure.reason;
+}
+
+async function refreshLogStatusCodes() {
+  try {
+    renderLogStatusCodes((await api.logStatusCodes()).status_codes);
+  } catch (err) {
+    // 失败时保留上次候选项；不影响日志筛选和其他看板数据。
+  } finally {
+    logStatusCodes.pending = false;
+  }
+}
+
+function renderLogStatusCodes(codes) {
+  // 保留尚未提交的用户选择；候选项刷新可能恰好发生在用户操作筛选器期间。
+  const currentValue = nodes.status.value;
+  const options = [
+    { label: "全部状态码", value: "" },
+    ...codes.map((code) => ({ label: String(code), value: String(code) })),
+  ];
+  const selectable = new Set(options.map((option) => option.value));
+  const selected = selectable.has(currentValue) ? currentValue : filters.status;
+  const updated = select("filter-status", options, selected);
+  nodes.status.replaceChildren(...updated.childNodes);
+  // select() 设置的 selected 属性只影响初始选项状态；显式恢复 DOM value。
+  nodes.status.value = selectable.has(selected) ? selected : "";
+  // 状态码可能随日志保留清理而消失；避免留下一个不再可见的筛选条件。
+  if (filters.status && !codes.some((code) => String(code) === filters.status)) {
+    filters.status = "";
+    nodes.status.value = "";
+  }
 }
 
 function logParams() {

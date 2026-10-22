@@ -44,6 +44,8 @@ HOP_BY_HOP = frozenset(
         "upgrade",
         # 非标准但被浏览器广泛使用，同样必须终止于代理。
         "proxy-connection",
+        # 代理终止 Expect 握手，避免客户端与上游重复等待 100 Continue。
+        "expect",
     }
 )
 
@@ -170,8 +172,12 @@ def parse_target(method: str, target: str, headers: Headers) -> RequestTarget:
         default_port = SCHEME_DEFAULT_PORT.get(parsed.scheme.lower())
         if default_port is None:
             raise BadRequest(f"不支持的协议: {parsed.scheme!r}")
-        host, port = _split_authority(parsed.netloc, default_port=default_port)
-        url = target
+        # URI userinfo 不属于主机 authority。先剥离，避免凭据里的冒号被当作
+        # IPv6 分隔符；记录 URL 时用占位符替代凭据。
+        authority = parsed.netloc.rsplit("@", 1)[-1]
+        host, port = _split_authority(authority, default_port=default_port)
+        safe_netloc = f"***@{authority}" if "@" in parsed.netloc else parsed.netloc
+        url = parsed._replace(netloc=safe_netloc).geturl()
     else:
         # origin-form：请求行只有路径，权威 host 来自 Host 头。
         host_header = headers.get("host")

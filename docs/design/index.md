@@ -2,6 +2,9 @@
 
 | 版本 | 日期 | 变更说明 | 作者 |
 | :--- | :--- | :--- | :--- |
+| v4.3.0 | 2026-10-22 | 评审后续核验：M2 验收新增「大请求体开始流式发送后上游 RST」端到端用例；DD_ROUTING v1.8.0 澄清 Happy Eyeballs 对目标域名与上级代理域名连接端点的不同作用范围 | Agent |
+| v4.2.0 | 2026-10-22 | 代码评审后续优化：DD_WEB v2.2.7 保留状态码下拉框未提交选择；DD_STORAGE v1.14.0 对批量写入的行级完整性约束错误逐条隔离；DD_SWITCHING v1.7.0 说明缓冲溢出后禁止切换，因此重放字节计数不会少计有效重试 | Agent |
+| v4.1.0 | 2026-10-22 | DD_DEPLOY v1.9.0 记录 mini-server 上由工作区代码更新 `r-proxy` 容器的镜像、持久化挂载与健康验证；DD_WEB v2.2.5 补充请求日志状态码动态下拉的查询接口与低频刷新设计 | Agent |
 | v1.0.0 | 2026-08-12 | 初始版本 | Agent |
 | v2.0.0 | 2026-08-13 | 补齐模块详细设计（7 篇）与重构路径，新增阅读顺序与需求映射表 | Agent |
 | v2.1.0 | 2026-08-14 | M1 实现完成，ARCH_OVERVIEW 包结构与 MIGRATION §3 回填实际落地情况 | Agent |
@@ -19,6 +22,7 @@
 | v3.8.0 | 2026-09-05 | HTTP/HTTPS 协议处理专项代码评审，修复三处缺陷并回填文档：①DD_SWITCHING v1.4.0——传输层失败判据（`outcome.status is None`）此前无条件切换，未检查请求是否已发出与方法幂等性，非幂等 POST 请求体完整发出后遇超时/断连会被无脑重投到下一个出口，与「非幂等方法已发出后不得重试」的红线矛盾，现补齐 `response_started`/`request_sent`+幂等门控；②③DD_PROXY v1.5.0——`_attempt_http` 补齐 1xx（`100 Continue`/`103 Early Hints`）中间响应跳过逻辑（§5.2.1），此前会把 1xx 当最终响应转发、真正响应被当成其 body 混入客户端；`_send_body` 补齐读客户端请求体的超时兜底（§4.3），此前慢速/挂起客户端可让连接与出口 socket 一起永久挂起。DD_PROXY 新增 §11 记录两处评估后暂不修的已知限制（body 部分发出后失败重试的重放位置偏差、`OPTIONS *` asterisk-form 处理不完整）。三处修复均新增端到端/单元回归测试 | Agent |
 | v3.9.0 | 2026-09-28 | 粘性映射加时间老化：DD_ROUTING v1.7.0 新增 §7.7 `get_live` 与 `get` 分离、`auto` 30 天未访问即惰性过期、`manual` 永存、`reconfigure` 不主动清空旧条目、与磁盘侧构成最终一致；DD_STORAGE v1.11.0 §5.1 回填过滤加 `MAX(last_success_at, updated_at)` fallback、新增 §6.4 粘性老化清理；DD_CONFIG v2.1.0 加 `routing.sticky_ttl`（默认 2_592_000，`0` 表示禁用）；新增 `storage/expiry.py` 作为分层边界 | Agent |
 | v4.0.0 | 2026-10-12 | 新增 [DD_SOCKS5.md](./DD_SOCKS5.md) v1.0.0：SOCKS5 出口协议支持（标准库无第三方依赖、RFC 1928/1929 二进制状态机、错误映射矩阵、L4 透明代理与 origin-form 转发、WebUI 探活与 Mock 测试策略） | Agent |
+| v4.1.0 | 2026-10-22 | 代码评审整改第 1 批，三处回填：①DD_PROXY v1.10.0 新增 §3.1.2「`readuntil` 的超限异常必须逐点接住」——`asyncio.LimitOverrunError` 既非 `OSError` 也非 `ValueError` 的子类，此前 `connection.py`/`body.py`/`connector.py` 三处漏接，异常逃出连接处理函数导致客户端收不到任何响应；②DD_WEB v2.2.6 新增 §5.1.1「内建文档端点必须关掉」——FastAPI 自注册的 `/docs` 与 `/openapi.json` 不经过 router 的 `dependencies`，认证依赖根本不会被调用；③DD_STORAGE v1.13.0 新增 §3.2.1「三条查询索引」（`logs.db` 3 → 4） | Agent |
 
 设计文档依据 [需求文档](../requirements/index.md) 编写。
 
@@ -76,6 +80,9 @@ flowchart LR
 | 怎么用容器部署、数据放在哪 | [DD_DEPLOY.md](./DD_DEPLOY.md) |
 | 为什么容器用 host 网络而不是发布端口 | [DD_DEPLOY §2](./DD_DEPLOY.md) |
 | SOCKS5 出口是如何握手与转发的 | [DD_SOCKS5 §2](./DD_SOCKS5.md)、[§5](./DD_SOCKS5.md) |
+| 上游响应头过大时客户端会收到什么 | [DD_PROXY §3.1.2](./DD_PROXY.md) |
+| Web 界面的哪些路径需要 token | [DD_WEB §5.1](./DD_WEB.md)、[§5.1.1](./DD_WEB.md) |
+| 看板查询慢是查了哪些表 | [DD_STORAGE §3.2.1](./DD_STORAGE.md)、[DD_WEB §4.2](./DD_WEB.md) |
 
 ## 需求到设计的映射
 

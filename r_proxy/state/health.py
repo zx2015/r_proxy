@@ -66,14 +66,16 @@ class HealthTable:
             health.probe_in_flight = False
         return not health.probe_in_flight
 
-    def acquire_probe(self, name: str) -> bool:
-        """尝试获取 ``half_open`` 的探测名额。
+    def acquire_probe(self, name: str, *, allow_open: bool = False) -> bool:
+        """尝试获取 ``half_open`` 或显式放宽 OPEN 状态的探测名额。
 
         **必须是同步方法**：中间若有 ``await``，两个请求可能都读到
         ``probe_in_flight == False`` 然后都置 ``True``，闸门就失效了。
         """
         health = self._health.get(name)
-        if health is None or health.state is not HealthState.HALF_OPEN:
+        if health is None or health.state is HealthState.CLOSED:
+            return True
+        if health.state is HealthState.OPEN and not allow_open:
             return True
         if health.probe_in_flight:
             return False

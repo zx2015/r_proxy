@@ -99,6 +99,7 @@ export const api = {
   health: () => request("GET", "/api/health"),
   resetCircuit: (name) => request("POST", `/api/health/${encodeURIComponent(name)}/reset`),
   logs: (params) => request("GET", `/api/logs${query(params)}`),
+  logStatusCodes: () => request("GET", "/api/logs/status-codes"),
   switches: (params) => request("GET", `/api/logs/switches${query(params)}`),
   hostTraffic: (params) => request("GET", `/api/traffic/hosts${query(params)}`),
 

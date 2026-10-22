@@ -12,13 +12,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from r_proxy import __version__
 from r_proxy.web import errors
 from r_proxy.web.config_writer import ConfigWriter
-from r_proxy.web.deps import AuthThrottle
+from r_proxy.web.deps import Authenticated, AuthThrottle
 from r_proxy.web.routers import rules, settings, status, sticky, upstreams
 
 if TYPE_CHECKING:
@@ -44,9 +44,19 @@ def create_app(application: Application) -> FastAPI:
     app = FastAPI(
         title="r-proxy 管理界面",
         version=__version__,
-        docs_url="/api/docs",
+        # 内建文档端点必须关掉。FastAPI 自己注册这几条路由，它们**不经过任何
+        # router 的 dependencies**——`require_token` 根本不会被调用。实测启用
+        # 认证后 `/api/docs` 与 `/api/openapi.json` 仍回 200，等于把全部接口
+        # 路径与数据结构白送给任何人（AGENTS.md §5.3：启用认证后 `/api/*`
+        # 全部需要 token，只读接口也不例外）。
+        #
+        # Swagger UI 的 HTML 页还从 CDN 拉脚本与样式，会被本应用自己的 CSP
+        # （`script-src 'self'; style-src 'self'`）拦掉，本来就是个打不开的
+        # 坏页，因此一并去掉。机器可读的 schema 改由 `_install_openapi` 以
+        # 受 token 保护的路由提供，认证口径与其它 `/api/*` 完全一致。
+        docs_url=None,
         redoc_url=None,
-        openapi_url="/api/openapi.json",
+        openapi_url=None,
     )
     # 请求处理函数经依赖注入取用，不用全局变量：测试里可以为每个用例装配一份
     # 独立的应用，互不影响。
@@ -58,6 +68,7 @@ def create_app(application: Application) -> FastAPI:
     errors.install(app)
     app.middleware("http")(_security_headers)
     app.middleware("http")(_slow_request_guard)
+    _install_openapi(app)
     app.include_router(status.router, prefix="/api")
     app.include_router(upstreams.router, prefix="/api")
     app.include_router(sticky.router, prefix="/api")
@@ -67,6 +78,21 @@ def create_app(application: Application) -> FastAPI:
     if STATIC_DIR.is_dir():
         _install_spa(app)
     return app
+
+
+def _install_openapi(app: FastAPI) -> None:
+    """以受 token 保护的路由提供 OpenAPI schema。
+
+    FastAPI 内建的 ``/openapi.json`` 路由不受 router 依赖约束，所以必须先在
+    构造函数里关掉它（``openapi_url=None``），再自己挂一条并把
+    ``require_token`` 挂成依赖——否则它就是一条绕过认证的后门。
+
+    ``include_in_schema=False``：schema 里不该再出现 schema 自己这条路由。
+    """
+
+    @app.get("/api/openapi.json", include_in_schema=False, dependencies=[Authenticated])
+    async def openapi_json() -> JSONResponse:
+        return JSONResponse(app.openapi())
 
 
 def _install_spa(app: FastAPI) -> None:

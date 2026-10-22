@@ -162,7 +162,7 @@ sequenceDiagram
 - 本机无 IPv6 能力 + 纯 IPv6 目标 → 候选链构造阶段跳过 `direct`，不发起连接、**不写负面记忆**（结构性不可达，记它只会白占 LRU 并掩盖真实故障）
 - 地址族能力过滤**不参与**「忽略标记重试一轮」的放宽
 - 规则强制指向 `direct` 而目标纯 IPv6 且本机无能力 → 不发起连接，返回 `502` 并记 `ipv6_unavailable` + 规则行号
-- Happy Eyeballs 用 `loop.create_connection(happy_eyeballs_delay=0.25)`，仅对 `direct` 生效
+- Happy Eyeballs 用 asyncio 连接 API（如 `loop.create_connection(happy_eyeballs_delay=0.25)`；高层 `asyncio.open_connection` 同样支持），对 `direct` 的目标解析生效；若上级代理地址本身是域名，建立到该上级代理的连接时也会受益于双栈竞速；经上级代理访问的最终目标仍由上级解析
 - 无方括号的 IPv6 目标（`CONNECT 2001:db8::1:443`）返回 `400`，**不猜**端口边界
 
 ### 5.2 存储与并发红线

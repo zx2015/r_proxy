@@ -318,3 +318,82 @@ def _is_safe_error_message(node: ast.expr) -> bool:
     if isinstance(node, ast.Name):
         return node.id.startswith("MSG_")
     return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "str"
+
+
+def test_readuntil_callers_handle_limit_overrun() -> None:
+    """凡调用 ``readuntil``/``readline`` 的地方必须接住 ``asyncio.LimitOverrunError``。
+
+    ``asyncio.LimitOverrunError`` 直接继承 ``Exception``——既不是 ``OSError``
+    也不是 ``ValueError`` 的子类。漏接的后果不是「归类错一点」，而是异常一路
+    逃出连接处理函数：客户端只看到连接被关闭，收不到任何响应（抓包表现为
+    ``<empty: no response>``），服务端日志里只剩一条没有上下文的栈。
+    """
+    for module in all_modules():
+        source = module.read_text(encoding="utf-8")
+        if ".readuntil(" not in source and ".readline(" not in source:
+            continue
+        relative = module.relative_to(PACKAGE_ROOT)
+        unprotected = _readuntil_without_overrun_handling(source)
+        assert not unprotected, (
+            f"{relative} 第 {unprotected} 行调用 readuntil/readline，"
+            "但没有接住 asyncio.LimitOverrunError"
+        )
+
+
+def test_the_readuntil_guard_actually_catches_a_missing_handler() -> None:
+    """守护测试本身也要被守护。"""
+    bad = (
+        "async def f(reader):\n"
+        "    try:\n"
+        "        raw = await reader.readuntil(b'\\r\\n')\n"
+        "    except (OSError, ValueError) as exc:\n"
+        "        raise RuntimeError from exc\n"
+    )
+    assert _readuntil_without_overrun_handling(bad) == [3]
+
+    good = (
+        "async def f(reader):\n"
+        "    try:\n"
+        "        raw = await reader.readuntil(b'\\r\\n')\n"
+        "    except (OSError, ValueError, asyncio.LimitOverrunError) as exc:\n"
+        "        raise RuntimeError from exc\n"
+    )
+    assert _readuntil_without_overrun_handling(good) == []
+
+    # 完全不在 try 里同样算漏接。
+    naked = "async def f(reader):\n    return await reader.readuntil(b'\\r\\n')\n"
+    assert _readuntil_without_overrun_handling(naked) == [2]
+
+
+def _readuntil_without_overrun_handling(source: str) -> list[int]:
+    """返回「调用了 ``readuntil``/``readline`` 但所在 try 没接超限异常」的行号。
+
+    以「所在 try 的 except 子句是否提到 ``LimitOverrunError``」判定，不做语义
+    推断：``except (OSError, ValueError, asyncio.LimitOverrunError)`` 与
+    ``except asyncio.LimitOverrunError`` 都要算接住了。
+    """
+    tree = ast.parse(source)
+    all_sites: set[int] = set()
+    protected: set[int] = set()
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and _is_line_read_call(node):
+            all_sites.add(node.lineno)
+        if not isinstance(node, ast.Try):
+            continue
+        catches = any(
+            handler.type is not None and "LimitOverrunError" in ast.unparse(handler.type)
+            for handler in node.handlers
+        )
+        if not catches:
+            continue
+        for stmt in node.body:
+            for sub in ast.walk(stmt):
+                if isinstance(sub, ast.Call) and _is_line_read_call(sub):
+                    protected.add(sub.lineno)
+
+    return sorted(all_sites - protected)
+
+
+def _is_line_read_call(node: ast.Call) -> bool:
+    return isinstance(node.func, ast.Attribute) and node.func.attr in ("readuntil", "readline")

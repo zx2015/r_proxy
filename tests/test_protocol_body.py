@@ -11,7 +11,7 @@ import pytest
 
 from r_proxy.contracts import Headers
 from r_proxy.protocol.body import BodyPlan, plan_body, stream_body
-from r_proxy.protocol.parse import BadRequest
+from r_proxy.protocol.parse import MAX_HEAD_BYTES, BadRequest
 
 
 def headers(*pairs: tuple[str, str]) -> Headers:
@@ -130,5 +130,18 @@ class TestStreamBody:
 
     async def test_oversized_chunk_size_line_is_rejected(self) -> None:
         src = await reader_of(b"5" * 9000 + b"\r\n")
+        with pytest.raises(BadRequest):
+            await stream_body(src, lambda c: None, BodyPlan(kind="chunked", length=None))
+
+    async def test_chunk_size_line_beyond_the_reader_limit_is_rejected(self) -> None:
+        """chunk 长度行超过 reader 上限时必须变成 400，而不是让异常逃出去。
+
+        ``asyncio.LimitOverrunError`` 直接继承 ``Exception``，既不是
+        ``ValueError`` 也不是 ``OSError`` 的子类。漏接时它会一路逃出连接处理
+        函数：客户端只看到连接被关闭，收不到任何响应（抓包是 ``<empty>``）。
+        """
+        src = asyncio.StreamReader(limit=MAX_HEAD_BYTES)
+        src.feed_data(b"5" * (MAX_HEAD_BYTES + 4096))  # 没有 CRLF，reader 先撞上 limit
+        src.feed_eof()
         with pytest.raises(BadRequest):
             await stream_body(src, lambda c: None, BodyPlan(kind="chunked", length=None))

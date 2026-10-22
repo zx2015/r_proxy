@@ -93,6 +93,11 @@ class Application:
         return self._rules_store
 
     @property
+    def cli_overrides(self) -> Mapping[str, object]:
+        """启动时的 CLI 覆盖，用于让 Web 候选配置校验与实际启动一致。"""
+        return self._overrides
+
+    @property
     def storage(self) -> StorageService:
         """存储子系统。Web 界面的只读查询与指标从这里取。"""
         if self._storage is None:
@@ -130,7 +135,7 @@ class Application:
     async def start(self) -> None:
         snapshot = self._load_snapshot()
         has_ipv6 = probe_ipv6_egress()
-        loaded = self._load_rules(snapshot)
+        loaded = await asyncio.to_thread(self._load_rules, snapshot)
         _raise_on_errors(
             _report(
                 loaded.issues
@@ -144,7 +149,7 @@ class Application:
         )
         self._snapshot = snapshot
         self._rules = loaded.rule_set
-        self._ensure_rules_db(snapshot)
+        await asyncio.to_thread(self._ensure_rules_db, snapshot)
 
         # 库打不开就拒绝启动：粘性与负面记忆丢了还能重学，但一个连不上磁盘的
         # 代理会静默地把每次学到的东西都扔掉，用户无从察觉。
@@ -273,7 +278,7 @@ class Application:
         snapshot = self._load_snapshot()
         # 重探：网络环境可能在两次加载之间变化（拨号、切 Wi-Fi、容器换网）。
         has_ipv6 = probe_ipv6_egress()
-        loaded = self._load_rules(snapshot)
+        loaded = await asyncio.to_thread(self._load_rules, snapshot)
         # 规则有条件错误时整份新规则集都不采纳：部分采纳会让路由处于
         # 「一半新一半旧」的状态，比完全不生效更难排查。抛出后旧的
         # ``self._rules`` 原样保留，代理继续按已知可用的规则工作。
@@ -294,7 +299,7 @@ class Application:
         changed = current is None or current.config_version != snapshot.config_version
         self._snapshot = snapshot
         self._rules = loaded.rule_set
-        self._ensure_rules_db(snapshot)
+        await asyncio.to_thread(self._ensure_rules_db, snapshot)
         if self._server is not None:
             self._server.update_snapshot(snapshot, loaded.rule_set)
             self._server.state.set_ipv6_egress(has_ipv6)

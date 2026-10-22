@@ -467,6 +467,20 @@ class TestStaticHosting:
         assert set(SPA_PAGES) | {"dashboard"} == set(modules)
 
 
+class TestDashboardStatusCodeFilter:
+    def test_status_filter_uses_dynamic_codes_with_low_frequency_refresh(self) -> None:
+        dashboard = (STATIC_DIR / "js" / "pages" / "dashboard.js").read_text(encoding="utf-8")
+        api = (STATIC_DIR / "js" / "api.js").read_text(encoding="utf-8")
+        assert 'select("filter-status", [{ label: "全部状态码", value: "" }]' in dashboard
+        assert "STATUS_CODES_REFRESH_MS = 30000" in dashboard
+        assert "api.logStatusCodes()" in dashboard
+        assert "const currentValue = nodes.status.value" in dashboard
+        assert "selectable.has(currentValue) ? currentValue : filters.status" in dashboard
+        assert "nodes.status.value = selectable.has(selected) ? selected : \"\"" in dashboard
+        assert '"/api/logs/status-codes"' in api
+        assert "nodes.status = input(" not in dashboard
+
+
 class TestModuleGraph:
     """每个命名导入都要能在目标模块里找到对应的导出。
 

@@ -377,7 +377,9 @@ class TestRelaxation:
         state = RuntimeState.from_snapshot(snap)
         for name in ("a", "b", "c"):
             open_breaker(state, name)
-        chain = router.build_chain(target(), snap, EMPTY_RULE_SET, state, now=1.0).chain
+        decision = router.build_chain(target(), snap, EMPTY_RULE_SET, state, now=1.0)
+        chain = decision.chain
+        assert decision.relaxed is True
         assert set(chain[:2]) == {"a", "b"}
         assert chain[2] == "c"
 

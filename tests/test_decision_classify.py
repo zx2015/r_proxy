@@ -76,11 +76,13 @@ class TestDetermineOrigin:
         origin = determine_origin(headers(("Server", "nginx")), is_connect=True)
         assert origin is Origin.PROXY
 
-    @pytest.mark.parametrize(
-        "name", ["X-Squid-Error", "X-Cache", "X-Tinyproxy", "Proxy-Connection"]
-    )
+    @pytest.mark.parametrize("name", ["X-Squid-Error", "X-Tinyproxy", "Proxy-Connection"])
     def test_proxy_error_headers_point_at_the_proxy(self, name: str) -> None:
         assert determine_origin(headers((name, "x")), is_connect=False) is Origin.PROXY
+
+    def test_cdn_cache_header_does_not_identify_a_proxy(self) -> None:
+        origin = determine_origin(headers(("X-Cache", "MISS from cloudfront")), is_connect=False)
+        assert origin is Origin.UNDETERMINED
 
     @pytest.mark.parametrize(
         "server", ["squid/5.7", "tinyproxy/1.11", "privoxy", "polipo", "mitmproxy/9"]

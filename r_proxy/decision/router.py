@@ -38,10 +38,12 @@ class Router:
             return self._forced(hit, target, snapshot, state)
 
         usable = self._filter_usable(target, snapshot, state, now=now, relaxed=False)
+        relaxed = False
         if not usable:
             # 放宽：熔断与负面记忆都是基于历史观测的推断，可能已经不准。
             # 宁可试一次，也别让用户完全上不去网。
             usable = self._filter_usable(target, snapshot, state, now=now, relaxed=True)
+            relaxed = bool(usable)
         if not usable:
             return Decision(
                 chain=(),
@@ -51,7 +53,7 @@ class Router:
             )
         ordered = _direct_first(self._order(usable, snapshot, state), target, snapshot)
         chain, source = self._apply_sticky(ordered, target, state, usable, now=now)
-        return Decision(chain=chain, source=source)
+        return Decision(chain=chain, source=source, relaxed=relaxed)
 
     def _apply_sticky(
         self,
