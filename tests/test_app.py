@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import socket
+import sqlite3
 import threading
 from pathlib import Path
 from typing import Any
@@ -263,11 +264,23 @@ class TestRuleLoading:
     """规则来自 rules.db。验收点 M5-20、M5-24、M5-25。"""
 
     def seed(self, tmp_path: Path, *pairs: tuple[str, str]) -> Path:
-        """直接往规则库里塞几条规则，绕开 Web 层。"""
+        """用原始 SQL 模拟历史规则/手工改库，不经过新规则的规范化写入口。"""
         path = tmp_path / "rules.db"
         store = RulesStore(path)
         store.ensure_schema()
-        store.replace(list(pairs), expected_revision=0, now_unix=0)
+        with sqlite3.connect(path) as conn:
+            conn.execute("DELETE FROM rule")
+            conn.executemany(
+                "INSERT INTO rule (position, condition, upstream, updated_at) VALUES (?, ?, ?, 0)",
+                [
+                    (position, condition, upstream)
+                    for position, (condition, upstream) in enumerate(pairs)
+                ],
+            )
+            conn.execute(
+                "UPDATE rule_meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) "
+                "WHERE key = 'revision'"
+            )
         return path
 
     def config_with_rules_db(self, tmp_path: Path, *, enabled: bool | None = None) -> Path:
@@ -338,12 +351,32 @@ class TestRuleLoading:
         assert not [i for i in issues if i.level == "error"]
         assert [i.code for i in issues if "RULE" in i.code] == ["W_RULE_DISABLED_TARGET"]
 
-    async def test_a_bad_condition_refuses_startup(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        ("pairs", "code"),
+        [
+            ((("^(unclosed", "direct"),), "E_RULE_REGEX_UNSUPPORTED"),
+            ((("/legacy/", "direct"),), "E_RULE_REGEX_UNSUPPORTED"),
+            ((("bad.test:8443", "direct"),), "E_RULE_CONDITION"),
+            (
+                (("api.example.com", "direct"), ("*.example.com", "direct")),
+                "E_RULE_OVERLAP",
+            ),
+        ],
+    )
+    async def test_a_bad_condition_refuses_startup(
+        self, tmp_path: Path, pairs: tuple[tuple[str, str], ...], code: str
+    ) -> None:
         """M5-24。库里的条件非法只可能来自手工改库，但启动不能带病运行。"""
-        self.seed(tmp_path, ("^(unclosed", "direct"))
+        path = self.seed(tmp_path, *pairs)
+        before = path.read_bytes()
         app = Application(config_path=self.config_with_rules_db(tmp_path))
-        with pytest.raises(StartupError):
-            await app.start()
+        try:
+            with pytest.raises(StartupError) as caught:
+                await app.start()
+            assert code in str(caught.value)
+            assert path.read_bytes() == before
+        finally:
+            await app.stop()
 
     def test_check_reports_every_offending_rule_at_once(self, tmp_path: Path) -> None:
         """M5-24：一次报告全部问题，界面据此高亮多行。"""
@@ -357,18 +390,83 @@ class TestRuleLoading:
 
         退化为无规则意味着全部流量转为自动路由——那是一次静默的、全局的路由变更。
         """
-        path = self.seed(tmp_path, ("*.example.com", "direct"))
+        self.seed(tmp_path, ("*.example.com", "direct"))
         app = Application(config_path=self.config_with_rules_db(tmp_path))
         await app.start()
         try:
             before = app.rules
-            RulesStore(path).replace([("^(unclosed", "direct")], expected_revision=1, now_unix=0)
+            self.seed(tmp_path, ("^(unclosed", "direct"))
             with pytest.raises(StartupError):
                 await app.reload()
             assert app.rules is before
             host, port = app.proxy_address
             _, writer = await asyncio.open_connection(host, port)
             writer.close()
+        finally:
+            await app.stop()
+
+    async def test_failed_reload_keeps_the_old_rules_database_reference(
+        self, tmp_path: Path
+    ) -> None:
+        """无效的新库不能让配置写入器悄悄开始读写另一个库。"""
+        original_path = self.seed(tmp_path, ("*.example.com", "direct"))
+        config_path = self.config_with_rules_db(tmp_path)
+        rejected_dir = tmp_path / "rejected"
+        rejected_dir.mkdir()
+        rejected_path = self.seed(rejected_dir, ("^legacy", "direct"))
+        app = Application(config_path=config_path)
+        await app.start()
+        try:
+            previous_snapshot, previous_rules, previous_store = (
+                app.snapshot,
+                app.rules,
+                app.rules_store,
+            )
+            original_bytes, rejected_bytes = original_path.read_bytes(), rejected_path.read_bytes()
+            config_path.write_text(
+                config_path.read_text().replace(str(original_path), str(rejected_path))
+            )
+            issues = app.check()
+            assert "E_RULE_REGEX_UNSUPPORTED" in {issue.code for issue in issues}
+            assert app.rules_store is previous_store
+            with pytest.raises(StartupError):
+                await app.reload()
+            assert app.snapshot is previous_snapshot
+            assert app.rules is previous_rules
+            assert app.rules_store is previous_store
+            assert original_path.read_bytes() == original_bytes
+            assert rejected_path.read_bytes() == rejected_bytes
+        finally:
+            await app.stop()
+
+    async def test_failed_rule_store_preparation_preserves_the_entire_snapshot(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        original_path = self.seed(tmp_path, ("*.example.com", "direct"))
+        config_path = self.config_with_rules_db(tmp_path)
+        candidate_dir = tmp_path / "candidate"
+        candidate_dir.mkdir()
+        candidate_path = self.seed(candidate_dir, ("*.other.com", "direct"))
+        app = Application(config_path=config_path)
+        await app.start()
+        try:
+            before = app.snapshot, app.rules, app.rules_store
+            original_ensure = RulesStore.ensure_schema
+
+            def fail_candidate(store: RulesStore) -> None:
+                if store.path == candidate_path:
+                    raise StorageError("candidate schema unavailable")
+                original_ensure(store)
+
+            monkeypatch.setattr(RulesStore, "ensure_schema", fail_candidate)
+            config_path.write_text(
+                config_path.read_text().replace(str(original_path), str(candidate_path))
+            )
+            with pytest.raises(StartupError, match="candidate schema unavailable"):
+                await app.reload()
+            assert app.snapshot is before[0]
+            assert app.rules is before[1]
+            assert app.rules_store is before[2]
         finally:
             await app.stop()
 

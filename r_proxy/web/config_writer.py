@@ -48,7 +48,7 @@ from r_proxy.config.validate import ValidationIssue, validate
 from r_proxy.egress.capability import probe_ipv6_egress
 from r_proxy.rules.loader import compile_rules
 from r_proxy.storage.queue import config_audit
-from r_proxy.storage.rules_store import RuleRow, RulesConflict, RulesSnapshot
+from r_proxy.storage.rules_store import RuleRow, RulesConflict, RulesSnapshot, canonical_rules
 from r_proxy.storage.schema import StorageError
 from r_proxy.web.toml_edit import Transform
 
@@ -62,8 +62,6 @@ BACKUP_STAMP = "%Y%m%d-%H%M%S"
 CONFIG_STEM = "config"
 RULES_STEM = "rules"
 
-# 单条插入落在哪个位置。首匹配胜出下只有表首能保证生效（§6.3.3）。
-PROMOTED_POSITION = 0
 # 备份文件名的形状由服务端决定；恢复接口只接受能在列表里找到的名字（§6.5）。
 BACKUP_PATTERN = re.compile(r"^[A-Za-z0-9._-]+-\d{8}-\d{6}(-\d+)?(\.toml)?$")
 
@@ -100,12 +98,7 @@ class ConfigInvalid(Exception):
 
 
 class RuleExists(Exception):
-    """要插入的条件在表里已经有了。库未改动。
-
-    整表替换路径允许重复（只回一条 `W_RULE_DUPLICATE` 告警），插入路径**拒绝**：
-    编辑表格时用户看得见那两行并能自己取舍，而从粘性页一键固化看不见规则表，
-    重复点两次只会在表首堆出一条让原规则永不生效的死行。
-    """
+    """旧 RULE_EXISTS 响应的兼容类型；新固化路径使用共享互斥校验错误。"""
 
     def __init__(self, *, position: int, condition: str, upstream: str) -> None:
         super().__init__(f"规则已存在：rules[{position}]")
@@ -162,16 +155,20 @@ def version_of(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()[:16]
 
 
-def issue_details(issues: Iterable[ValidationIssue]) -> list[dict[str, str]]:
-    """校验问题 → 响应体里的 ``details``。
-
-    只回代码、位置与说明。位置是配置键或「规则文件名:行号」，不含文件系统路径
-    （DD_WEB §7.4）。
-    """
-    return [
-        {"code": i.code, "location": i.location or "", "message": i.message, "level": i.level}
-        for i in issues
-    ]
+def issue_details(issues: Iterable[ValidationIssue]) -> list[dict[str, object]]:
+    """校验问题及可选冲突双方信息，不返回文件系统路径。"""
+    details: list[dict[str, object]] = []
+    for issue in issues:
+        item: dict[str, object] = {
+            "code": issue.code,
+            "location": issue.location or "",
+            "message": issue.message,
+            "level": issue.level,
+        }
+        if issue.conflict is not None:
+            item["conflict"] = issue.conflict
+        details.append(item)
+    return details
 
 
 def render_rules(rows: Iterable[RuleRow]) -> str:
@@ -269,7 +266,7 @@ class ConfigWriter:
     ) -> tuple[int, list[ValidationIssue]]:
         """整表替换，返回 ``(新 revision, 告警清单)``。
 
-        `rules` 是 `(condition, upstream)` 的有序列表，`position` 由下标决定。
+        `rules` 是 `(condition, upstream)` 的完整集合；下标只用于提交快照的错误定位。
         三步保证：**校验版本 → 校验内容 → 单事务写入**。前两步任一失败时库一个
         字节都没动，`revision` 不变，客户端可以直接重试。
 
@@ -293,26 +290,20 @@ class ConfigWriter:
         actor: str,
         target: str,
     ) -> tuple[int, int, list[ValidationIssue]]:
-        """把一条规则插到表首，返回 ``(位置, 新 revision, 告警清单)``。
+        """向互斥集合添加规则，返回 ``(字母序位置, 新 revision, 告警清单)``。
 
-        供粘性页的「固化为规则」使用（[DD_WEB §8.9](../../docs/design/DD_WEB.md)）。
-        读当前表、插入、整表写回**都在这把锁里**完成，客户端因此不需要参与
-        `revision` 协商：一键操作没有「请刷新后重试」的合理位置，而把读改写留在
-        客户端就一定会有这一步。
-
-        插表首而不是追加表尾：首匹配胜出下，表尾的新规则只要前面有 `*` 或更宽的
-        `*.apex` 就永远不会命中——保存成功、只回一条告警、实际无效，是最难查的
-        失败形态。表首则一定生效，代价是它会排在用户已有的顺序之前，这一点由界面
-        在确认前说明。
+        读当前集合、分析、写回都在同一把锁中执行；冲突与整表保存使用相同反馈。
+        固化不会借助首项优先级覆盖已有规则。
         """
         async with self._lock:
             current = await asyncio.to_thread(self._app.rules_store.read)
-            self._reject_duplicate(condition, upstream, current.rows)
-            rules = [(condition, upstream), *((c, u) for _position, c, u in current.rows)]
+            rules = [*((c, u) for _position, c, u in current.rows), (condition, upstream)]
             revision, issues = await self._commit_rules(
                 rules, current=current, actor=actor, action="rules.promote", target=target
             )
-            return PROMOTED_POSITION, revision, issues
+            ordered = await asyncio.to_thread(canonical_rules, rules)
+            added = canonical_rules([(condition, upstream)])[0]
+            return ordered.index(added), revision, issues
 
     async def _commit_rules(
         self,
@@ -328,16 +319,17 @@ class ConfigWriter:
         整表替换与插入共用这一段：两条写入路径各写一份，漂移的方向总是其中一条
         漏掉备份或审计。
         """
-        issues = self.validate_rules(rules)
+        issues = await asyncio.to_thread(self.validate_rules, rules)
+        ordered = await asyncio.to_thread(canonical_rules, rules)
         before = render_rules(current.rows)
         after = render_rules(
-            [(i, condition, upstream) for i, (condition, upstream) in enumerate(rules)]
+            [(i, condition, upstream) for i, (condition, upstream) in enumerate(ordered)]
         )
 
         await asyncio.to_thread(self._backup_rules, before)
         revision = await asyncio.to_thread(
             self._app.rules_store.replace,
-            rules,
+            ordered,
             expected_revision=current.revision,
             now_unix=int(time.time()),
         )
@@ -354,20 +346,6 @@ class ConfigWriter:
             )
         )
         return revision, issues
-
-    def _reject_duplicate(self, condition: str, upstream: str, rows: Sequence[RuleRow]) -> None:
-        """条件已在表里出现过就拒绝，不写库。
-
-        比的是编译后的 `dedup_key` 而不是原始文本：`[2001:0db8::1]` 与
-        `[2001:db8::1]` 是同一条规则，写法差异不该逃过检测。
-        """
-        candidate = compile_rules([(PROMOTED_POSITION, condition, upstream)])
-        if not candidate.ok:
-            raise ConfigInvalid(candidate.issues)
-        key = candidate.rule_set.rules[0].dedup_key
-        for rule in compile_rules(rows).rule_set.rules:
-            if rule.dedup_key == key:
-                raise RuleExists(position=rule.position, condition=rule.raw, upstream=rule.target)
 
     async def _commit(
         self,
@@ -449,18 +427,22 @@ class ConfigWriter:
             rows = self._app.rules_store.read_rules()
         except StorageError as exc:
             raise ConfigInvalid([ValidationIssue("error", "E_RULES_READ", str(exc))]) from exc
-        loaded = compile_rules(rows)
-        issues = loaded.issues + validate(
+        # 禁用时保留历史问题供修复，但出口引用仍必须检查。
+        issues = compile_rules(rows).issues if candidate.rules_enabled else []
+        targets: dict[str, str] = {}
+        for position, _condition, upstream in rows:
+            targets.setdefault(upstream, f"rules[{position}]")
+        issues += validate(
             candidate,
             has_ipv6_egress=probe_ipv6_egress(),
-            rule_targets=loaded.rule_set.targets(),
+            rule_targets=targets,
         )
         if any(i.level == "error" for i in issues):
             raise ConfigInvalid(issues)
         return candidate
 
     def validate_rules(self, rules: Sequence[tuple[str, str]]) -> list[ValidationIssue]:
-        """条件语法 + 出口存在性。有 error 时抛 :class:`ConfigInvalid`。
+        """校验完整互斥集合、条件和出口；有阻断问题时抛 `ConfigInvalid`。
 
         出口是否存在只能对着**当前**配置判断。用户可能想先加规则再加出口，但那
         段时间里规则指向一个不存在的出口，启动校验同样会拒绝——两处口径必须

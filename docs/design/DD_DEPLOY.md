@@ -2,6 +2,10 @@
 
 | 版本号 | 日期 | 变更说明 | 作者 |
 | :--- | :--- | :--- | :--- |
+| v1.14.0 | 2026-10-24 | 版本升级至0.3.2并重建容器，部署有效期小时输入与悬停提示 | Agent |
+| v1.13.0 | 2026-10-24 | 版本升级至0.3.1并重建正式容器，全局设置增加自动粘性有效期入口 | Agent |
+| v1.12.0 | 2026-10-24 | 用户确认IPv4前缀IP-only后正式升级完成：388规则零冲突、1460测试、备份/回退标签、生产Web/HTTP/CONNECT与源码树验证 | Agent |
+| v1.11.0 | 2026-10-24 | 新增§14互斥规则候选构建与隔离验收：1437测试、代码树哈希、生产只读预检失败与保持旧容器运行 | Agent |
 | v1.10.0 | 2026-10-22 | §12.1 记录 `r-proxy` 从 v0.2.0 更新至 v0.3.0：传统 builder 构建、Compose 仅重建服务、保留现有配置与数据卷，并核验容器健康、CLI 版本与 `body_streamed` 代码标记 | Agent |
 | v1.9.0 | 2026-10-22 | 新增 §12：记录 mini-server 上由当前工作区重建并更新 `r-proxy` 容器的过程、镜像 ID、健康检查和状态码接口验证；传统 builder 构建时 PyPI 下载曾超时重试，最终成功 | Agent |
 | v1.0.0 | 2026-08-16 | 初始版本：Dockerfile、docker-compose、host 网络选型、卷布局与迁移流程、验证记录 | Agent |
@@ -715,3 +719,91 @@ docker compose up -d r-proxy
 - [DD_STORAGE.md](./DD_STORAGE.md) — 三库布局、单一写者、启动回填
 - [DD_WEB.md](./DD_WEB.md) — Web 绑定与 token 约束
 - [PRD_OVERVIEW.md](../requirements/PRD_OVERVIEW.md) §4.8 — 依赖与部署
+
+## 14. 2026-10-24 互斥规则候选镜像与生产切换阻断
+
+| 项目 | 验证结果 |
+|------|------|
+| 候选构建 | `DOCKER_BUILDKIT=0 docker build -t r-proxy:exclusive-candidate .` 成功 |
+| 候选镜像ID | `sha256:eeb709ec83e38a0c2385d4715ca81f2493ab0d463ce7cee945c7b66d29ca9999` |
+| 核心标记 | `ANALYSIS_VERSION=exclusive-v1`，应用版本仍为0.3.0 |
+| 运行代码核对 | 79个 `.py/.js/.css/.html` 文件汇总SHA-256与工作区一致：`572219fead8af9749f278db62028e5589b92d71295547493fb91930c97bab9c4` |
+| 隔离方式 | 临时配置/数据目录，Docker network=none，不占生产监听或接触生产写库 |
+| 候选运行 | running/healthy，Web API、实际HTTP代理、CONNECT双向数据、字母序返回和冲突保存拦截通过 |
+| 生产只读预检 | 新镜像以readonly挂载配置和数据，仅运行audit；revision445、388条，ready=false，源连接写入计数0 |
+| 正式容器 | 保持镜像 `sha256:2f2c015aeb591252d820a19a472b0ad94bd16302da95bc8de749e0a81e01523a`，running/healthy，没有重建或重启 |
+
+候选API实测：同出口包含冲突返回400且带双方与共同host；普通通配符部分交叠预检ok=false；正则明确不支持；失败保存后GET规则与revision保持基线。HTTP与CONNECT测试使用候选容器内的本地目标，证明代理和隧道数据通路，不作为外部站点或TLS应用层可用性的保证。完成测试后清理临时容器，保留候选镜像供后续迁移使用。
+
+生产完整离线盘点有8,395对交叠，根因是数字IPv4前缀普通星号还匹配域名。正式切换需用户确认数字前缀是否收窄为IP-only并完成设计/实现/配置迁移，或人工改写冲突规则；不能以直接替换容器、关闭规则或任意保留一条代替迁移。详见 [DD_RULES §12](./DD_RULES.md#12-v30-实现回填与部署前置条件)。
+
+## 15. 2026-10-24 IPv4专用通配符确认后的正式升级
+
+用户明确确认纯数字IPv4前缀通配符仅匹配IP。实现类型与交集约束更新后，宿主源码和将要部署的镜像分别只读预检生产配置，均为ready=true、analysis_complete=true、issue_counts为空；388条规则、revision445、快照摘要与升级前相同，source_changes=0。
+
+| 项目 | 结果 |
+|------|------|
+| 全量回归 | 1460 passed、2条既有依赖弃用警告；Ruff、MyPy通过 |
+| 升级前备份 | `/tmp/r-proxy-pre-exclusive-h4a9wcdi/`，目录0700；config.toml、SQLite备份与manifest均0600 |
+| 回退镜像 | `r-proxy:pre-exclusive-20261024` 指向旧健康镜像 `sha256:2f2c015aeb591252d820a19a472b0ad94bd16302da95bc8de749e0a81e01523a` |
+| 正式构建 | `DOCKER_BUILDKIT=0 docker compose build r-proxy` 成功 |
+| 运行镜像 | `r-proxy:0.3.0`，ID `sha256:f2cef6f8a591d5131d91c5e3cb438361dffad02e95d34ba1edb996faf54a9d22` |
+| 语义标记 | `exclusive-v2`；应用版本号仍0.3.0，不能只凭标签判断代码是否更新 |
+| 运行状态 | running/healthy，启动时间 `2026-10-24T07:20:43.594425827Z` |
+| 监听与挂载 | 代理6060/Web6061启动完成，原/config、/data、/etc/localtime挂载保留 |
+| 源码核对 | 79个运行文件聚合SHA `a4edd5d4cdd5988ac2df31eb47a6258137ac8b2dcf0564811d260b9622aac945` 与工作区相同 |
+| 规则完整性 | 388条全量加载：23 IPv4_WILDCARD + 365 DOMAIN_SUFFIX；revision445、原逻辑摘要不变 |
+
+先用相同镜像在network=none临时数据容器中验证新语义与保存拒绝，再仅重新创建r-proxy服务。正式验证脚本在容器内读取认证令牌但不输出，仅调用GET、POST /api/route-test和POST /api/rules/validate，禁止PUT/DELETE，因此没有替换生产规则。
+
+正式验证结果：Web鉴权成功；规则字母排序正确；真实配置下数字IP命中IPv4规则、数字开头的域名命中域名后缀；同出口IP范围交叠仍被拒绝；HTTP转发与CONNECT数据通路通过，规则快照前后相同。数据通路使用本机临时目标，不代表逐一验证所有外部上级代理或TLS应用。隔离验收容器已清理，候选标签同步指向新镜像。
+
+§14的“生产切换阻断”是用户确认前的历史状态，此次已解除。回退基线与备份保留；本次没有发布Git提交或新版本号。
+
+
+## 16. 2026-10-24 v0.3.1与自动粘性有效期入口部署
+
+按用户要求将pyproject.toml、r_proxy.__version__与Compose镜像标签从0.3.0同步升级至0.3.1，使用当前工作区构建。新增全局设置自动粘性有效期入口的设计见 [DD_WEB §15](./DD_WEB.md#15-全局设置自动粘性映射有效期入口)。保留先前版本的镜像及历史验收记录，不发布Git提交。
+
+构建命令为 `DOCKER_BUILDKIT=0 docker compose build r-proxy`；依赖下载曾长时间无输出，检查确认pip进程仍运行，最终正常完成。随后执行 `docker compose up -d --no-deps --force-recreate r-proxy`。
+
+| 项目 | 实测结果 |
+|------|------|
+| 正式镜像 | r-proxy:0.3.1 |
+| 镜像ID | sha256:5b09ae65537e7a80eeae967fbabfa3d939a5b3ce562b2a244f18e4a671145438 |
+| 状态 | running / healthy |
+| 启动时间 | 2026-10-24T07:48:14.180449524Z |
+| CLI/API版本 | 均为0.3.1 |
+| 代码核对 | 79运行文件SHA-256为d25fc50a799fdf19694332cc79e301bdaf64e2ff1bb2fc95fd87e715aa223f69，与宿主源码一致 |
+| 有效期入口 | 服务端实际返回的settings.js与已安装文件一致，包含sticky_ttl输入及0永不过期说明 |
+| 当前有效期 | 2592000秒（30天），本次未更改此配置值 |
+| 当前规则快照 | revision449、392条（23 IPv4通配符、369域名后缀），预检ready=true；验收前后完全一致 |
+| 配置与数据 | 原/config、/data和/etc/localtime挂载保留 |
+| 验证 | 169项前端/设置测试及2项CLI测试通过；Ruff、MyPy、diff检查通过；正式Web鉴权、字母排序、IPv4/域名区分、冲突预检及本地HTTP/CONNECT数据通路通过 |
+
+此处规则数量反映此次验收时的当前快照，不把上一阶段revision445的388条当作仍然有效的现状。正式验收只调用GET或诊断POST，未提交生产规则或有效期修改。HTTP/CONNECT目标为本地测试服务，不代表所有外部出口均被逐一测试。
+
+
+## 18. 2026-10-24 v0.3.2小时输入与提示部署
+
+按用户要求同步pyproject.toml、r_proxy.__version__、docker-compose.yml至0.3.2，以当前工作区重建。构建命令为 `DOCKER_BUILDKIT=0 docker compose build r-proxy`。首次构建下载setuptools时files.pythonhosted.org读取超时，pip子进程退出2、Docker构建退出1，未替换旧容器；重试相同命令成功。随后 `docker compose up -d --no-deps --force-recreate r-proxy` 完成正式切换。
+
+| 项目 | 实测结果 |
+|------|------|
+| 镜像 | r-proxy:0.3.2 |
+| 镜像ID | sha256:661459fb84455a0144706aba3d9eba2f415f4ab1d61ceb17ac154f47e0530889 |
+| 状态 | running / healthy |
+| 启动时间 | 2026-10-24T08:04:26.817879353Z |
+| CLI及API版本 | 均为0.3.2 |
+| 代码核对 | 79运行文件SHA-256为48aaf092b471f15b3fa9c3105808f23af73ded909eb3c0d6c122bb37e1190332，与宿主源码相同 |
+| 页面交付 | HTTP返回的settings.js与app.css等于镜像安装文件；包含小时标签、小数输入、小时转秒、tooltip及默认隐藏样式 |
+| 有效期 | API仍返回2592000秒，页面转换为720小时；本次未调整配置值 |
+| 规则 | revision449、392条，23个IPv4通配符与369个域名后缀；完整预检无冲突，验收前后快照一致 |
+| 挂载 | 原/config、/data与/etc/localtime保留 |
+| 验证 | 182项前端/配置/CLI测试通过，Ruff、MyPy、diff检查通过；正式Web鉴权、字母序、IPv4/域名区分、冲突诊断、本地HTTP及CONNECT数据通路通过 |
+
+旧0.3.1镜像保留可回退；不修改生产规则或有效期，不发布Git提交。页面交互由Node DOM适配器验证，未宣称真实浏览器布局检查；HTTP/CONNECT使用本地测试目标，不等同于逐一测试外部出口。小时与提示设计见 [DD_WEB §17](./DD_WEB.md#17-自动粘性有效期小时展示与提示交互)。
+
+### 18.1 v0.3.2 Git交付前完整验证
+
+2026-10-24用户授权提交并push。获取origin后，本地main与origin/main相同，无待合并提交。交付前完整pytest为1471 passed、2条既有websockets依赖弃用警告；Ruff、MyPy及diff检查通过。提交包含互斥规则、IPv4专用通配符、规则列表筛选/字母序/分页/取消调序、自动粘性有效期小时输入与提示、0.3.2版本及配套文档测试；.learnings、TODO.md及.Codex按本地规则排除。上文“不发布Git提交”为此前部署时状态，此次按新授权交付。

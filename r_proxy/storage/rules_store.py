@@ -18,6 +18,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from r_proxy.rules.condition import normalize_condition
 from r_proxy.storage.reader import connect_readonly
 from r_proxy.storage.schema import Database, StorageError, open_write
 
@@ -25,6 +26,17 @@ REVISION_KEY = "revision"
 
 # 空库与「库还不存在」共用这个版本号：两者对客户端是同一件事——还没有人写过。
 INITIAL_REVISION = 0
+
+_ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
+def canonical_rules(rules: Sequence[tuple[str, str]]) -> list[tuple[str, str]]:
+    """规范化规则条件并按与 SQLite NOCASE 一致的字母序生成存储快照。"""
+    return sorted(
+        ((normalize_condition(condition), upstream) for condition, upstream in rules),
+        key=lambda row: (row[0].translate(_ASCII_LOWER), row[0]),
+    )
+
 
 # (position, condition, upstream)
 RuleRow = tuple[int, str, str]
@@ -98,10 +110,8 @@ class RulesStore:
     ) -> int:
         """整表替换，返回新的 ``revision``。
 
-        ``rules`` 是 ``(condition, upstream)`` 的有序列表，``position`` 由下标
-        决定。整表替换而非算最小差异集：客户端提交的本来就是一份完整有序列表，
-        而 diff 要处理「内容变了」「顺序变了」「两者都变」的组合，复杂且容易在
-        重排时错乱。
+        ``rules`` 是完整规则集合；调用方先完成交集校验。通过后规范化并按条件
+        字母序存储，``position`` 仅表示该快照的位置，不参与出口选择。
 
         ``expected_revision`` 在事务内再比对一次——调用方持锁时读到的值到这里
         理论上不会变，但把检查放进同一个事务才是真正的原子性。
@@ -109,7 +119,9 @@ class RulesStore:
         self.ensure_schema()
         conn = open_write(self._path, Database.RULES)
         try:
-            return _replace_in_transaction(conn, rules, expected_revision, now_unix)
+            return _replace_in_transaction(
+                conn, canonical_rules(rules), expected_revision, now_unix
+            )
         except sqlite3.Error as exc:
             raise StorageError(f"写入规则库失败 {self._path.name}: {exc}") from exc
         finally:
@@ -153,9 +165,9 @@ def _read_revision(conn: sqlite3.Connection) -> int:
 
 
 def _read_rows(conn: sqlite3.Connection) -> tuple[RuleRow, ...]:
-    # ORDER BY position, id 而非只按 position：position 无唯一约束，补上 id
-    # 作为决胜项，外部手工改库造成重复值时顺序仍然确定。
+    # 读取不改写历史规则；position 在返回值中只是本快照的字母序位置。
     rows = conn.execute(
-        "SELECT position, condition, upstream FROM rule ORDER BY position, id"
+        "SELECT condition, upstream FROM rule "
+        "ORDER BY condition COLLATE NOCASE, condition COLLATE BINARY, id"
     ).fetchall()
-    return tuple((int(r[0]), str(r[1]), str(r[2])) for r in rows)
+    return tuple((position, str(row[0]), str(row[1])) for position, row in enumerate(rows))

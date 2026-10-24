@@ -15,6 +15,8 @@
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
 from collections.abc import AsyncIterator, Sequence
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
@@ -476,7 +478,7 @@ class TestDashboardStatusCodeFilter:
         assert "api.logStatusCodes()" in dashboard
         assert "const currentValue = nodes.status.value" in dashboard
         assert "selectable.has(currentValue) ? currentValue : filters.status" in dashboard
-        assert "nodes.status.value = selectable.has(selected) ? selected : \"\"" in dashboard
+        assert 'nodes.status.value = selectable.has(selected) ? selected : ""' in dashboard
         assert '"/api/logs/status-codes"' in api
         assert "nodes.status = input(" not in dashboard
 
@@ -535,7 +537,7 @@ def _parse_exports(source: str) -> set[str]:
 
 
 class TestRulesPage:
-    """M5-26：规则页表格化之后的三条源码守护。"""
+    """规则页安全守护与互斥规则页面的事件/快照边界。"""
 
     def test_the_diff_module_is_gone(self) -> None:
         """表格化之后 diff 预览失去意义，`diff.js` 随之删除。
@@ -546,19 +548,32 @@ class TestRulesPage:
         for path in js_files():
             assert "diff.js" not in path.read_text(encoding="utf-8"), path.name
 
-    def test_rule_rows_are_draggable_with_the_string_true(self) -> None:
-        """`draggable` 是枚举属性：赋空串时元素**不可拖动**，且没有任何报错。
-
-        这个坑在出口页的分组拖拽上踩过一次，这里守住第二处。
-        """
-        source = (STATIC_DIR / "js" / "pages" / "rules.js").read_text(encoding="utf-8")
-        assert re.search(r'draggable:\s*"true"', source), "规则行没有可拖动标记"
-        assert not re.search(r'draggable:\s*(?:""|true\b)', source), "draggable 必须是字符串 true"
-
-    def test_keyboard_reordering_exists_alongside_dragging(self) -> None:
-        """拖拽在键盘与触屏上不可达，↑/↓ 不是可选项（WEBUI_SPEC §2.4.2、§5）。"""
-        source = (STATIC_DIR / "js" / "pages" / "rules.js").read_text(encoding="utf-8")
-        assert '"↑"' in source and '"↓"' in source
+    @pytest.mark.parametrize(
+        "scenario",
+        [
+            "sort",
+            "delete_after_blur",
+            "new_row",
+            "conflict",
+            "stale_validation",
+            "save_during_edit",
+            "save_snapshot_race",
+        ],
+    )
+    def test_rule_page_interactions(self, scenario: str) -> None:
+        """执行实际页面模块，守住筛选/分页映射、事件时序和异步快照边界。"""
+        node = shutil.which("node")
+        if node is None:
+            pytest.skip("规则页事件测试需要 Node.js；不把源码字符串检查当作交互验证")
+        result = subprocess.run(
+            [node, str(Path(__file__).parent / "frontend" / "rules_page.mjs"), scenario],
+            cwd=STATIC_DIR.parents[2],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
 
     def test_the_frontend_never_serialises_rule_text(self) -> None:
         """前端只提交 `[{condition, upstream}]`，序列化是服务端的事。
@@ -629,3 +644,35 @@ def _package_data_patterns(pyproject: str) -> Sequence[str]:
 
 def _static_files() -> list[Path]:
     return sorted(path for path in STATIC_DIR.rglob("*") if path.is_file())
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "default",
+        "unchanged",
+        "zero",
+        "fraction",
+        "maximum",
+        "tiny",
+        "negative",
+        "over",
+        "empty",
+        "nan",
+        "tooltip",
+    ],
+)
+def test_settings_ttl_hours_interactions(scenario: str) -> None:
+    """执行实际设置模块，验证小时换算、原秒值保护及提示交互。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("设置页交互测试需要Node.js")
+    result = subprocess.run(
+        [node, str(Path(__file__).parent / "frontend" / "settings_page.mjs"), scenario],
+        cwd=STATIC_DIR.parents[2],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

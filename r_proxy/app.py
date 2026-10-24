@@ -147,9 +147,8 @@ class Application:
                 )
             )
         )
-        self._snapshot = snapshot
-        self._rules = loaded.rule_set
-        await asyncio.to_thread(self._ensure_rules_db, snapshot)
+        store = await asyncio.to_thread(self._ensure_rules_db, snapshot)
+        self._snapshot, self._rules, self._rules_store = snapshot, loaded.rule_set, store
 
         # 库打不开就拒绝启动：粘性与负面记忆丢了还能重学，但一个连不上磁盘的
         # 代理会静默地把每次学到的东西都扔掉，用户无从察觉。
@@ -297,9 +296,9 @@ class Application:
         # 原封不动。一律说「配置已重载」会让运维照着一个没变过的文件排查。
         current = self._snapshot
         changed = current is None or current.config_version != snapshot.config_version
-        self._snapshot = snapshot
-        self._rules = loaded.rule_set
-        await asyncio.to_thread(self._ensure_rules_db, snapshot)
+        store = await asyncio.to_thread(self._ensure_rules_db, snapshot)
+        # 校验和建库都成功后再同时发布，期间不能把 Web 写入门面切到被拒绝的库。
+        self._snapshot, self._rules, self._rules_store = snapshot, loaded.rule_set, store
         if self._server is not None:
             self._server.update_snapshot(snapshot, loaded.rule_set)
             self._server.state.set_ipv6_egress(has_ipv6)
@@ -334,21 +333,22 @@ class Application:
             loaded = load_rules(store, enabled=snapshot.rules_enabled)
         except StorageError as exc:
             raise StartupError(str(exc)) from exc
-        self._rules_store = store
         return loaded
 
-    def _ensure_rules_db(self, snapshot: ConfigSnapshot) -> None:
-        """建库、建表、写入 ``revision = 0``。
+    def _ensure_rules_db(self, snapshot: ConfigSnapshot) -> RulesStore:
+        """准备候选规则库门面；开启规则时建库、建表、写入 ``revision = 0``。
 
         ``rules.enabled = false`` 时**不建库**：救场开关的语义是「完全不碰规则
         库」，在库可能已损坏的场景下这一点是关键。
         """
-        if not snapshot.rules_enabled or self._rules_store is None:
-            return
+        store = RulesStore(snapshot.database.rules_path)
+        if not snapshot.rules_enabled:
+            return store
         try:
-            self._rules_store.ensure_schema()
+            store.ensure_schema()
         except StorageError as exc:
             raise StartupError(str(exc)) from exc
+        return store
 
 
 def _report(issues: list[ValidationIssue]) -> list[ValidationIssue]:

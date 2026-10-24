@@ -90,3 +90,6 @@ credentials.json
 *.orig
 *.rej
 .pip-tools.txt
+
+# Codex 本地文件，不纳入版本控制
+.Codex/

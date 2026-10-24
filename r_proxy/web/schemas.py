@@ -431,11 +431,21 @@ class RulesValidateRequest(Model):
     rules: list[RuleRow] = RULES_FIELD
 
 
+class RuleConflictItem(Model):
+    related_location: str
+    condition: str
+    upstream: str
+    related_condition: str
+    related_upstream: str
+    example_host: str
+
+
 class IssueItem(Model):
     code: str
     location: str
     message: str
     level: str
+    conflict: RuleConflictItem | None = None
 
 
 class RulesSaveResponse(Model):

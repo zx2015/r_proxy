@@ -49,6 +49,26 @@ class TestRead:
         store = seeded(tmp_path, ("a.test", "direct"))
         assert store.read_rules() == ((0, "a.test", "direct"),)
 
+    def test_historical_rows_are_read_in_alphabetical_snapshot_order(self, tmp_path: Path) -> None:
+        store = store_at(tmp_path)
+        store.ensure_schema()
+        with sqlite3.connect(store.path) as conn:
+            conn.executemany(
+                "INSERT INTO rule (position, condition, upstream, updated_at) VALUES (?, ?, ?, 0)",
+                [(0, "Z.test", "direct"), (9, "a.test", "direct"), (0, "B.test", "direct")],
+            )
+        assert store.read().rows == (
+            (0, "a.test", "direct"),
+            (1, "B.test", "direct"),
+            (2, "Z.test", "direct"),
+        )
+        with sqlite3.connect(store.path) as conn:
+            assert conn.execute("SELECT position FROM rule ORDER BY id").fetchall() == [
+                (0,),
+                (9,),
+                (0,),
+            ]
+
     def test_an_unreadable_database_names_the_file(self, tmp_path: Path) -> None:
         """启动失败时用户手上只有这一行文本，得知道是哪个库坏了。"""
         (tmp_path / "rules.db").write_bytes(b"not a database")
@@ -57,6 +77,16 @@ class TestRead:
 
 
 class TestReplace:
+    def test_replacement_canonicalises_conditions_and_sorts_alphabetically(
+        self, tmp_path: Path
+    ) -> None:
+        store = seeded(tmp_path, ("Z.test.", "direct"), ("B.test", "proxy"), ("a.test", "direct"))
+        assert store.read().rows == (
+            (0, "a.test", "direct"),
+            (1, "b.test", "proxy"),
+            (2, "z.test", "direct"),
+        )
+
     def test_m5_13_positions_are_assigned_from_the_array_index(self, tmp_path: Path) -> None:
         store = seeded(tmp_path, ("a.test", "direct"), ("b.test", "proxy"), ("c.test", "direct"))
         assert [p for p, _, _ in store.read().rows] == [0, 1, 2]

@@ -280,11 +280,11 @@ class TestPromotion:
     """把粘性映射固化成规则（WEBUI_SPEC §2.3、DD_WEB §8.9）。
 
     固化改变的是**语义**而不只是存续时间：规则命中后候选链长度恒为 1、失败原样
-    返回，而粘性只是把出口提到链首。因此每个用例都要验到「规则真的进了表首并
+    返回，而粘性只是把出口提到链首。因此每个用例都要验到「规则进入互斥集合并
     热重载生效」，只验接口回了 200 说明不了什么。
     """
 
-    async def test_the_rule_lands_at_the_top_and_takes_effect(
+    async def test_the_rule_enters_the_set_and_takes_effect(
         self, app: Application, client: httpx.AsyncClient
     ) -> None:
         app.state.sticky.record_success("a.example", "proxy-a", now=time.monotonic())
@@ -298,19 +298,20 @@ class TestPromotion:
         # 热重载已经完成：接口返回时新规则就该在决策用的规则集里。
         assert [r.raw for r in app.rules.rules] == ["a.example"]
 
-    async def test_an_existing_table_keeps_its_order_below_the_new_rule(
+    async def test_promoted_rule_returns_its_alphabetical_position(
         self, app: Application, client: httpx.AsyncClient
     ) -> None:
-        """插表首而不是表尾：表尾的新规则被前面更宽的条件一遮就永不生效。"""
-        await client.post(
-            "/api/sticky/b.example/promote",
-            json={"condition": "*.example", "upstream": "direct"},
-        )
         await client.post(
             "/api/sticky/a.example/promote",
-            json={"condition": "a.example", "upstream": "proxy-a"},
+            json={"condition": "a.example", "upstream": "direct"},
         )
-        assert [c for _p, c, _u in app.rules_store.read().rows] == ["a.example", "*.example"]
+        response = await client.post(
+            "/api/sticky/z.example/promote",
+            json={"condition": "z.example", "upstream": "proxy-a"},
+        )
+        assert response.status_code == 200
+        assert response.json()["position"] == 1
+        assert [c for _p, c, _u in app.rules_store.read().rows] == ["a.example", "z.example"]
 
     async def test_the_condition_may_generalise_the_host(
         self, app: Application, client: httpx.AsyncClient
@@ -390,26 +391,30 @@ class TestPromotion:
         assert body["sticky_cleared"] is False
         assert [r.raw for r in app.rules.rules] == ["gone.example"]
 
-    async def test_a_broader_rule_already_covering_the_host_is_reported(
+    async def test_overlap_is_rejected_and_preserves_the_sticky_entry(
         self, app: Application, client: httpx.AsyncClient
     ) -> None:
-        """回固化**前**的命中，界面据此说明「新规则从此优先于 rules[i]」。"""
         await client.post(
             "/api/sticky/b.example/promote",
             json={"condition": "*.example", "upstream": "direct"},
         )
-        body = (
-            await client.post(
-                "/api/sticky/a.example/promote",
-                json={"condition": "a.example", "upstream": "proxy-a"},
-            )
-        ).json()
-        assert body["previous_match"] == {"position": 0, "condition": "*.example"}
+        app.state.sticky.record_success("a.example", "proxy-a", now=time.monotonic())
+        before = app.rules_store.read()
+        response = await client.post(
+            "/api/sticky/a.example/promote",
+            json={"condition": "a.example", "upstream": "proxy-a"},
+        )
+        assert response.status_code == 400
+        issue = response.json()["error"]["details"][0]
+        assert issue["code"] == "E_RULE_OVERLAP"
+        assert issue["conflict"]["example_host"] == "a.example"
+        assert app.rules_store.read() == before
+        assert app.state.sticky.get("a.example") is not None
 
     async def test_a_duplicate_condition_is_refused(
         self, app: Application, client: httpx.AsyncClient
     ) -> None:
-        """重复点两次只会在表首堆出一条让原规则永不生效的死行。"""
+        """重复条件通过与整表保存相同的互斥校验拒绝。"""
         first = {"condition": "a.example", "upstream": "proxy-a"}
         await client.post("/api/sticky/a.example/promote", json=first)
         before = app.rules_store.read()
@@ -417,10 +422,13 @@ class TestPromotion:
         response = await client.post(
             "/api/sticky/a.example/promote", json={"condition": "a.example", "upstream": "direct"}
         )
-        assert response.status_code == 409
-        error = response.json()["error"]
-        assert error["code"] == "RULE_EXISTS"
-        assert error["details"] == {"position": 0, "condition": "a.example", "upstream": "proxy-a"}
+        assert response.status_code == 400
+        issue = response.json()["error"]["details"][0]
+        assert issue["code"] == "E_RULE_DUPLICATE"
+        assert {issue["location"], issue["conflict"]["related_location"]} == {
+            "rules[0]",
+            "rules[1]",
+        }
         assert app.rules_store.read() == before
 
     async def test_differently_spelled_ip_literals_count_as_duplicates(
@@ -435,7 +443,8 @@ class TestPromotion:
             "/api/sticky/2001:db8::1/promote",
             json={"condition": "[2001:db8::1]", "upstream": "proxy-a"},
         )
-        assert response.status_code == 409
+        assert response.status_code == 400
+        assert response.json()["error"]["details"][0]["code"] == "E_RULE_DUPLICATE"
 
     async def test_an_unknown_upstream_is_rejected(
         self, app: Application, client: httpx.AsyncClient

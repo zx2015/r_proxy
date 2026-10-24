@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import replace
 
 import pytest
 
@@ -51,25 +50,23 @@ def target_of(rules: RuleSet, target: RequestTarget) -> str | None:
     return found.target if found is not None else None
 
 
-class TestFirstMatchWins:
-    def test_the_earlier_rule_beats_the_later_one(self) -> None:
-        """M5-01：`*` 写在前面就赢——与 v1 的 last-match-wins 相反。"""
-        rules = rule_set(("*", "proxy-a"), ("*.github.com", "direct"))
-        assert target_of(rules, http("www.github.com")) == "proxy-a"
+class TestUniqueMatch:
+    def test_reordering_disjoint_rules_does_not_change_decision(self) -> None:
+        pairs = [("*.github.com", "a"), ("*.gitlab.com", "b"), ("a*b.test", "c")]
+        for order in (pairs, list(reversed(pairs))):
+            rules = rule_set(*order)
+            assert target_of(rules, http("api.github.com")) == "a"
+            assert target_of(rules, http("gitlab.com")) == "b"
+            assert target_of(rules, http("axxb.test")) == "c"
 
-    def test_a_specific_rule_placed_first_wins_over_the_catch_all(self) -> None:
-        rules = rule_set(("*.github.com", "direct"), ("*", "proxy-a"))
-        assert target_of(rules, http("www.github.com")) == "direct"
-
-    def test_the_match_reports_position_and_condition(self) -> None:
-        rules = rule_set(("*", "proxy-a"), ("*.github.com", "direct"))
-        found = match(rules, http("github.com"))
+    def test_match_reports_snapshot_position_and_condition(self) -> None:
+        rules = rule_set(("*.github.com", "a"), ("*.gitlab.com", "b"))
+        found = match(rules, http("gitlab.com"))
         assert found is not None
-        assert (found.position, found.condition) == (0, "*")
+        assert (found.position, found.condition) == (1, "*.gitlab.com")
 
     def test_unmatched_host_falls_through_to_automatic_routing(self) -> None:
-        rules = rule_set(("*.github.com", "direct"))
-        assert match(rules, http("example.com")) is None
+        assert match(rule_set(("*.github.com", "direct")), http("example.com")) is None
 
     def test_empty_rule_set_never_matches(self) -> None:
         assert match(EMPTY_RULE_SET, http("example.com")) is None
@@ -83,19 +80,10 @@ class TestHostOnly:
         assert target_of(rules, http("api.example.com", "/v1")) == "proxy-a"
         assert target_of(rules, connect("api.example.com")) == "proxy-a"
 
-    def test_a_regex_sees_only_the_host(self) -> None:
-        rules = rule_set((r"^api\.example\.com$", "proxy-b"))
-        assert target_of(rules, http("api.example.com", "/admin")) == "proxy-b"
-
-    def test_a_url_regex_carried_over_from_v1_never_matches(self) -> None:
-        """`^https?://…` 这类条件在 v2 匹配不到任何东西，换算表就是为它准备的。"""
-        rules = rule_set((r"^https?://api\.example\.com/", "proxy-b"))
-        assert match(rules, http("api.example.com", "/v1")) is None
-        assert match(rules, connect("api.example.com")) is None
-
-    def test_the_port_is_not_part_of_the_subject(self) -> None:
-        rules = rule_set((r"^api\.example\.com:443$", "proxy-b"))
-        assert match(rules, connect("api.example.com")) is None
+    def test_path_and_port_do_not_change_host_rule_match(self) -> None:
+        rules = rule_set(("api.example.com", "a"))
+        assert target_of(rules, http("api.example.com", "/admin", port=8080)) == "a"
+        assert target_of(rules, connect("api.example.com", port=8443)) == "a"
 
 
 class TestDomainSuffix:
@@ -149,9 +137,14 @@ class TestExactHost:
     def test_exact_does_not_match_subdomains(self) -> None:
         assert match(rule_set(("api.github.com", "proxy-a")), http("v2.api.github.com")) is None
 
-    def test_exact_written_first_beats_a_suffix(self) -> None:
-        rules = rule_set(("api.github.com", "direct"), ("*.github.com", "proxy-a"))
-        assert target_of(rules, http("api.github.com")) == "direct"
+    def test_overlapping_exact_and_suffix_are_rejected_instead_of_ranked(self) -> None:
+        for pairs in [
+            (("api.github.com", "direct"), ("*.github.com", "a")),
+            (("*.github.com", "a"), ("api.github.com", "direct")),
+        ]:
+            result = compile_rules([(i, c, u) for i, (c, u) in enumerate(pairs)])
+            assert not result.ok
+            assert result.errors[0].code == "E_RULE_OVERLAP"
 
 
 class TestIpLiterals:
@@ -178,53 +171,19 @@ class TestIpLiterals:
 
 
 class TestLinearBucket:
-    def test_wildcard_and_regex_share_one_ordered_bucket(self) -> None:
-        rules = rule_set(("*.example.*", "proxy-a"), (r"^www\.", "proxy-b"))
-        assert target_of(rules, http("www.example.com")) == "proxy-a"
-
-    def test_evaluation_stops_once_no_later_rule_can_win(self) -> None:
-        """M5-10：已有 position 更小的候选时，后面的正则不再求值。"""
-        evaluated: list[str] = []
-
-        class Spy:
-            def __init__(self, name: str) -> None:
-                self.name = name
-
-            def search(self, subject: str) -> object:
-                evaluated.append(self.name)
-                return object()
-
-        rules = rule_set(("*.example.com", "proxy-a"), (r"^www\.", "proxy-b"), (r"^w", "proxy-c"))
-        spied = RuleSet.build(
-            [
-                rules.rules[0],
-                replace(rules.rules[1], regex=Spy("second")),
-                replace(rules.rules[2], regex=Spy("third")),
-            ]
-        )
-        assert target_of(spied, http("www.example.com")) == "proxy-a"
-        assert evaluated == []
-
-    def test_a_linear_rule_before_the_current_best_is_still_evaluated(self) -> None:
-        """提前退出只跳过不可能更优的规则，不能连更靠前的一起跳掉。"""
-        rules = rule_set((r"^www\.", "proxy-b"), ("*.example.com", "proxy-a"))
-        assert target_of(rules, http("www.example.com")) == "proxy-b"
-
-    def test_an_overlong_host_skips_the_linear_bucket_but_keeps_the_rest(self) -> None:
-        """回溯耗时随输入长度增长，超限跳过是唯一可靠的防线。"""
+    def test_an_overlong_host_skips_wildcards_but_keeps_indexed_rules(self) -> None:
         host = "a" * (MAX_SUBJECT + 1)
-        rules = rule_set((r"^a+$", "proxy-b"), ("*", "direct"))
-        assert target_of(rules, http(host)) == "direct"
+        assert match(rule_set(("a*", "b")), http(host)) is None
+        assert target_of(rule_set(("*", "direct")), http(host)) == "direct"
 
     def test_the_skip_is_logged(self, caplog: pytest.LogCaptureFixture) -> None:
-        rules = rule_set((r"^a+$", "proxy-b"))
+        rules = rule_set(("a*", "b"))
         with caplog.at_level(logging.WARNING, logger="r_proxy.rules.matcher"):
             assert match(rules, http("a" * (MAX_SUBJECT + 1))) is None
         assert "主机名过长" in caplog.text
 
-    def test_a_host_at_the_limit_is_still_matched(self) -> None:
-        rules = rule_set((r"^a+$", "proxy-b"))
-        assert target_of(rules, http("a" * MAX_SUBJECT)) == "proxy-b"
+    def test_host_at_limit_is_matched(self) -> None:
+        assert target_of(rule_set(("a*", "b")), http("a" * MAX_SUBJECT)) == "b"
 
 
 class TestAnyPattern:

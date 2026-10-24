@@ -36,19 +36,13 @@ class TestKinds:
     def test_star_elsewhere_is_a_wildcard(self) -> None:
         """M5-03：`*.example.*` 不是 apex 特例形状，落到通配符。"""
         assert kind_of("*.example.*") is PatternKind.WILDCARD
-        assert kind_of("192.168.*") is PatternKind.WILDCARD
+        assert kind_of("192.168.*").name == "IPV4_WILDCARD"
 
-    def test_caret_is_a_regex(self) -> None:
-        pattern = classify(r"^cdn\d+\.example\.com$")
-        assert pattern.kind is PatternKind.REGEX
-        assert pattern.regex is not None
-        assert pattern.regex.search("cdn12.example.com")
-
-    def test_slash_delimited_is_a_regex_without_the_slashes(self) -> None:
-        pattern = classify(r"/\.cn$/")
-        assert pattern.kind is PatternKind.REGEX
-        assert pattern.regex is not None
-        assert pattern.regex.pattern == r"\.cn$"
+    @pytest.mark.parametrize("condition", [r"^cdn\d+\.example\.com$", r"/\.cn$/"])
+    def test_regex_is_explicitly_unsupported(self, condition: str) -> None:
+        with pytest.raises(ConditionError) as caught:
+            classify(condition)
+        assert caught.value.code == "E_RULE_REGEX_UNSUPPORTED"
 
     def test_ipv4_literal(self) -> None:
         pattern = classify("127.0.0.1")
@@ -81,8 +75,8 @@ class TestOrderOfJudgement:
         """端口检测排在 IP 之后，否则 `2001:db8::1` 会被误判。"""
         assert kind_of("2001:db8::1") is PatternKind.IP_LITERAL
 
-    def test_regex_containing_a_colon_and_digits_is_still_a_regex(self) -> None:
-        assert kind_of(r"^example\.com:443$") is PatternKind.REGEX
+    def test_regex_containing_a_colon_is_not_misreported_as_a_port(self) -> None:
+        assert "正则" in refuse(r"^example\.com:443$")
 
 
 class TestRejections:
@@ -98,6 +92,17 @@ class TestRejections:
         """M5-08：方括号明示了意图。退化为域名会产生一条永不匹配的规则。"""
         assert "IPv6" in refuse("[2001:db8::zz]")
 
+    def test_brackets_cannot_wrap_ipv4_or_hide_an_unclosed_address(self) -> None:
+        assert "IPv6" in refuse("[192.168.1.1]")
+        assert "方括号" in refuse("[example.com")
+
+    @pytest.mark.parametrize("condition", ["*.", "**.", "***..."])
+    def test_unfinished_domain_suffix_cannot_become_catch_all(self, condition: str) -> None:
+        assert "不完整" in refuse(condition)
+
+    def test_normalized_condition_still_respects_the_length_limit(self) -> None:
+        assert "上限" in refuse("İ" * 501)
+
     def test_zone_id_is_rejected(self) -> None:
         assert "zone id" in refuse("fe80::1%eth0")
         assert "zone id" in refuse("[fe80::1%eth0]")
@@ -106,14 +111,19 @@ class TestRejections:
         """`2001:db8:zz` 既不是 IP 也不该变成主机名。"""
         assert "方括号" in refuse("2001:db8:zz")
 
+    @pytest.mark.parametrize("condition", ["*.::1", "*.dead:443", "*.ab:12"])
+    def test_domain_suffix_cannot_contain_an_ipv6_authority_or_port(self, condition: str) -> None:
+        assert "域名后缀" in refuse(condition)
+
     def test_invalid_regex_is_rejected(self) -> None:
         assert "正则" in refuse("^https?://(unclosed")
 
     def test_overlong_regex_is_rejected(self) -> None:
         assert refuse("^" + "a" * 1000)
 
-    def test_a_regex_at_the_length_limit_is_accepted(self) -> None:
-        assert kind_of("^" + "a" * 999) is PatternKind.REGEX
+    def test_length_limit_applies_to_supported_conditions(self) -> None:
+        assert kind_of("a" * 999 + "*") is PatternKind.WILDCARD
+        assert "上限" in refuse("a" * 1000 + "*")
 
 
 class TestWildcardCompilation:
@@ -139,16 +149,16 @@ class TestWildcardCompilation:
         assert compile_wildcard("*.EXAMPLE.*").search("www.example.cn")
 
 
-class TestRedosHeuristic:
-    def test_nested_quantifier_is_flagged(self) -> None:
-        text = "^(a+)+$"
-        assert looks_risky(classify(text), text)
+class TestNormalization:
+    def test_host_dot_and_case_are_canonical(self) -> None:
+        assert classify(" API.EXAMPLE.COM. ").exact == "api.example.com"
 
-    def test_plain_regex_is_not_flagged(self) -> None:
-        text = r"^cdn\d+\."
-        assert not looks_risky(classify(text), text)
+    def test_double_star_cannot_change_into_apex_suffix(self) -> None:
+        pattern = classify("**.example.com")
+        assert pattern.kind is PatternKind.WILDCARD
+        assert pattern.regex is not None
+        assert pattern.regex.search("example.com") is None
 
-    def test_wildcard_is_never_flagged(self) -> None:
-        """通配符由我们自己转译，不可能含嵌套量词。"""
+    def test_wildcard_does_not_execute_regex(self) -> None:
         text = "*.example.*"
         assert not looks_risky(classify(text), text)

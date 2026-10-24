@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -115,57 +116,97 @@ async def connect(app: Application, host: str = "site.test", port: int = 443) ->
 
 
 class TestMatchingSemantics:
-    async def test_m5_01_the_first_matching_rule_wins(self, tmp_path: Path) -> None:
-        """M5-01：`*` 写在前面就赢，与已废止的 M3-10 相反。
-
-        这是整次重构里唯一「代码能跑但结果全错」的改动——分桶索引不变、类型
-        不变、接口不变，只有一个比较符号。端到端跑一遍，看真正的字节去了哪里。
-        """
-        seen_all: list[str] = []
-        seen_gh: list[str] = []
-        catch_all = await start_server(responder(b"HTTP/1.1 200 OK", seen=seen_all))
-        github = await start_server(responder(b"HTTP/1.1 200 OK", seen=seen_gh))
-        seed_rules(tmp_path, ("*", "all"), ("*.github.com", "gh"))
-        app = await running_app(
-            write_config(
-                tmp_path,
-                config(
-                    http_upstream("all", catch_all.address),
-                    http_upstream("gh", github.address),
-                    tmp_path=tmp_path,
-                ),
+    @pytest.mark.parametrize("reverse", [False, True])
+    async def test_m5_01_historical_overlap_refuses_startup_without_rewriting_rules(
+        self, tmp_path: Path, reverse: bool
+    ) -> None:
+        """旧首匹配配置不能被字母重排后直接加载，须先由用户清理交叠。"""
+        store = seed_rules(tmp_path)
+        rows = [(7, "*", "all"), (2, "*.github.com", "gh")]
+        if reverse:
+            rows.reverse()
+        with sqlite3.connect(store.path) as conn:
+            conn.executemany(
+                "INSERT INTO rule (position, condition, upstream, updated_at) VALUES (?, ?, ?, 0)",
+                rows,
             )
+        before = store.path.read_bytes()
+        before_snapshot = store.read()
+        path = write_config(
+            tmp_path,
+            config(
+                http_upstream("all", "127.0.0.1:1"),
+                http_upstream("gh", "127.0.0.1:2"),
+                tmp_path=tmp_path,
+            ),
         )
+        app = Application(config_path=path)
         try:
-            await get(app, host="api.github.com")
-            assert len(seen_all) == 1
-            assert seen_gh == []
+            with pytest.raises(StartupError) as caught:
+                await app.start()
         finally:
+            # 即便回归使无效配置意外启动，也必须回收写者线程与监听端口。
             await app.stop()
+        assert "E_RULE_OVERLAP" in str(caught.value)
+        assert store.path.read_bytes() == before
+        assert store.read() == before_snapshot
+        with sqlite3.connect(store.path) as conn:
+            assert (
+                conn.execute(
+                    "SELECT position, condition, upstream FROM rule ORDER BY id"
+                ).fetchall()
+                == rows
+            )
 
-    async def test_m5_01_reordering_the_same_two_rules_flips_the_result(
+    async def test_m5_01_reordering_exclusive_rules_keeps_real_routing_unchanged(
         self, tmp_path: Path
     ) -> None:
-        """顺序是唯一的变量：换个顺序，同一个请求必须走另一个出口。"""
-        seen_all: list[str] = []
+        """同一互斥集合以相反数组顺序保存，真实转发与路由测试保持相同出口。"""
+        seen_other: list[str] = []
         seen_gh: list[str] = []
-        catch_all = await start_server(responder(b"HTTP/1.1 200 OK", seen=seen_all))
+        other = await start_server(responder(b"HTTP/1.1 200 OK", seen=seen_other))
         github = await start_server(responder(b"HTTP/1.1 200 OK", seen=seen_gh))
-        seed_rules(tmp_path, ("*.github.com", "gh"), ("*", "all"))
+        seed_rules(tmp_path, ("*.github.com", "gh"), ("*.example.net", "other"))
         app = await running_app(
             write_config(
                 tmp_path,
                 config(
-                    http_upstream("all", catch_all.address),
+                    http_upstream("other", other.address),
                     http_upstream("gh", github.address),
                     tmp_path=tmp_path,
                 ),
             )
         )
+        hosts = ("api.github.com", "api.example.net")
         try:
-            await get(app, host="api.github.com")
-            assert len(seen_gh) == 1
-            assert seen_all == []
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=create_app(app), client=("127.0.0.1", 12345)),
+                base_url="http://webui.test",
+            ) as client:
+                before = []
+                for host in hosts:
+                    assert (await get(app, host=host)).startswith(b"HTTP/1.1 200")
+                    prediction = (
+                        await client.post("/api/route-test", json={"url": f"https://{host}/"})
+                    ).json()
+                    before.append((prediction["matched_rule"]["condition"], prediction["upstream"]))
+                listing = (await client.get("/api/rules")).json()
+                saved = await client.put(
+                    "/api/rules",
+                    json={"revision": listing["revision"], "rules": listing["rules"][::-1]},
+                )
+                assert saved.status_code == 200
+                after = []
+                for host in hosts:
+                    assert (await get(app, host=host)).startswith(b"HTTP/1.1 200")
+                    prediction = (
+                        await client.post("/api/route-test", json={"url": f"https://{host}/"})
+                    ).json()
+                    after.append((prediction["matched_rule"]["condition"], prediction["upstream"]))
+            assert before == after == [("*.github.com", "gh"), ("*.example.net", "other")]
+            assert len(seen_gh) == len(seen_other) == 2
+            assert all("api.github.com" in line for line in seen_gh)
+            assert all("api.example.net" in line for line in seen_other)
         finally:
             await app.stop()
 

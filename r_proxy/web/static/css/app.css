@@ -302,6 +302,15 @@ input[type="checkbox"] {
   margin: 10px 0;
 }
 
+.toolbar[hidden] {
+  display: none;
+}
+
+.rule-filter-host {
+  min-width: 200px;
+  flex: 1;
+}
+
 .inline-field {
   display: inline-flex;
   align-items: center;
@@ -424,13 +433,6 @@ input[type="checkbox"] {
 
 /* 规则表 ------------------------------------------------------------------ */
 
-.drag-handle {
-  width: 24px;
-  color: var(--muted);
-  cursor: grab;
-  user-select: none;
-}
-
 /* 条件列吃掉剩余宽度，其余列按内容收窄。*/
 .cell-grow {
   width: 100%;
@@ -443,15 +445,6 @@ input[type="checkbox"] {
 
 input.invalid {
   border-color: var(--bad);
-}
-
-.fallback-row td {
-  background: var(--code-bg);
-  color: var(--muted);
-}
-
-.fallback-row:hover {
-  background: var(--code-bg);
 }
 
 .issue-list {
@@ -557,3 +550,38 @@ input.invalid {
     border-bottom: 1px solid var(--border);
   }
 }
+
+/* 设置字段旁提示：不占表单说明行，支持鼠标与键盘。 */
+.field-label-with-tip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.setting-help-wrap { position: relative; display: inline-flex; }
+.setting-help {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  padding: 0 3px;
+  min-height: 24px;
+  cursor: help;
+}
+.setting-tooltip {
+  position: absolute;
+  top: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 20;
+  width: 260px;
+  max-width: 70vw;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: 0 3px 12px #0002;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: normal;
+}
+.setting-tooltip[hidden] { display: none; }

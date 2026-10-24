@@ -15,15 +15,11 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from r_proxy.rules.glob import GlobPattern
 from r_proxy.rules.model import ZONE_ID_SEPARATOR, IPAddress, PatternKind, parse_ip
 
-# 单条正则的长度上限。ReDoS 的最坏耗时随模式复杂度增长，限制长度是编译期
-# 唯一能做的事——Python 的 re 不支持匹配超时。
+# 所有条件（含规范化产物）的统一长度上限。
 MAX_PATTERN_LENGTH = 1000
-
-# 嵌套量词的启发式检测：``(a+)+``、``(x*)*`` 一类。只告警不阻断——判定不可能
-# 精确，误杀合法正则的代价比放过一条可疑正则更大。匹配侧另有输入长度上限。
-NESTED_QUANTIFIER = re.compile(r"\([^()]*[+*]\)[+*]")
 
 # `host:port` 的形状。带方括号的 IPv6 也要覆盖，否则 `[2001:db8::1]:443`
 # 会漏网。
@@ -34,7 +30,11 @@ _APEX_WILDCARD = re.compile(r"\A\*\.([^*]+)\Z")
 
 
 class ConditionError(Exception):
-    """条件无法编译。调用方补上 ``rules[i]`` 位置后转成 ``ValidationIssue``。"""
+    """条件无法编译；错误码供加载、Web 与只读盘点共用。"""
+
+    def __init__(self, message: str, *, code: str = "E_RULE_CONDITION") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,7 +45,7 @@ class Pattern:
     suffix: str | None = None
     exact: str | None = None
     address: IPAddress | None = None
-    regex: re.Pattern[str] | None = None
+    regex: GlobPattern | None = None
 
     def fields(self) -> dict[str, object]:
         """构造 :class:`~r_proxy.rules.model.Rule` 时展开用。"""
@@ -57,84 +57,92 @@ class Pattern:
         }
 
 
-def classify(text: str) -> Pattern:
-    """识别条件类型。
-
-    正则先于 IP 与域名判定：``^`` 与 ``/`` 都不是合法的主机名字符，先判正则
-    不会抢走其他类型。IP 先于域名：``127.0.0.1`` 能被 ``ip_address`` 解析，
-    落到域名分支会变成一条永不匹配的精确主机规则。
-
-    **端口检测必须排在 IP 与通配符之后。** 冒号在 IPv6 里是合法字符：提前到
-    IP 之前会让 ``2001:db8::1`` 报「带端口」，提前到通配符之前会让
-    ``2001:db8:*`` 与 ``fd00:*`` 同样报错。
-    """
+def normalize_condition(text: str) -> str:
+    """与请求规范化保持一致；保留普通 glob 的类型，避免 **.host 变为后缀特例。"""
+    text = text.strip()
     if not text:
         raise ConditionError("条件不能为空")
+    if len(text) > MAX_PATTERN_LENGTH:
+        raise ConditionError(f"条件超过 {MAX_PATTERN_LENGTH} 字符上限")
+    if text.startswith("^") or text.startswith("/"):
+        raise ConditionError(
+            "不再支持正则规则，请改为精确 host 或 * 通配符", code="E_RULE_REGEX_UNSUPPORTED"
+        )
+    if any(char.isspace() or ord(char) < 33 or ord(char) == 127 for char in text):
+        raise ConditionError("条件不能包含空白或控制字符")
+    if "/" in text or "@" in text:
+        raise ConditionError("条件只匹配主机名，不能包含 URL、路径或用户信息")
+    if text.startswith("["):
+        if text.endswith("]"):
+            return str(_address(text[1:-1], bracketed=True))
+        if "]:" in text:
+            raise ConditionError("条件只匹配主机名，不能带端口")
+        raise ConditionError("IPv6 地址的方括号未闭合")
+    had_tail_dot = text.endswith(".")
+    text = text.rstrip(".").lower()
+    if not text:
+        raise ConditionError("条件不能为空")
+    if had_tail_dot and set(text) == {"*"}:
+        raise ConditionError("域名后缀不完整，请填写 *.example.com 这样的完整条件")
+    if len(text) > MAX_PATTERN_LENGTH:
+        raise ConditionError(f"规范化后的条件超过 {MAX_PATTERN_LENGTH} 字符上限")
+    if (addr := _try_address(text)) is not None:
+        return str(addr)
+    return text
 
+
+def classify(text: str) -> Pattern:
+    """识别可验证条件；纯数字IPv4前缀与域名/普通星号语义分离。"""
+    text = normalize_condition(text)
     if text == "*":
         return Pattern(PatternKind.ANY)
-
-    if text.startswith("^"):
-        return Pattern(PatternKind.REGEX, regex=_compile_regex(text))
-    if len(text) >= 2 and text.startswith("/") and text.endswith("/"):
-        return Pattern(PatternKind.REGEX, regex=_compile_regex(text[1:-1]))
-
-    # 方括号明示了意图是 IPv6。解析失败必须报错而非退化为域名：退化会让写错
-    # 的地址变成一条永不匹配的规则，静默失效且极难发现。
-    if text.startswith("[") and text.endswith("]"):
-        return Pattern(PatternKind.IP_LITERAL, address=_address(text[1:-1], bracketed=True))
-
     if (addr := _try_address(text)) is not None:
         return Pattern(PatternKind.IP_LITERAL, address=addr)
-
-    if (apex := _APEX_WILDCARD.match(text)) is not None:
-        return Pattern(PatternKind.DOMAIN_SUFFIX, suffix=apex.group(1).lower())
     if "*" in text:
+        if text[0] in "0123456789" and "." in text and set(text) <= set("0123456789.*"):
+            _validate_ipv4_wildcard(text)
+            return Pattern(PatternKind.IPV4_WILDCARD, regex=compile_wildcard(text))
+        if ":" in text and any(c not in "0123456789abcdef:.*" for c in text):
+            raise ConditionError("条件只匹配主机名，不能带端口")
+        if (apex := _APEX_WILDCARD.match(text)) is not None:
+            if ":" in apex.group(1):
+                raise ConditionError("域名后缀不能包含端口或 IPv6 地址")
+            return Pattern(PatternKind.DOMAIN_SUFFIX, suffix=apex.group(1))
         return Pattern(PatternKind.WILDCARD, regex=compile_wildcard(text))
-
     if _PORT_SUFFIX.match(text):
         raise ConditionError("条件只匹配主机名，不能带端口")
     if ":" in text:
         raise ConditionError("含冒号但不是合法的 IP 地址；IPv6 请用方括号包裹")
+    return Pattern(PatternKind.EXACT_HOST, exact=text)
 
-    return Pattern(PatternKind.EXACT_HOST, exact=text.lower())
+
+def _validate_ipv4_wildcard(text: str) -> None:
+    if text.count(".") > 3 or ".." in text:
+        raise ConditionError("IPv4前缀最多四段，不能包含空段")
+    fixed = [part for part in text.split(".") if "*" not in part]
+    # 首个星号前的部分也是首个/当前IPv4段的必需前缀。
+    fixed.extend(part for part in text.split("*", 1)[0].split(".") if part)
+    for part in fixed:
+        if len(part) > 3 or int(part) > 255 or (len(part) > 1 and part[0] == "0"):
+            raise ConditionError("IPv4前缀固定数字段必须为0～255且不能有前导零")
 
 
-def compile_wildcard(text: str) -> re.Pattern[str]:
-    """``*`` 展开为 ``.*``，其余字符一律字面转义，首尾锚定。
-
-    ``*`` 展开为 ``.*`` 而非 ``[^.]*``：``192.168.*`` 必须能匹配
-    ``192.168.1.10``，星号要能跨越点号。
-
-    锚定放进模式而不是让调用方改用 ``fullmatch``：WILDCARD 与 REGEX 共用
-    ``linear_rules`` 桶，匹配时统一调 ``search()``，桶内因此不需要按 kind 分支。
-
-    逐字符 ``re.escape`` 而非 ``fnmatch.translate``：后者把 ``?`` 与 ``[seq]``
-    也当元字符，且 ``*`` 的实现细节随版本变动。自己转译才能保证「除 ``*`` 外
-    一律字面」这条写进文档的承诺。
-    """
-    body = "".join(".*" if ch == "*" else re.escape(ch) for ch in text.lower())
-    return re.compile(rf"\A{body}\Z")
+def compile_wildcard(text: str) -> GlobPattern:
+    """星号唯一元字符，返回不使用 Python 正则的整串匹配器。"""
+    return GlobPattern(re.sub(r"\*+", "*", text.lower()))
 
 
 def looks_risky(pattern: Pattern, text: str) -> bool:
-    """是否值得给一条 ReDoS 告警。只对用户手写的正则判断。"""
-    return pattern.kind is PatternKind.REGEX and NESTED_QUANTIFIER.search(text) is not None
-
-
-def _compile_regex(pattern: str) -> re.Pattern[str]:
-    if len(pattern) > MAX_PATTERN_LENGTH:
-        raise ConditionError(f"正则超过 {MAX_PATTERN_LENGTH} 字符上限")
-    try:
-        return re.compile(pattern)
-    except re.error as exc:
-        raise ConditionError(f"正则语法错误: {exc}") from exc
+    """兼容旧诊断调用；新语法没有可执行的用户正则。"""
+    return False
 
 
 def _address(text: str, *, bracketed: bool) -> IPAddress:
     if (addr := _try_address(text)) is None:
         hint = "方括号内不是合法的 IPv6 地址" if bracketed else "不是合法的 IP 地址"
         raise ConditionError(f"{hint}: {text}")
+    if bracketed and addr.version != 6:
+        raise ConditionError("方括号仅用于 IPv6 地址")
     return addr
 
 

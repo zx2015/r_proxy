@@ -8,9 +8,6 @@ from __future__ import annotations
 from r_proxy.rules.loader import (
     E_CONDITION,
     W_CATCH_ALL,
-    W_DUPLICATE,
-    W_REDOS,
-    W_SHADOWED,
     RuleRow,
     compile_rules,
     load_rules,
@@ -48,7 +45,7 @@ class TestCompilation:
             rows(("[2001:db8::zz]", "a"), ("^(unclosed", "a"), ("ok.com:8443", "a"))
         )
         assert [i.location for i in result.errors] == ["rules[0]", "rules[1]", "rules[2]"]
-        assert {i.code for i in result.errors} == {E_CONDITION}
+        assert {i.code for i in result.errors} == {E_CONDITION, "E_RULE_REGEX_UNSUPPORTED"}
 
     def test_empty_input_is_valid(self) -> None:
         result = compile_rules([])
@@ -59,66 +56,53 @@ class TestCompilation:
         result = compile_rules(rows(("*.a.com", "proxy-a"), ("*.b.com", "direct")))
         assert result.rule_set.targets() == {"proxy-a": "rules[0]", "direct": "rules[1]"}
 
-    def test_redos_warns_but_keeps_the_rule(self) -> None:
+    def test_legacy_regex_cannot_enter_new_rule_set(self) -> None:
         result = compile_rules(rows(("^(a+)+$", "direct")))
-        assert result.ok
-        assert [i.code for i in result.issues] == [W_REDOS]
-        assert len(result.rule_set.rules) == 1
+        assert not result.ok
+        assert [i.code for i in result.issues] == ["E_RULE_REGEX_UNSUPPORTED"]
+        assert result.rule_set.is_empty
 
 
-class TestShadowing:
+class TestMutualExclusion:
     def test_catch_all_warns_on_itself(self) -> None:
         result = compile_rules(rows(("*", "direct")))
+        assert result.ok
         assert [(i.code, i.location) for i in result.issues] == [(W_CATCH_ALL, "rules[0]")]
 
-    def test_everything_after_catch_all_is_shadowed(self) -> None:
-        """M5-17：首匹配胜出，`*` 之后的规则永远轮不到。"""
-        result = compile_rules(rows(("*", "direct"), ("*.a.com", "proxy-a")))
-        assert [(i.code, i.location) for i in result.issues] == [
-            (W_CATCH_ALL, "rules[0]"),
-            (W_SHADOWED, "rules[1]"),
-        ]
+    def test_catch_all_conflicts_with_other_rule_in_any_order(self) -> None:
+        for pairs in [
+            (("*", "direct"), ("*.a.com", "proxy-a")),
+            (("*.a.com", "proxy-a"), ("*", "direct")),
+        ]:
+            result = compile_rules(rows(*pairs))
+            assert [issue.code for issue in result.errors] == ["E_RULE_OVERLAP"]
+            assert result.errors[0].conflict is not None
 
-    def test_duplicate_points_at_the_later_one(self) -> None:
-        """M5-17：顺序语义反转后，不生效的是**后**出现的那条。"""
+    def test_duplicate_includes_both_rule_locations(self) -> None:
         result = compile_rules(rows(("*.example.com", "proxy-a"), ("*.example.com", "direct")))
-        assert [(i.code, i.location) for i in result.issues] == [(W_DUPLICATE, "rules[1]")]
-        assert "rules[0]" in result.issues[0].message
+        assert [(i.code, i.location) for i in result.errors] == [("E_RULE_DUPLICATE", "rules[1]")]
+        assert result.errors[0].conflict["related_location"] == "rules[0]"
 
-    def test_ipv6_written_two_ways_counts_as_a_duplicate(self) -> None:
+    def test_ipv6_written_two_ways_counts_as_duplicate(self) -> None:
         result = compile_rules(rows(("[2001:db8::1]", "a"), ("[2001:0db8:0:0:0:0:0:1]", "b")))
-        assert [i.code for i in result.issues] == [W_DUPLICATE]
+        assert [i.code for i in result.errors] == ["E_RULE_DUPLICATE"]
 
-    def test_suffix_shadows_a_more_specific_host_beneath_it(self) -> None:
-        result = compile_rules(rows(("*.example.com", "proxy-a"), ("api.example.com", "direct")))
-        assert [(i.code, i.location) for i in result.issues] == [(W_SHADOWED, "rules[1]")]
-
-    def test_suffix_shadows_a_narrower_suffix(self) -> None:
-        result = compile_rules(rows(("*.example.com", "a"), ("*.api.example.com", "b")))
-        assert [i.code for i in result.issues] == [W_SHADOWED]
-
-    def test_a_more_specific_rule_placed_first_is_fine(self) -> None:
-        """这正是首匹配胜出下的正确写法，不该有任何告警。"""
-        result = compile_rules(rows(("api.example.com", "direct"), ("*.example.com", "proxy-a")))
-        assert result.issues == []
-
-    def test_unrelated_suffixes_do_not_shadow(self) -> None:
+    def test_unrelated_suffixes_do_not_conflict(self) -> None:
         result = compile_rules(rows(("*.example.com", "a"), ("notexample.com", "b")))
-        assert result.issues == []
+        assert result.ok
 
-    def test_ip_literal_is_not_shadowed_by_a_suffix(self) -> None:
-        """匹配器对 IP 走地址比较分支，`*.1.10` 不可能命中 192.168.1.10。"""
+    def test_ip_literal_is_not_matched_by_a_suffix(self) -> None:
         result = compile_rules(rows(("*.1.10", "a"), ("192.168.1.10", "b")))
-        assert result.issues == []
+        assert result.ok
 
-    def test_regex_shadowing_is_not_reported(self) -> None:
-        """M5-18：正则包含关系不可判定，宁可漏报也不误报。"""
+    def test_regex_does_not_bypass_conflict_analysis(self) -> None:
         result = compile_rules(rows((r"^.*\.example\.com$", "a"), ("api.example.com", "b")))
-        assert result.issues == []
+        assert not result.ok
+        assert result.errors[0].code == "E_RULE_REGEX_UNSUPPORTED"
 
-    def test_wildcard_shadowing_is_not_reported(self) -> None:
+    def test_wildcard_overlap_is_reported(self) -> None:
         result = compile_rules(rows(("*.example.*", "a"), ("api.example.com", "b")))
-        assert result.issues == []
+        assert [i.code for i in result.errors] == ["E_RULE_OVERLAP"]
 
 
 class TestLoad:

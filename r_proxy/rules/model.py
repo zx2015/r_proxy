@@ -8,12 +8,13 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from ipaddress import IPv4Address, IPv6Address, ip_address
 from types import MappingProxyType
+
+from r_proxy.rules.glob import GlobPattern
 
 IPAddress = IPv4Address | IPv6Address
 
@@ -36,26 +37,27 @@ def parse_ip(text: str) -> IPAddress | None:
 class PatternKind(Enum):
     ANY = auto()  # *
     DOMAIN_SUFFIX = auto()  # *.example.com，含 apex
-    WILDCARD = auto()  # 192.168.*，* 可在任意位置
+    WILDCARD = auto()  # 普通字符串通配符，* 可在任意位置
+    IPV4_WILDCARD = auto()  # 纯数字IPv4前缀，只匹配合法IPv4字面量
     EXACT_HOST = auto()  # api.github.com
     IP_LITERAL = auto()  # 192.168.1.10 / [2001:db8::1]
-    REGEX = auto()  # ^cdn\d+\. 或 /.../
+    REGEX = auto()  # 仅保留历史类型标识；新条件识别器拒绝正则。
 
 
 @dataclass(frozen=True, slots=True)
 class Rule:
-    """一条已编译的规则。``position`` 决定优先级——数值**小**者胜。"""
+    """一条已编译的规则。``position`` 仅定位当前快照，不参与决策。"""
 
     position: int
     kind: PatternKind
     raw: str
     target: str
 
-    # 按 kind 使用其中之一。WILDCARD 与 REGEX 共用 regex。
+    # 按 kind 使用其中之一；保留 regex 字段名兼容，但仅承载受控 GlobPattern。
     suffix: str | None = None
     exact: str | None = None
     address: IPAddress | None = None
-    regex: re.Pattern[str] | None = None
+    regex: GlobPattern | None = None
 
     @property
     def location(self) -> str:
@@ -80,7 +82,10 @@ class Rule:
             return ("exact", self.exact or "")
         if self.kind is PatternKind.IP_LITERAL:
             return ("ip", str(self.address))
-        kind = "wildcard" if self.kind is PatternKind.WILDCARD else "regex"
+        kind = {
+            PatternKind.WILDCARD: "wildcard",
+            PatternKind.IPV4_WILDCARD: "ipv4_wildcard",
+        }.get(self.kind, "regex")
         return (kind, self.regex.pattern if self.regex is not None else self.raw)
 
 
@@ -102,13 +107,12 @@ class RuleMatch:
 class RuleSet:
     """编译后的规则集。通过 :meth:`build` 构造，它负责分桶索引的计算。"""
 
-    rules: tuple[Rule, ...]  # 按 position 升序
+    rules: tuple[Rule, ...]  # 保留输入快照位置，不代表优先级
     any_rules: tuple[Rule, ...] = ()
     exact_index: Mapping[str, tuple[Rule, ...]] = field(default_factory=dict, compare=False)
     suffix_index: Mapping[str, tuple[Rule, ...]] = field(default_factory=dict, compare=False)
     ip_index: Mapping[IPAddress, tuple[Rule, ...]] = field(default_factory=dict, compare=False)
-    # WILDCARD + REGEX：都无法用哈希索引，都靠 pattern.search() 逐条求值。
-    # 合并成一个按 position 升序的桶，才能实现匹配时的提前退出。
+    # 普通星号模式逐项查找，互斥校验保证遍历顺序不影响命中结果。
     linear_rules: tuple[Rule, ...] = ()
 
     @classmethod
@@ -131,7 +135,7 @@ class RuleSet:
                 case PatternKind.IP_LITERAL:
                     if rule.address is not None:
                         ip.setdefault(rule.address, []).append(rule)
-                case PatternKind.WILDCARD | PatternKind.REGEX:
+                case PatternKind.WILDCARD | PatternKind.IPV4_WILDCARD | PatternKind.REGEX:
                     linear.append(rule)
 
         return cls(

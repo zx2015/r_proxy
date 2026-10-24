@@ -430,7 +430,7 @@ class TestForcedRouting:
         snap = make_snapshot(upstream("b"))
         state = RuntimeState.from_snapshot(snap)
         decision = router.build_chain(
-            target(), snap, rules(("api.other.com", "b"), ("*", "b")), state, now=0.0
+            target(), snap, rules(("api.other.com", "b"), ("*.example.com", "b")), state, now=0.0
         )
         assert decision.rule_position == 1
 

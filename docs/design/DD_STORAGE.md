@@ -2,6 +2,8 @@
 
 | 版本 | 日期 | 变更说明 | 作者 |
 | :--- | :--- | :--- | :--- |
+| v1.15.1 | 2026-10-24 | 互斥规则存储契约已实现：条件规范化及ASCII稳定字母序、position仅快照位置，读取不改写历史数据 | Agent |
+| v1.15.0 | 2026-10-24 | 新增 §11 互斥规则的目标存储契约：按字母显式读取、position 降为兼容展示位置、全量分析通过后才规范化写入，保留旧 schema 和历史日志 | Agent |
 | v1.14.0 | 2026-10-22 | 写入错误恢复细化：批量 `executemany` 遇到 `IntegrityError` 时回滚后按原操作顺序逐条隔离，跳过违反约束的单行并提交同批有效行；锁、磁盘等其他 SQLite 错误仍整批回滚且不重试，避免阻塞队列 | Agent |
 | v1.13.0 | 2026-10-22 | 代码评审修复：`logs.db` schema 3 → 4，新增 `_LOGS_V4`（只加索引，不动表结构）。三条索引各自对应一条实测过的慢查询——状态码下拉的候选集（46ms → 6.7ms）、请求日志与流量统计的联表（138ms → 0.1ms）、切换事件流（50ms → 31ms）。详见新增的 §3.2.1 | Agent |
 | v1.12.0 | 2026-09-30 | 代码评审修复：`route_block_upsert`/`sticky_upsert` 的 `fail_count`/`hit_count` 补 `delta_slots`（新增 `fail_count_delta`/`hit_delta` 参数，默认 1），SQL 由 `route_block.fail_count + 1`/`host_upstream.hit_count + 1` 改为 `+ excluded.fail_count`/`+ excluded.hit_count`；此前同批次内同一 `(host, upstream)`/同一 host 被多次写入时，合并只留最后一条，计数会比实际少（§4.4、§4.4a） | Agent |
@@ -1121,3 +1123,24 @@ Web 界面只回答「现在怎么样」。长期后台运行还需要回答「�
 批次合并只压缩相邻的同主键、同类型操作。不能把非相邻的 `HIT → UPSERT → HIT` 合并成 `HIT(2) → UPSERT`，否则首次 HIT 的 UPDATE 会早于 UPSERT，目标行不存在而静默少计。DELETE 仍会抹除此前同键操作，之后的写入保持在 DELETE 之后。
 
 `config_audit` 与 `request_log`、`traffic_log` 共用 `database.retention_days` 和 `database.max_log_rows`。定时清理在日志写者线程的事务中先按时间删除，再裁剪到最大行数，保证审计数据也有界。
+
+## 11. 互斥规则存储契约（已实现，生产待迁移）
+
+本节实施后优先于 §4.8 中“position 表示匹配优先级”和“数组按输入顺序落盘”的旧描述。完整需求与算法见 [RULES_CONFIG §11](../requirements/RULES_CONFIG.md#11-互斥规则与无优先级匹配目标需求)、[DD_RULES §11](./DD_RULES.md#11-互斥规则与无优先级匹配目标设计)。
+
+- `rules.db` 继续使用现有规则表、rule_meta/revision 和配置写入器唯一写者，不引入第二个写库入口。
+- 第一阶段保留 position 和现有 RuleRow 接口形状；其值改为成功保存后的规范字母序位置，不参与路由决策。物理行顺序无意义；读取显式使用 `ORDER BY condition COLLATE NOCASE, condition COLLATE BINARY, id`。
+- 完整候选集合在写锁内完成与输入顺序无关的交集检查；保留输入索引用于失败定位。通过后才规范排序、备份及 BEGIN IMMEDIATE 整表替换，事务内继续校验 revision 并自增。
+- 冲突、正则不支持或校验未完成均不能触发规则备份和写事务。SQL UNIQUE 约束不能替代通配符交叠检查。
+- 不自动迁移或删除历史正则，不先重排旧的有序规则库；语义切换前先完成只读盘点和清理，再一并发布新引擎与规范排序读写。
+- 历史日志 `rules[n]` 仍表示产生该日志时的快照位置，不宣称其为跨 revision 的稳定规则 ID；本阶段不改写历史日志或为此引入永久 ID。
+
+验证需覆盖排列无关的保存结果、失败时库/revision/备份不变、显式字母查询、已有 schema 可读取及旧库迁移前不被重排。
+
+### 11.1 实现状态更新
+
+§11 已在 `RulesStore` 与 ConfigWriter 落地：成功写入前规范化并按 ASCII 折叠/原文次级排序；读取以显式 SQL 字母序返回并重新枚举展示位置。历史读取不迁移、不写库。revision锁、失败无副作用和字母序位置已由存储/API测试覆盖。生产旧库尚未重排，切换前置条件见 [DD_RULES §12](./DD_RULES.md#12-v30-实现回填与部署前置条件)。
+
+### 11.2 正式上线状态
+
+用户确认IPv4专用通配符后，原388条规则无需迁移表结构或重写条件即可通过新校验。正式容器已上线，数据库revision445及原逻辑内容摘要在升级前后不变；字母排序仅由显式读取和当前快照位置提供。此前待迁移状态已解除，详见 [DD_RULES §13.1](./DD_RULES.md#131-实现历史配置复核与正式上线)。

@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 from fastapi import APIRouter, HTTPException, Request
@@ -80,7 +81,7 @@ async def validate_rules(body: RulesValidateRequest, writer: WriterDep) -> Rules
     """
     rules = [(row.condition, row.upstream) for row in body.rules]
     try:
-        issues = writer.validate_rules(rules)
+        issues = await asyncio.to_thread(writer.validate_rules, rules)
     except ConfigInvalid as exc:
         return RulesValidateResponse(
             ok=False,

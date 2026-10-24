@@ -59,7 +59,7 @@ const AUDIT_ACTIONS = [
 
 const nodes = {};
 const fields = {};
-const state = { version: null, dirty: false, statusBoxes: new Map(), auditPage: 1 };
+const state = { version: null, dirty: false, statusBoxes: new Map(), auditPage: 1, stickyTtlSeconds: 0, stickyTtlHours: "0" };
 
 function mount(root) {
   nodes.notice = el("div", { hidden: true });
@@ -158,10 +158,13 @@ async function refresh() {
 function renderForm(settings) {
   const r = settings.routing;
   const d = settings.storage;
+  state.stickyTtlSeconds = r.sticky_ttl;
+  state.stickyTtlHours = String(r.sticky_ttl / 3600);
   const spec = [
     ["connect_timeout", "连接超时（秒）", { type: "number", step: "0.1", min: 0.1, max: 300 }, r.connect_timeout],
     ["read_timeout", "读超时（秒）", { type: "number", step: "0.1", min: 0.1, max: 3600 }, r.read_timeout],
     ["sticky_fail_threshold", "粘性失败阈值", { type: "number", min: 1, max: 100 }, r.sticky_fail_threshold],
+    ["sticky_ttl", "自动粘性映射有效期（小时）", { type: "number", min: 0, max: 8760, step: "any" }, state.stickyTtlHours],
     ["route_block_ttl", "负面记忆有效期（秒）", { type: "number", min: 1, max: 86400 }, r.route_block_ttl],
     ["tunnel_probe_window", "隧道早夭窗口（秒）", { type: "number", step: "0.1", min: 0.1, max: 300 }, r.tunnel_probe_window],
     ["max_switches_per_host", "每 host 最大切换次数", { type: "number", min: 1, max: 1000 }, r.status_switch_rate_limit.max_switches_per_host],
@@ -174,9 +177,9 @@ function renderForm(settings) {
   ];
 
   const grid = el("div", { class: "form-grid" });
-  for (const [name, label, attrs, value] of spec) {
+  for (const [name, label, attrs, value, hint] of spec) {
     fields[name] = input(`set-${name}`, { ...attrs, value });
-    grid.appendChild(field(label, fields[name]));
+    grid.appendChild(name === "sticky_ttl" ? stickyTtlField(label, fields[name]) : field(label, fields[name], hint));
   }
   fields.circuit_breaker_enabled = input("set-circuit_breaker_enabled", {
     type: "checkbox",
@@ -196,6 +199,39 @@ function renderForm(settings) {
       text("span", `当前配置版本 ${settings.config_version}`, { class: "muted" }),
     ]),
   );
+}
+
+function stickyTtlField(label, control) {
+  const tip = text("span", "0 表示永不过期；720 小时为 30 天。仅影响自动映射，成功使用后重新计时；手动绑定不受影响。", {
+    id: "sticky-ttl-tip", class: "setting-tooltip", role: "tooltip", hidden: true,
+  });
+  const help = el("button", {
+    id: "sticky-ttl-help", type: "button", class: "setting-help",
+    "aria-label": "自动粘性映射有效期说明", "aria-describedby": "sticky-ttl-tip",
+    "aria-expanded": "false",
+  }, ["ⓘ"]);
+  const wrapper = el("span", { class: "setting-help-wrap" }, [help, tip]);
+  let pinned = false;
+  const show = (open) => {
+    tip.hidden = !open;
+    help.ariaExpanded = String(open);
+  };
+  wrapper.addEventListener("pointerenter", () => show(true));
+  wrapper.addEventListener("pointerleave", () => {
+    if (!pinned && document.activeElement !== help) show(false);
+  });
+  wrapper.addEventListener("focusin", () => show(true));
+  wrapper.addEventListener("focusout", (event) => {
+    if (!wrapper.contains(event.relatedTarget)) { pinned = false; show(false); }
+  });
+  help.addEventListener("click", () => { pinned = !pinned; show(pinned); });
+  wrapper.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") { pinned = false; show(false); event.preventDefault(); }
+  });
+  return el("div", { class: "field" }, [
+    el("div", { class: "field-label-with-tip" }, [text("label", label, { for: control.getAttribute("id") }), wrapper]),
+    control,
+  ]);
 }
 
 function renderStatusCodes(selected) {
@@ -298,11 +334,19 @@ async function submit() {
     return;
   }
 
+  const hoursText = fields.sticky_ttl.value;
+  const hours = Number(hoursText);
+  const seconds = hoursText === state.stickyTtlHours ? state.stickyTtlSeconds : Math.round(hours * 3600);
+  if (hoursText.trim() === "" || !Number.isFinite(hours) || hours < 0 || hours > 8760 || (hours > 0 && seconds < 1)) {
+    notify(nodes.notice, "bad", "自动粘性映射有效期须为 0～8760 小时；0 表示永不过期，正数至少为 1 秒。");
+    return;
+  }
   const body = { config_version: state.version, switch_on_status: codes };
   for (const [name, control] of Object.entries(fields)) {
-    if (name === "extra_status") continue;
+    if (name === "extra_status" || name === "sticky_ttl") continue;
     body[name] = control.type === "checkbox" ? control.checked : Number(control.value);
   }
+  body.sticky_ttl = seconds;
   try {
     const result = await api.updateSettings(body);
     state.version = result.config_version;

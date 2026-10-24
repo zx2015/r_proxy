@@ -52,6 +52,7 @@ class ValidationIssue:
     code: str
     message: str
     location: str | None = None
+    conflict: dict[str, str] | None = None
 
 
 def validate(
@@ -317,14 +318,18 @@ def _check_routing(s: ConfigSnapshot, issues: list[ValidationIssue]) -> None:
     if r.sticky_fail_threshold <= 0:
         issues.append(
             ValidationIssue(
-                "error", "E_STICKY_FAIL_THRESHOLD", "sticky_fail_threshold 必须大于 0",
+                "error",
+                "E_STICKY_FAIL_THRESHOLD",
+                "sticky_fail_threshold 必须大于 0",
                 "routing.sticky_fail_threshold",
             )
         )
     if r.switch_buffer_bytes < 0:
         issues.append(
             ValidationIssue(
-                "error", "E_SWITCH_BUFFER_NEGATIVE", "switch_buffer_bytes 不能为负数",
+                "error",
+                "E_SWITCH_BUFFER_NEGATIVE",
+                "switch_buffer_bytes 不能为负数",
                 "routing.switch_buffer_bytes",
             )
         )

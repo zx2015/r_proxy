@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import threading
 import time
 import tomllib
 from collections.abc import AsyncIterator, Callable
@@ -743,6 +744,61 @@ class TestAuditMasking:
 class TestRules:
     """整表读写。验收点 M5-11 ~ M5-17、M5-21。"""
 
+    async def test_preflight_and_save_compile_outside_the_event_loop(
+        self, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        event_thread = threading.get_ident()
+        seen_threads: list[int] = []
+        original = config_writer.compile_rules
+
+        def observed(rows):  # type: ignore[no-untyped-def]
+            seen_threads.append(threading.get_ident())
+            return original(rows)
+
+        monkeypatch.setattr(config_writer, "compile_rules", observed)
+        rules = [{"condition": "a.example", "upstream": "direct"}]
+        preflight = await client.post("/api/rules/validate", json={"rules": rules})
+        saved = await client.put("/api/rules", json={"revision": 1, "rules": rules})
+        assert preflight.json()["ok"] is True
+        assert saved.status_code == 200
+        assert len(seen_threads) == 2
+        assert all(thread_id != event_thread for thread_id in seen_threads)
+
+    @pytest.mark.parametrize("upstream", ["direct", "proxy-a"])
+    @pytest.mark.parametrize("reverse", [False, True])
+    async def test_partial_overlap_is_rejected_without_any_side_effects(
+        self, client: httpx.AsyncClient, app: Application, upstream: str, reverse: bool
+    ) -> None:
+        rules = [
+            {"condition": "api-*.example.com", "upstream": "direct"},
+            {"condition": "*-prod.example.com", "upstream": upstream},
+        ]
+        if reverse:
+            rules.reverse()
+        before = app.rules_store.read()
+        active_rules = app.rules
+        backups_before = list(app.snapshot.database.rules_path.parent.glob("backups/*"))
+        response = await client.put(
+            "/api/rules", json={"revision": before.revision, "rules": rules}
+        )
+        assert response.status_code == 400
+        overlap = next(
+            i for i in response.json()["error"]["details"] if i["code"] == "E_RULE_OVERLAP"
+        )
+        assert {overlap["location"], overlap["conflict"]["related_location"]} == {
+            "rules[0]",
+            "rules[1]",
+        }
+        witness = overlap["conflict"]["example_host"]
+        assert witness.startswith("api-") and witness.endswith("-prod.example.com")
+        assert app.rules_store.read() == before
+        assert app.rules is active_rules
+        assert list(app.snapshot.database.rules_path.parent.glob("backups/*")) == backups_before
+        assert (
+            await asyncio.to_thread(app.storage.logs_reader.query, "SELECT * FROM config_audit")
+            == []
+        )
+
     async def test_the_table_is_returned_with_its_revision(self, client: httpx.AsyncClient) -> None:
         body = (await client.get("/api/rules")).json()
         assert body["rules"] == [{"condition": "*.pinned.test", "upstream": "proxy-a"}]
@@ -766,6 +822,41 @@ class TestRules:
         finally:
             await instance.stop()
 
+    async def test_disabled_legacy_rules_remain_readable_but_cannot_be_saved(
+        self, tmp_path: Path
+    ) -> None:
+        path = write_files(tmp_path)
+        path.write_text(path.read_text() + "\n[rules]\nenabled = false\n")
+        with sqlite3.connect(tmp_path / "rules.db") as conn:
+            conn.execute(
+                "INSERT INTO rule (position, condition, upstream, updated_at) "
+                "VALUES (9, '^legacy', 'direct', 0)"
+            )
+        instance = Application(config_path=path)
+        await instance.start()
+        try:
+            async with _client_for(instance) as c:
+                loaded = (await c.get("/api/rules")).json()
+                assert loaded["enabled"] is False
+                assert {row["condition"] for row in loaded["rules"]} == {"*.pinned.test", "^legacy"}
+                changed = await c.put(
+                    "/api/settings",
+                    json={"config_version": version(instance), "connect_timeout": 8.0},
+                )
+                assert changed.status_code == 200
+                before = instance.rules_store.read()
+                rejected = await c.put(
+                    "/api/rules", json={"revision": loaded["revision"], "rules": loaded["rules"]}
+                )
+                assert rejected.status_code == 400
+                assert "E_RULE_REGEX_UNSUPPORTED" in {
+                    issue["code"] for issue in rejected.json()["error"]["details"]
+                }
+                assert instance.rules_store.read() == before
+                assert instance.rules.is_empty
+        finally:
+            await instance.stop()
+
     async def test_m5_13_a_valid_save_takes_effect(
         self, client: httpx.AsyncClient, app: Application
     ) -> None:
@@ -774,7 +865,7 @@ class TestRules:
             json={
                 "revision": 1,
                 "rules": [
-                    {"condition": "api.pinned.test", "upstream": "direct"},
+                    {"condition": "api.other.test", "upstream": "direct"},
                     {"condition": "*.pinned.test", "upstream": "proxy-a"},
                 ],
             },
@@ -782,7 +873,7 @@ class TestRules:
         assert response.status_code == 200
         assert response.json()["revision"] == 2
         await wait_until(
-            lambda: [r.raw for r in app.rules.rules] == ["api.pinned.test", "*.pinned.test"],
+            lambda: [r.raw for r in app.rules.rules] == ["*.pinned.test", "api.other.test"],
             what="规则热重载",
         )
         assert [r.position for r in app.rules.rules] == [0, 1]
@@ -807,8 +898,8 @@ class TestRules:
         )
         rows = app.rules_store.read().rows
         assert [(position, condition) for position, condition, _ in rows] == [
-            (0, "b.test"),
-            (1, "a.test"),
+            (0, "a.test"),
+            (1, "b.test"),
         ]
 
     async def test_m5_15_saving_the_same_content_twice_bumps_the_revision_each_time(
@@ -868,9 +959,10 @@ class TestRules:
         assert [d["location"] for d in details] == ["rules[1]", "rules[2]"]
         assert app.rules_store.read() == before
 
-    async def test_m5_17_warnings_do_not_block_the_save(
+    async def test_m5_17_duplicate_and_shadowing_errors_block_the_save(
         self, client: httpx.AsyncClient, app: Application
     ) -> None:
+        before = app.rules_store.read()
         response = await client.put(
             "/api/rules",
             json={
@@ -882,13 +974,24 @@ class TestRules:
                 ],
             },
         )
-        assert response.status_code == 200
-        codes = [i["code"] for i in response.json()["issues"]]
-        assert codes == ["W_RULE_CATCH_ALL", "W_RULE_SHADOWED", "W_RULE_SHADOWED"]
-        assert all(i["level"] == "warning" for i in response.json()["issues"])
-        await wait_until(lambda: len(app.rules.rules) == 3, what="规则热重载")
+        assert response.status_code == 400
+        details = response.json()["error"]["details"]
+        conflicts = [i for i in details if i["level"] == "error"]
+        assert sorted(i["code"] for i in conflicts) == [
+            "E_RULE_DUPLICATE",
+            "E_RULE_OVERLAP",
+            "E_RULE_OVERLAP",
+        ]
+        assert {
+            frozenset((i["location"], i["conflict"]["related_location"])) for i in conflicts
+        } == {
+            frozenset(("rules[0]", "rules[1]")),
+            frozenset(("rules[0]", "rules[2]")),
+            frozenset(("rules[1]", "rules[2]")),
+        }
+        assert app.rules_store.read() == before
 
-    async def test_m5_17_a_duplicate_warning_points_at_the_later_row(
+    async def test_m5_17_a_duplicate_error_identifies_both_rows(
         self, client: httpx.AsyncClient
     ) -> None:
         response = await client.post(
@@ -900,8 +1003,16 @@ class TestRules:
                 ]
             },
         )
+        assert response.status_code == 200
+        assert response.json()["ok"] is False
         issues = response.json()["issues"]
-        assert [(i["code"], i["location"]) for i in issues] == [("W_RULE_DUPLICATE", "rules[1]")]
+        assert len(issues) == 1
+        issue = issues[0]
+        assert (issue["code"], issue["level"]) == ("E_RULE_DUPLICATE", "error")
+        assert {issue["location"], issue["conflict"]["related_location"]} == {
+            "rules[0]",
+            "rules[1]",
+        }
 
     async def test_validation_alone_writes_nothing(
         self, client: httpx.AsyncClient, app: Application
