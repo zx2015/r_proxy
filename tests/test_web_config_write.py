@@ -1050,6 +1050,34 @@ class TestRules:
         snapshots = sorted((ConfigWriter(app).backup_dir).glob("rules-*"))
         assert [p.read_text(encoding="utf-8") for p in snapshots] == ["*.pinned.test\tproxy-a\n"]
 
+    async def test_reload_failure_restores_the_previous_rule_rows(
+        self, app: Application, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        before = app.rules_store.read()
+        before_rules = app.rules.rules
+        real_reload = app.reload
+        calls = 0
+
+        async def fail_once() -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("模拟候选规则重载失败")
+            await real_reload()
+
+        monkeypatch.setattr(app, "reload", fail_once)
+        with pytest.raises(RuntimeError, match="模拟候选规则重载失败"):
+            await ConfigWriter(app).write_rules(
+                [("other.test", "direct")],
+                expected_revision=before.revision,
+                actor="test",
+            )
+
+        after = app.rules_store.read()
+        assert after.rows == before.rows
+        assert after.revision == before.revision + 2
+        assert app.rules.rules == before_rules
+
     async def test_the_rules_snapshot_is_not_offered_for_restore(
         self, client: httpx.AsyncClient
     ) -> None:
@@ -1254,6 +1282,45 @@ class TestAtomicWrite:
             )
         assert config_text(app) == original
         assert app.snapshot.routing.connect_timeout == 3.0
+
+    @pytest.mark.parametrize("newline", ["\n", "\r\n"])
+    async def test_written_bytes_preserve_the_input_newlines(
+        self, app: Application, newline: str
+    ) -> None:
+        text = newline.join(("[section]", 'value = "ok"', ""))
+        path = app.snapshot.source_path
+        ConfigWriter(app)._replace(path, text)
+        assert path.read_bytes() == text.encode("utf-8")
+        assert b"\r\r\n" not in path.read_bytes()
+
+    async def test_reload_failure_restores_original_bytes_and_valid_toml(
+        self, app: Application, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = app.snapshot.source_path
+        original = path.read_bytes().replace(b"\n", b"\r\n")
+        path.write_bytes(original)
+        real_reload = app.reload
+        calls = 0
+
+        async def fail_once() -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("模拟候选配置重载失败")
+            await real_reload()
+
+        monkeypatch.setattr(app, "reload", fail_once)
+        with pytest.raises(RuntimeError, match="模拟候选配置重载失败"):
+            await ConfigWriter(app).edit_config(
+                lambda text: text.replace("connect_timeout = 3.0", "connect_timeout = 6.0"),
+                expected_version=config_writer.version_of(original),
+                actor="test",
+                action="settings.update",
+                target="config.toml",
+            )
+
+        assert path.read_bytes() == original
+        assert tomllib.loads(original.decode("utf-8"))["routing"]["connect_timeout"] == 3.0
 
     async def test_the_target_file_is_never_truncated_in_place(
         self, app: Application, monkeypatch: pytest.MonkeyPatch

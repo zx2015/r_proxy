@@ -333,7 +333,22 @@ class ConfigWriter:
             expected_revision=current.revision,
             now_unix=int(time.time()),
         )
-        await self._app.reload()
+        try:
+            await self._app.reload()
+        except Exception:
+            # SQLite 提交已经完成；若热重载失败，旧快照仍在内存中，但数据库
+            # 已是候选规则。用新 revision 做 CAS 写回旧行，再尝试同步重载。
+            try:
+                await asyncio.to_thread(
+                    self._app.rules_store.replace,
+                    [(condition, upstream) for _position, condition, upstream in current.rows],
+                    expected_revision=revision,
+                    now_unix=int(time.time()),
+                )
+                await self._app.reload()
+            except Exception:
+                logger.exception("规则重载失败后恢复旧规则也未能重载")
+            raise
         self._app.storage.queue.put(
             config_audit(
                 actor=actor,
@@ -518,12 +533,15 @@ class ConfigWriter:
         """备份 → 轮转 → 原子替换。同步执行，调用方负责放进 `to_thread`。"""
         self._backup(path)
         tmp = path.with_name(path.name + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as handle:
+        # Text mode translates ``\n`` to the platform newline on Windows. Since
+        # the input may already contain CRLF, that would persist CRCRLF. Write
+        # the exact UTF-8 representation supplied by the editor instead.
+        with open(tmp, "wb") as handle:
             # config.toml 含明文 auth_token，`open()` 按 umask 默认建出 644；
             # `os.replace` 是纯 rename，目标文件继承 tmp 的权限位，因此必须
             # 在这里限到 600，而不是指望调用方后续再补一次 chmod。
             os.fchmod(handle.fileno(), 0o600)
-            handle.write(text)
+            handle.write(text.encode("utf-8"))
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, path)
