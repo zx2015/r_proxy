@@ -19,6 +19,7 @@
 | v2.2.1 | 2026-09-24 | §10.7 看板日志表去掉 URL、尝试序号两列：URL 与 host 高度重复且占横向空间，尝试序号只在切换事件流里有诊断价值 | Agent |
 | v2.2.2 | 2026-09-24 | §4.2 `query_logs` 新增与 `traffic_log` 的联表：`request_log.bytes_up`/`bytes_down` 恒为 0（DD_STORAGE §4.9），看板「请求日志」的流量列此前直接显示这两个恒零字段，观感是「统计坏了」；改为 `LEFT JOIN (SELECT request_id, bytes_up, bytes_down FROM traffic_log)` 取真实传输量，新增 `LogItem.traffic_bytes_up`/`traffic_bytes_down`（`None` 表示这次尝试从未传输过数据或响应体仍在流式转发中，前端展示「—」而非「0 B」）。子查询只选三列，不会把 `traffic_log` 自己的 `host`/`upstream_name`/`created_at` 带进联表引发歧义；`_COLUMNS` 里的 `request_id`/`bytes_up`/`bytes_down` 相应加 `request_log.` 前缀 | Agent |
 | v2.1.6 | 2026-08-21 | §7 补充：新增 `sqlite3.OperationalError → 503` 的专用错误处理器，慢磁盘/WAL checkpoint 触发的忙锁不再落进兜底的 `500` | Agent |
+| v2.1.7 | 2026-11-10 | §6.3.3 补充规则 SQLite 提交后的热重载失败回滚：用提交 revision 做 CAS 写回旧规则并重载；失败时记录回滚错误并保留原始异常 | Agent |
 | v2.1.5 | 2026-08-18 | §6.1 补第三点：原子写的临时文件必须先 `fchmod(0o600)` 再写内容，`os.replace` 不会自动收紧权限；修复此前每次 Web 写配置都把含明文 `auth_token` 的 `config.toml` 权限从 600 重置为 644 的缺陷，备份文件同一问题一并修复。详见 [DD_DEPLOY §11.8](./DD_DEPLOY.md) | Agent |
 | v2.1.4 | 2026-08-16 | 依生产日志降噪：新增 §5.2.1「失败日志一个窗口只说两次话」，`record_failure()` 改为返回窗口内累计次数，避免一次页面加载刷五条同样的 `WARNING` | Agent |
 | v2.1.3 | 2026-08-16 | 偏差表更新：请求日志的生产端已接通，日志页与切换页不再永远为空（实现见 [DD_STORAGE §4.9](./DD_STORAGE.md)），前端未改动 | Agent |
@@ -838,6 +839,8 @@ async def insert_rule(
 | 条件重复 → `409 RULE_EXISTS`，**不写库** | 整表替换路径允许重复（只回 `W_RULE_DUPLICATE`）：编辑表格时用户看得见那两行并能自己取舍。插入路径看不见规则表，重复点两次只会在表首堆出一条让原规则永不生效的死行。比的是编译后的 `dedup_key` 而非原始文本，`[2001:0db8::1]` 与 `[2001:db8::1]` 因此算同一条 |
 
 `insert_rule` 与 `write_rules` 共用 `_commit_rules()`（校验 → 备份 → 单事务替换 → 热重载 → 审计）。两条写入路径各写一份的话，漂移的方向总是其中一条漏掉备份或审计。审计的 `action` 是 `rules.promote`、`target` 是被固化的 host，而不是整表替换用的 `rules`——事后要能回答「这条规则是谁、从哪个 host 固化来的」。
+
+热重载发生在 SQLite 提交之后，不能靠已结束的数据库事务回滚。若重载失败，写入器必须以新 revision 为 `expected_revision`，在新的 `BEGIN IMMEDIATE` 事务中恢复提交前的规则行，再尝试重载恢复后的规则；revision 单调增加，不回退。恢复或二次重载失败时记录异常，同时向调用方传播最初的候选重载异常。规则快照是人工查阅材料，不是恢复接口的输入。
 
 #### 6.3.4 重复/完全遮蔽校验的阻断时序（2026-10-24 补充）
 

@@ -540,7 +540,8 @@ class ConfigWriter:
             # config.toml 含明文 auth_token，`open()` 按 umask 默认建出 644；
             # `os.replace` 是纯 rename，目标文件继承 tmp 的权限位，因此必须
             # 在这里限到 600，而不是指望调用方后续再补一次 chmod。
-            os.fchmod(handle.fileno(), 0o600)
+            if os.name != "nt":
+                os.fchmod(handle.fileno(), 0o600)
             handle.write(text.encode("utf-8"))
             handle.flush()
             os.fsync(handle.fileno())
@@ -548,6 +549,10 @@ class ConfigWriter:
         # 对父目录 fsync 容易被漏掉：`os.replace` 保证了替换的原子性，但目录项
         # 本身的落盘要单独同步，否则断电后可能「新内容已写入而目录仍指向旧
         # inode」。
+        if os.name == "nt":
+            # Windows does not expose POSIX directory fsync. File data was
+            # flushed before replacement; permissions inherit the directory ACL.
+            return
         fd = os.open(path.parent, os.O_DIRECTORY)
         try:
             os.fsync(fd)

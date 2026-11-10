@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import resource
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -370,6 +369,10 @@ def _raise_on_errors(issues: list[ValidationIssue]) -> None:
 
 
 def _nofile_limit() -> int | None:
+    try:
+        import resource
+    except ImportError:
+        return None
     try:
         soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     except (OSError, ValueError):

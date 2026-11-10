@@ -2,6 +2,7 @@
 
 | 版本 | 日期 | 变更说明 | 作者 |
 | :--- | :--- | :--- | :--- |
+| v2.1.1 | 2026-11-10 | Web 配置原子写使用 UTF-8 二进制写入，确保 Windows 下 LF/CRLF 原样持久化，重载失败回滚逐字节还原 | Agent |
 | v1.0.0 | 2026-08-13 | 初始版本：不可变快照模型、启动校验清单、`config_version` 计算与并发修改检测、热重载引用替换 | Agent |
 | v1.1.0 | 2026-08-13 | 分歧定案：配置格式改为 TOML，读用标准库 `tomllib`、写用 `tomlkit`（§1.1 全面重写）；新增未知键拒绝（`E_UNKNOWN_KEY`）；`W_RULE_DISABLED_TARGET` 的降级理由改为「拆分条件」的正式表述并要求持续可见 | Agent |
 | v1.4.0 | 2026-08-15 | M4 切片 d 回写：新增 `load_text()`（从内存文本构建候选快照，不落盘，供 Web 写前校验）；§5.2 关键路径改为 `edit_config(transform)`——基线在锁内读、生效走 `Application.reload()` 而非 `reload_from(candidate)` | Agent |
@@ -577,6 +578,8 @@ def _atomic_write(self, text: str, previous: bytes) -> None:
 
 对父目录 `fsync` 容易被遗漏：`os.replace` 保证了原子性，但目录项本身的落盘需要单独同步，否则断电后可能出现「新文件内容已写入但目录仍指向旧 inode」。
 
+> v2.1.1 实现补充：Web `ConfigWriter._replace()` 必须以二进制模式打开临时文件，并写入 `text.encode("utf-8")`。Windows 文本模式会把已有 CRLF 中的 `\n` 再转换，产生 CRCRLF；二进制写入保证提交和重载失败后的恢复共用相同的逐字节写入路径。上方伪代码中的文本模式仅为历史示意，当前实现以此约束为准。
+
 备份策略见 [WEBUI §6.2.1](../requirements/WEBUI_SPEC.md)：保留 `backup_keep`（默认 10）份，按时间倒序淘汰。
 
 ---
@@ -730,3 +733,9 @@ load(path, cli_overrides) -> ConfigSnapshot
 | `config` 包导入 `storage` 或查库 | 架构守卫失败（`rule_targets` 由调用方注入） | — |
 | 重载期间持续请求 | 无请求读到半更新配置 | CC-05 |
 | `asdict()` 序列化上级代理 | 不含 `password` 明文 | — |
+
+## Linux 与 Windows 11 兼容（2026-11-10）
+
+Windows 下资源上限检测不依赖 resource 模块；无法获取 RLIMIT_NOFILE 时跳过相应告警。配置写入在两平台均使用 UTF-8 二进制临时文件、flush/fsync 与 os.replace。Linux 保留 fchmod(0600) 与父目录 fsync；Windows 跳过 Unix 专用调用，文件访问权限继承父目录 NTFS ACL，部署者须限制配置和备份目录仅服务账户与管理员可访问。Windows 不承诺 POSIX 父目录 fsync 的断电持久性。
+
+Linux 继续使用 asyncio 信号处理及 SIGHUP 重载；Windows 使用标准 SIGINT/SIGTERM 回调通过 call_soon_threadsafe 请求优雅停止，退出时恢复原处理器。Windows 热重载使用 WebUI/API；强制结束进程不保证优雅排空。

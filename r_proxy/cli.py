@@ -12,6 +12,7 @@ import os
 import signal
 import sys
 from pathlib import Path
+from typing import Any
 
 from r_proxy import __version__
 from r_proxy.app import Application, StartupError
@@ -122,10 +123,19 @@ async def _serve(app: Application) -> None:
     loop = asyncio.get_running_loop()
     reload_requested = asyncio.Event()
 
-    loop.add_signal_handler(signal.SIGINT, app.request_stop)
-    loop.add_signal_handler(signal.SIGTERM, app.request_stop)
-    # SIGHUP 触发重载而非退出：重新加载配置并整体替换快照。
-    loop.add_signal_handler(signal.SIGHUP, reload_requested.set)
+    installed = []
+    previous: dict[int, Any] = {}
+    if sys.platform == "win32":
+        # Windows asyncio loops do not implement add_signal_handler.
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            previous[sig] = signal.getsignal(sig)
+            signal.signal(sig, lambda _sig, _frame: loop.call_soon_threadsafe(app.request_stop))
+    else:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, app.request_stop)
+            installed.append(sig)
+        loop.add_signal_handler(signal.SIGHUP, reload_requested.set)
+        installed.append(signal.SIGHUP)
 
     task = asyncio.create_task(app.run())
     try:
@@ -148,8 +158,10 @@ async def _serve(app: Application) -> None:
                 waiter.cancel()
                 await asyncio.gather(waiter, return_exceptions=True)
     finally:
-        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        for sig in installed:
             loop.remove_signal_handler(sig)
+        for previous_sig, handler in previous.items():
+            signal.signal(previous_sig, handler)
         await task
 
 
