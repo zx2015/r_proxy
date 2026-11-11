@@ -21,17 +21,13 @@ from r_proxy.web.schemas import (
 
 
 def health_info(cfg: UpstreamConfig, table: HealthTable, *, now: float) -> UpstreamHealthInfo:
-    """``state_of`` 与 ``is_available`` **必须**经这里调用。
-
-    两者都会顺带完成 ``open → half_open`` 的惰性迁移；绕过它们直接读字段会显示
-    一个早已不成立的 ``open``，运维会以为出口还被拦着。
-    """
+    """展示健康累计；兼容状态固定 closed，可用性表示出口是否启用。"""
     health = table.snapshot_of(cfg.name)
     state = table.state_of(cfg.name, now=now)
     attempts = health.total_success + health.total_failure
     return UpstreamHealthInfo(
         circuit_state=state.name.lower(),
-        available=table.is_available(cfg.name, now=now),
+        available=cfg.enabled,
         consecutive_failures=health.consecutive_failures,
         total_success=health.total_success,
         total_failure=health.total_failure,

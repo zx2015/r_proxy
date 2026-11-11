@@ -7,9 +7,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import socket
 import sqlite3
+import subprocess
+import sys
 import threading
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +23,7 @@ from r_proxy import cli
 from r_proxy.app import Application, StartupError
 from r_proxy.egress.capability import probe_ipv6_egress
 from r_proxy.storage.rules_store import RulesStore
-from r_proxy.storage.schema import StorageError
+from r_proxy.storage.schema import Database, StorageError, open_write
 
 MINIMAL = """
 [listen]
@@ -76,7 +80,7 @@ class TestStartup:
         text = MINIMAL.replace("port = 0", f"port = {port}")
         app = Application(config_path=write_config(tmp_path, text))
         try:
-            with pytest.raises(OSError):
+            with pytest.raises(StartupError, match="端口已被占用"):
                 await app.start()
         finally:
             blocker.close()
@@ -268,7 +272,9 @@ class TestRuleLoading:
         path = tmp_path / "rules.db"
         store = RulesStore(path)
         store.ensure_schema()
-        with sqlite3.connect(path) as conn:
+        # sqlite3 的事务上下文不关闭连接；显式关闭避免 GC 时 checkpoint
+        # 改变后续字节断言观察到的主文件。
+        with closing(sqlite3.connect(path)) as conn, conn:
             conn.execute("DELETE FROM rule")
             conn.executemany(
                 "INSERT INTO rule (position, condition, upstream, updated_at) VALUES (?, ?, ?, 0)",
@@ -523,3 +529,95 @@ class TestCli:
         with pytest.raises(SystemExit) as e:
             cli.parse_args(["--version"])
         assert e.value.code == 0
+
+
+@pytest.mark.parametrize("web_host", ["127.0.0.1", "localhost"])
+async def test_web_start_logs_the_bound_ephemeral_port(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, web_host: str
+) -> None:
+    caplog.set_level(logging.INFO, logger="r_proxy.app")
+    text = MINIMAL.replace("enabled = false", f'enabled = true\nport = 0\nhost = "{web_host}"')
+    app = Application(config_path=write_config(tmp_path, text))
+    await app.start()
+    try:
+        assert app.web is not None
+        await asyncio.wait_for(app._background[-1], 2)
+        host, port = app.web.bound_address
+        assert host == "127.0.0.1"
+        assert port > 0
+        assert f"Web 管理界面监听于 {host}:{port}" in caplog.messages
+    finally:
+        await app.stop()
+
+
+@pytest.mark.parametrize("field", ["state", "logs", "rules"])
+async def test_start_and_check_refuse_to_ignore_a_legacy_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], field: str
+) -> None:
+    legacy = tmp_path / f"data/{field}.db"
+    legacy.parent.mkdir()
+    if field == "rules":
+        store = RulesStore(legacy)
+        store.ensure_schema()
+        store.replace([("legacy.test", "direct")], expected_revision=0, now_unix=0)
+    else:
+        open_write(legacy, Database.STATE if field == "state" else Database.LOGS).close()
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    path = write_config(config_dir, MINIMAL + f'\n[database]\n{field}_path = "data/{field}.db"\n')
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(["--check", "--config", str(path)]) == 2
+    check = capsys.readouterr().err
+    expected = config_dir / "data" / f"{field}.db"
+    assert "E_LEGACY_DB_PATH" in check
+    assert str(legacy) in check
+    assert str(expected) in check
+    with pytest.raises(StartupError, match="E_LEGACY_DB_PATH"):
+        await Application(config_path=path).start()
+    assert not expected.parent.exists()
+    if field == "rules":
+        assert RulesStore(legacy).read_rules() == ((0, "legacy.test", "direct"),)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX C locale regression")
+def test_check_writes_utf8_in_the_c_locale(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "r_proxy.cli", "--check", "--config", str(write_config(tmp_path))],
+        env={
+            **os.environ,
+            "LC_ALL": "C",
+            "LANG": "C",
+            "PYTHONUTF8": "0",
+            "PYTHONCOERCECLOCALE": "0",
+            "PYTHONIOENCODING": "ascii:strict",
+        },
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+    assert "配置校验通过" in result.stdout.decode("utf-8")
+
+
+async def test_an_occupied_web_port_fails_startup_cleanly(tmp_path: Path) -> None:
+    with socket.create_server(("127.0.0.1", 0)) as blocker:
+        port = blocker.getsockname()[1]
+        text = MINIMAL.replace("enabled = false", f"enabled = true\nport = {port}")
+        app = Application(config_path=write_config(tmp_path, text))
+        with pytest.raises(StartupError, match=rf"Web 管理界面.*{port}.*端口已被占用"):
+            await app.start()
+    assert app.web is None
+    assert not [t for t in threading.enumerate() if t.name == "r-proxy-writer"]
+
+
+def test_unavailable_home_directory_is_reported_as_configuration_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def unavailable() -> Path:
+        raise RuntimeError("home unavailable")
+
+    monkeypatch.delenv("R_PROXY_CONFIG", raising=False)
+    monkeypatch.delenv("APPDATA", raising=False)
+    monkeypatch.setattr(Path, "home", unavailable)
+    assert cli.main(["--check"]) == 2
+    assert "用户目录" in capsys.readouterr().err

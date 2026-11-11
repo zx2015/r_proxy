@@ -33,16 +33,26 @@ class Router:
         state: RuntimeStateView,
         *,
         now: float,
+        update_state: bool = True,
     ) -> Decision:
+        """按当前状态构造候选链。
+
+        update_state=False 时仍按相同规则判定 TTL 和排序，但不推进游标、
+        不删除过期项、不调整缓存的 LRU 顺序。
+        """
         if (hit := match(rule_set, target)) is not None:
             return self._forced(hit, target, snapshot, state)
 
-        usable = self._filter_usable(target, snapshot, state, now=now, relaxed=False)
+        usable = self._filter_usable(
+            target, snapshot, state, now=now, relaxed=False, touch=update_state
+        )
         relaxed = False
         if not usable:
-            # 放宽：熔断与负面记忆都是基于历史观测的推断，可能已经不准。
+            # 放宽：负面记忆是基于历史观测的推断，可能已经不准。
             # 宁可试一次，也别让用户完全上不去网。
-            usable = self._filter_usable(target, snapshot, state, now=now, relaxed=True)
+            usable = self._filter_usable(
+                target, snapshot, state, now=now, relaxed=True, touch=update_state
+            )
             relaxed = bool(usable)
         if not usable:
             return Decision(
@@ -51,8 +61,12 @@ class Router:
                 switchable=False,
                 empty_reason=self._empty_reason(target, snapshot, state),
             )
-        ordered = _direct_first(self._order(usable, snapshot, state), target, snapshot)
-        chain, source = self._apply_sticky(ordered, target, state, usable, now=now)
+        ordered = _direct_first(
+            self._order(usable, snapshot, state, advance=update_state), target, snapshot
+        )
+        chain, source = self._apply_sticky(
+            ordered, target, state, usable, now=now, touch=update_state
+        )
         return Decision(chain=chain, source=source, relaxed=relaxed)
 
     def _apply_sticky(
@@ -63,17 +77,18 @@ class Router:
         usable: set[str],
         *,
         now: float,
+        touch: bool,
     ) -> tuple[tuple[str, ...], DecisionSource]:
         """把上次成功的出口提到链首，其余保持优先级序。
 
-        粘性出口已不在 ``usable`` 中（被禁用、熔断、有负面记忆、地址族不匹配）
+        粘性出口已不在 ``usable`` 中（被禁用、有负面记忆、地址族不匹配）
         时**不前置也不清除**：清除是执行层的职责，只有真正尝试失败才累加
-        ``fail_count``。路由层因熔断暂时跳过它，不代表这个绑定是错的。
+        ``fail_count``。路由层因负面记忆暂时跳过它，不代表这个绑定是错的。
 
-        用 :meth:`StickyCache.get_live` 而非 ``get``：空闲超过 ``sticky_ttl`` 的
-        ``auto`` 绑定在此惰性删除，等价于「从没学过」（DD_ROUTING §7.7）。
+        用 :meth:`StickyCache.get_live` 判断空闲过期。正常决策惰性删除，
+        只读决策仅过滤过期绑定（DD_ROUTING §7.7）。
         """
-        entry = state.sticky.get_live(target.host, now=now)
+        entry = state.sticky.get_live(target.host, now=now, touch=touch)
         if entry is None or entry.upstream not in usable:
             return chain, "priority"
         head = entry.upstream
@@ -88,7 +103,7 @@ class Router:
     ) -> Decision:
         """规则命中：候选链长度恒为 1，失败原样返回。
 
-        **不检查熔断与负面记忆**：那是自动路由用来避开坏出口的推断，而规则
+        **不检查负面记忆**：那是自动路由用来避开坏出口的推断，而规则
         是用户的明确指令。因系统推断而拒绝执行指令，用户会认为规则失效了。
 
         但「出口被禁用」与「地址族结构性不可达」必须在发起连接**之前**判定：
@@ -124,8 +139,9 @@ class Router:
         *,
         now: float,
         relaxed: bool,
+        touch: bool,
     ) -> set[str]:
-        """四道过滤。``enabled`` 与地址族**永不放宽**：前者是用户的明确指令，
+        """三道过滤。``enabled`` 与地址族**永不放宽**：前者是用户的明确指令，
         后者是结构性事实，放宽只会多消耗一次超时。"""
         usable: set[str] = set()
         for u in snapshot.upstreams:
@@ -134,15 +150,13 @@ class Router:
             if not _family_ok(u, target, has_ipv6_egress=state.has_ipv6_egress):
                 continue
             if not relaxed:
-                if not state.health.is_available(u.name, now=now):
-                    continue
-                if state.memory.is_blocked(target.host, u.name, now=now):
+                if state.memory.is_blocked(target.host, u.name, now=now, touch=touch):
                     continue
             usable.add(u.name)
         return usable
 
     def _order(
-        self, usable: set[str], snapshot: ConfigSnapshot, state: RuntimeStateView
+        self, usable: set[str], snapshot: ConfigSnapshot, state: RuntimeStateView, *, advance: bool
     ) -> tuple[str, ...]:
         chain: list[str] = []
         for priority, members in snapshot.priority_groups:
@@ -154,7 +168,8 @@ class Router:
                 continue
             # 游标在构造时推进而非成功时：否则某出口连续失败的场景下
             # 游标不动，每个请求都从同一个坏出口开始。
-            offset = state.cursors.next(priority) % len(present)
+            cursor = state.cursors.next(priority) if advance else state.cursors.peek(priority)
+            offset = cursor % len(present)
             chain.extend(present[offset:] + present[:offset])
         return tuple(chain)
 
@@ -188,7 +203,7 @@ def _direct_first(
         (n for n in chain if (u := snapshot.upstream(n)) is not None and u.is_direct), None
     )
     if direct is None:
-        # 被禁用、熔断或不在配置里。不能因为目标是内网就把它塞回链中：
+        # 被禁用、有负面记忆或不在配置里。不能因为目标是内网就把它塞回链中：
         # 那几道过滤各有各的理由，绕过去只会白等一次超时。
         return chain
     return (direct, *(n for n in chain if n != direct))

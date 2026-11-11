@@ -18,6 +18,7 @@ import threading
 import time
 import tomllib
 from collections.abc import AsyncIterator, Callable
+from dataclasses import fields, replace
 from pathlib import Path
 
 import httpx
@@ -99,6 +100,7 @@ async def app(tmp_path: Path) -> AsyncIterator[Application]:
 @pytest.fixture
 async def client(app: Application) -> AsyncIterator[httpx.AsyncClient]:
     async with httpx.AsyncClient(
+        trust_env=False,
         transport=httpx.ASGITransport(app=create_app(app), client=("127.0.0.1", 12345)),
         base_url="http://webui.test",
     ) as c:
@@ -151,6 +153,7 @@ def _client_for(
     instance: Application, *, token: str | None = None, ip: str = "127.0.0.1"
 ) -> httpx.AsyncClient:
     return httpx.AsyncClient(
+        trust_env=False,
         transport=httpx.ASGITransport(app=create_app(instance), client=(ip, 12345)),
         base_url="http://webui.test",
         headers={"Authorization": f"Bearer {token}"} if token else None,
@@ -584,11 +587,15 @@ class TestSettings:
             json={
                 "config_version": version(app),
                 "circuit_breaker_fail_threshold": 7,
+                "circuit_breaker_enabled": False,
                 "max_switches_per_host": 4,
             },
         )
         assert response.status_code == 200
         assert app.snapshot.routing.circuit_breaker.fail_threshold == 7
+        assert app.snapshot.routing.circuit_breaker.enabled is False
+        settings = (await client.get("/api/settings")).json()
+        assert settings["routing"]["circuit_breaker"]["enabled"] is False
         assert app.snapshot.routing.status_switch_rate_limit.max_switches_per_host == 4
 
     async def test_m4_12_a_success_status_in_switch_on_status_is_refused(
@@ -1194,6 +1201,7 @@ class TestBackups:
         await instance.start()
         try:
             async with httpx.AsyncClient(
+                trust_env=False,
                 transport=httpx.ASGITransport(
                     app=create_app(instance), client=("127.0.0.1", 12345)
                 ),
@@ -1452,3 +1460,129 @@ class TestReload:
         response = await client.post("/api/reload")
         assert str(path) not in response.text
         assert "config.toml" in response.json()["error"]["message"]
+
+
+async def test_removed_circuit_cannot_be_enabled(
+    client: httpx.AsyncClient, app: Application
+) -> None:
+    before = config_text(app)
+    response = await client.put(
+        "/api/settings",
+        json={
+            "config_version": version(app),
+            "circuit_breaker_enabled": True,
+        },
+    )
+    assert response.status_code == 400
+    assert config_text(app) == before
+
+
+async def test_route_test_preserves_live_state(client: httpx.AsyncClient, app: Application) -> None:
+    import copy
+
+    from r_proxy.config.model import ConfigSnapshot
+    from r_proxy.state.sticky import StickyEntry
+
+    old = app.snapshot
+    same_priority = tuple(replace(u, priority=10) for u in old.upstreams)
+    app._snapshot = ConfigSnapshot.build(
+        **{
+            field.name: getattr(old, field.name)
+            for field in fields(old)
+            if field.init and field.name not in {"upstreams", "by_name", "priority_groups"}
+        },
+        upstreams=same_priority,
+    )
+    app.state.sticky.restore(StickyEntry("old.test", "proxy-a", "auto", last_used_at=1))
+    app.state.memory.block("old.test", "proxy-a", now=1, reason="test")
+    before = copy.deepcopy(app.state)
+    for _ in range(2):
+        response = await client.post("/api/route-test", json={"url": "http://old.test/"})
+        assert response.status_code == 200
+    assert app.state.cursors._cursors == before.cursors._cursors
+    assert app.state.sticky._entries == before.sticky._entries
+    assert app.state.memory._blocks == before.memory._blocks
+
+
+async def test_full_cache_route_preview_uses_only_keyed_reads(
+    client: httpx.AsyncClient, app: Application, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from collections import OrderedDict
+
+    class KeyedReadsOnly(OrderedDict):
+        def __iter__(self):
+            raise AssertionError("route preview iterated the cache")
+
+        def items(self):
+            raise AssertionError("route preview copied the cache")
+
+        def values(self):
+            raise AssertionError("route preview scanned the cache")
+
+    now = time.monotonic()
+    state = app.state
+    for i in range(app.snapshot.limits.sticky_cache_size):
+        state.sticky.record_success(f"h{i}.test", "direct", now=now)
+    for i in range(app.snapshot.limits.route_block_cache_size):
+        state.memory.block(f"h{i}.test", "proxy-a", now=now, reason="test")
+    monkeypatch.setattr(state.sticky, "_entries", KeyedReadsOnly(state.sticky._entries))
+    monkeypatch.setattr(state.memory, "_blocks", KeyedReadsOnly(state.memory._blocks))
+    response = await client.post("/api/route-test", json={"url": "http://h0.test/"})
+    assert response.status_code == 200
+    assert response.json()["candidate_chain"] == ["direct"]
+
+
+@pytest.mark.parametrize("field", ["state_path", "logs_path", "write_queue_size"])
+async def test_restore_rejects_storage_changes_before_backup_or_write(
+    client: httpx.AsyncClient, app: Application, field: str
+) -> None:
+    original = config_text(app)
+    if field.endswith("_path"):
+        text = original.replace(
+            getattr(app.snapshot.database, field).as_posix(),
+            (app.snapshot.source_path.parent / "alternate.db").as_posix(),
+        )
+    else:
+        text = original.replace("[database]", "[database]\nwrite_queue_size = 1234")
+    assert text != original
+    folder = ConfigWriter(app).backup_dir
+    folder.mkdir(exist_ok=True)
+    filename = "config-20200101-000000.toml"
+    (folder / filename).write_text(text, encoding="utf-8")
+    before = app.snapshot
+    response = await client.post(
+        "/api/config/restore", json={"config_version": version(app), "filename": filename}
+    )
+    assert response.status_code == 400
+    assert any(
+        issue["code"] == "E_STORAGE_RESTART" and issue["location"] == f"database.{field}"
+        for issue in response.json()["error"]["details"]
+    )
+    assert app.snapshot is before
+    assert config_text(app) == original
+    assert sorted(p.name for p in folder.iterdir()) == [filename]
+
+
+async def test_restore_reports_legacy_database_error_code(
+    client: httpx.AsyncClient, app: Application, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cwd = app.snapshot.source_path.parent / "cwd"
+    cwd.mkdir()
+    store = RulesStore(cwd / "legacy.db")
+    store.ensure_schema()
+    monkeypatch.chdir(cwd)
+    original = config_text(app)
+    text = original.replace(app.snapshot.database.rules_path.as_posix(), "legacy.db")
+    folder = ConfigWriter(app).backup_dir
+    folder.mkdir(exist_ok=True)
+    filename = "config-20200101-000000.toml"
+    (folder / filename).write_text(text, encoding="utf-8")
+    response = await client.post(
+        "/api/config/restore", json={"config_version": version(app), "filename": filename}
+    )
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["code"] == "E_LEGACY_DB_PATH"
+    assert error["details"][0]["code"] == "E_LEGACY_DB_PATH"
+    assert config_text(app) == original
+    assert sorted(p.name for p in folder.iterdir()) == [filename]

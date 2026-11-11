@@ -50,7 +50,7 @@ class ProxyServer:
         self._connector = connector if connector is not None else UpstreamConnector()
         self._head_read_timeout = head_read_timeout
         self._idle_timeout = idle_timeout
-        # 路由与执行器全进程共享：熔断状态、负面记忆、轮询游标、限流窗口
+        # 路由与执行器全进程共享：健康统计、负面记忆、轮询游标、限流窗口
         # 都必须跨请求累积，每连接新建一份等于让这些机制失效。
         self.state = state if state is not None else RuntimeState.from_snapshot(snapshot)
         self._router = Router()

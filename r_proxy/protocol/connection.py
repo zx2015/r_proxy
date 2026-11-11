@@ -434,7 +434,7 @@ class ClientConnection:
             # 客户端只看到连接被关闭、收不到任何响应（响应头超过 reader 的 64KB
             # 上限就会触发）。归 `ROUTE_ERROR` 与同块里的 `ValueError` 一致：
             # 「经这个出口到不了这个目标」，只记 `(host, upstream)` 负面记忆，
-            # 不该把整个出口熔断掉。
+            # 不该错误归类整个出口。
             await conn.close()
             return AttemptResult(
                 outcome=AttemptOutcome(

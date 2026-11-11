@@ -24,10 +24,14 @@ class CursorTable:
     def __init__(self) -> None:
         self._cursors: dict[int, int] = {}
 
+    def peek(self, priority: int) -> int:
+        """读取当前游标。"""
+        return self._cursors.get(priority, 0)
+
     def next(self, priority: int) -> int:
         """取当前值并推进。**单调递增不取模**——取模在使用点做，
         这样组成员数量因热重载变化时，旧游标不会越界。"""
-        value = self._cursors.get(priority, 0)
+        value = self.peek(priority)
         self._cursors[priority] = value + 1
         return value
 
@@ -36,13 +40,7 @@ class CursorTable:
 
 
 class RuntimeStateView(Protocol):
-    """``Router`` 看到的只读视图：拿不到任何写方法。
-
-    状态变更由执行层在得到结果后执行，两者职责不混淆。
-    """
-
-    @property
-    def health(self) -> HealthTable: ...
+    """Router 决策需要的状态接口。"""
 
     @property
     def memory(self) -> RouteMemory: ...
@@ -91,7 +89,7 @@ class RuntimeState:
     def on_reload(self, snapshot: ConfigSnapshot) -> None:
         """按新快照调整状态，但保留仍在配置中的出口的观测结果。
 
-        不整体重建：出口的熔断状态与负面记忆是花时间学来的，
+        不整体重建：出口的健康统计与负面记忆是花时间学来的，
         改一行无关配置就把它们清空会让代理重新踩一遍所有坑。
         IPv6 能力保持原值，由调用方重探后覆盖。
         """

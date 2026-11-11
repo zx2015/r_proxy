@@ -14,12 +14,15 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import logging
 import os
+import sqlite3
+import sys
 import time
 import tomllib
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
-from pathlib import Path
+from contextlib import closing, contextmanager
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from r_proxy.config.model import (
@@ -44,10 +47,17 @@ DEFAULT_LOGS_PATH = "~/.r-proxy/logs.db"
 DEFAULT_RULES_PATH = "~/.r-proxy/rules.db"
 
 E_RULES_FILES_REMOVED = "E_RULES_FILES_REMOVED"
+E_LEGACY_DB_PATH = "E_LEGACY_DB_PATH"
+
+logger = logging.getLogger(__name__)
 
 
 class ConfigError(Exception):
     """配置无法被加载。启动阶段抛出，调用方应打印后以退出码 2 结束。"""
+
+    def __init__(self, message: str, *, code: str = "E_PARSE") -> None:
+        self.code = code
+        super().__init__(message)
 
 
 # --------------------------------------------------------------------------
@@ -131,6 +141,7 @@ def load(
     :param cli_overrides: 点分键到值的映射，如 ``{"webui.port": 7061}``。
         优先级：CLI > 环境变量 > 配置文件 > 内置默认值。
     """
+    path = expand_user_path(path)
     return _build(_read_bytes(path), path, cli_overrides)
 
 
@@ -146,7 +157,7 @@ def load_text(
 
     ``path`` 仍然必须传：``source_path`` 会进快照，错误消息也要指明是哪个文件。
     """
-    return _build(text.encode("utf-8"), path, cli_overrides)
+    return _build(text.encode("utf-8"), expand_user_path(path), cli_overrides)
 
 
 def _build(
@@ -167,14 +178,17 @@ def _build(
             _build_upstream(item, index)
             for index, item in enumerate(_section_list(data, "upstreams"))
         )
+        rules_enabled = _resolve_rules_enabled(data)
         return ConfigSnapshot.build(
             listen=_build_listen(_table(data, "listen")),
             webui=_build_webui(_table(data, "webui")),
-            database=_build_database(_table(data, "database")),
+            database=_build_database(
+                _table(data, "database"), path.absolute().parent, rules_enabled=rules_enabled
+            ),
             routing=_build_routing(_table(data, "routing")),
             limits=_build_limits(_table(data, "limits")),
             upstreams=upstreams,
-            rules_enabled=_resolve_rules_enabled(data),
+            rules_enabled=rules_enabled,
             config_version=version,
             source_path=path,
             loaded_at=time.time(),
@@ -194,12 +208,37 @@ def _errors_prefixed_with(path: Path) -> Iterator[None]:
         message = str(exc)
         if message.startswith(str(path)):
             raise
-        raise ConfigError(f"{path}: {message}") from None
+        raise ConfigError(f"{path}: {message}", code=exc.code) from None
+
+
+def expand_user_path(path: Path) -> Path:
+    try:
+        return path.expanduser()
+    except RuntimeError as exc:
+        raise ConfigError(f"无法展开用户目录 {str(path)!r}：{exc}") from exc
 
 
 def default_config_path() -> Path:
+    """环境变量覆盖平台默认配置位置。"""
     env = os.environ.get(ENV_CONFIG_PATH)
-    return Path(env).expanduser() if env else Path("config.toml")
+    if env:
+        return expand_user_path(Path(env))
+    preferred = None
+    if sys.platform == "win32" and (appdata := os.environ.get("APPDATA")):
+        directory = Path(appdata)
+        if directory.is_absolute():
+            preferred = directory / "r-proxy/config.toml"
+            if preferred.exists():
+                return preferred
+    try:
+        legacy = Path.home() / ".config/r-proxy/config.toml"
+    except RuntimeError as exc:
+        if preferred is not None:
+            return preferred
+        raise ConfigError(f"无法确定用户目录，请通过 --config 指定绝对路径：{exc}") from exc
+    if preferred is not None and not legacy.is_file():
+        return preferred
+    return legacy
 
 
 # --------------------------------------------------------------------------
@@ -386,11 +425,35 @@ def _build_webui(t: Mapping[str, Any]) -> WebUIConfig:
     )
 
 
-def _build_database(t: Mapping[str, Any]) -> DatabaseConfig:
+def _build_database(t: Mapping[str, Any], base: Path, *, rules_enabled: bool) -> DatabaseConfig:
+    conflicts: list[str] = []
+
+    def path(name: str, default: str, table: str, *, check_legacy: bool = True) -> Path:
+        value = _get_str(t, name, default, "database")
+        field = f"database.{name}"
+        candidate = resolve_database_path(value, base, field=field)
+        if check_legacy:
+            legacy = expand_user_path(Path(value))
+            if not legacy.is_absolute():
+                conflict = _legacy_database_conflict(legacy.absolute(), candidate, field, table)
+                if conflict is not None:
+                    conflicts.append(conflict)
+        return candidate
+
+    state_path = path("state_path", DEFAULT_STATE_PATH, "host_upstream")
+    logs_path = path("logs_path", DEFAULT_LOGS_PATH, "request_log")
+    rules_path = path("rules_path", DEFAULT_RULES_PATH, "rule", check_legacy=rules_enabled)
+    if conflicts:
+        raise ConfigError(
+            f"{E_LEGACY_DB_PATH}：请核对数据并将受影响字段设为旧库的绝对路径。\n"
+            + "\n".join(conflicts),
+            code=E_LEGACY_DB_PATH,
+        )
+
     return DatabaseConfig(
-        state_path=_expand(_get_str(t, "state_path", DEFAULT_STATE_PATH, "database")),
-        logs_path=_expand(_get_str(t, "logs_path", DEFAULT_LOGS_PATH, "database")),
-        rules_path=_expand(_get_str(t, "rules_path", DEFAULT_RULES_PATH, "database")),
+        state_path=state_path,
+        logs_path=logs_path,
+        rules_path=rules_path,
         retention_days=_get_int(t, "retention_days", 30, "database"),
         max_log_rows=_get_int(t, "max_log_rows", 100000, "database"),
         write_queue_size=_get_int(t, "write_queue_size", 10000, "database"),
@@ -416,6 +479,8 @@ def _build_routing(t: Mapping[str, Any]) -> RoutingConfig:
     if not isinstance(rl, dict) or not isinstance(cb, dict):
         raise ConfigError("routing: status_switch_rate_limit 与 circuit_breaker 必须是表")
 
+    # 验证历史字段类型，但不允许配置重新开启已移除的机制。
+    _get_bool(cb, "enabled", False, "routing.circuit_breaker")
     return RoutingConfig(
         connect_timeout=_get_float(t, "connect_timeout", defaults.connect_timeout, "routing"),
         read_timeout=_get_float(t, "read_timeout", defaults.read_timeout, "routing"),
@@ -441,7 +506,7 @@ def _build_routing(t: Mapping[str, Any]) -> RoutingConfig:
             window_seconds=_get_int(rl, "window_seconds", 60, "routing.status_switch_rate_limit"),
         ),
         circuit_breaker=CircuitBreakerConfig(
-            enabled=_get_bool(cb, "enabled", True, "routing.circuit_breaker"),
+            enabled=False,
             fail_threshold=_get_int(cb, "fail_threshold", 5, "routing.circuit_breaker"),
             cooldown_seconds=_get_int(cb, "cooldown_seconds", 60, "routing.circuit_breaker"),
         ),
@@ -518,5 +583,50 @@ def _resolve_rules_enabled(data: Mapping[str, Any]) -> bool:
     return _get_bool(rules, "enabled", True, "rules")
 
 
-def _expand(value: str) -> Path:
-    return Path(value).expanduser().absolute()
+def resolve_database_path(value: str, base: Path, *, field: str) -> Path:
+    """按配置目录解析库路径。"""
+    if os.name != "nt" and PureWindowsPath(value).drive.endswith(":"):
+        raise ConfigError(f"{field} 的 Windows 盘符路径在本平台无效，请使用 POSIX 路径：{value!r}")
+    path = expand_user_path(Path(value))
+    if path.is_absolute():
+        return path
+    if path.anchor:
+        raise ConfigError(f"{field} 须使用完整绝对路径或普通相对路径：{value!r}")
+    try:
+        return (base / path).resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ConfigError(f"无法解析 {field} 的数据库路径：{exc}") from exc
+
+
+def _legacy_database_conflict(legacy: Path, candidate: Path, field: str, table: str) -> str | None:
+    if legacy == candidate:
+        return None
+    locations = f"{field}：旧口径 {legacy}，配置目录口径 {candidate}"
+    try:
+        if not _has_database_schema(legacy, table):
+            return None
+        if candidate.exists() and candidate.samefile(legacy):
+            return None
+        if not _has_database_schema(candidate, table):
+            return f"{locations}。候选库缺失或缺少 r-proxy 库表。"
+    except (OSError, sqlite3.Error) as exc:
+        return f"{locations}。无法核验数据库：{exc}"
+    logger.warning("W_LEGACY_DB_PATH %s。两处均有 r-proxy 库，当前使用配置目录口径。", locations)
+    return None
+
+
+def _has_database_schema(path: Path, table: str) -> bool:
+    if not path.is_file() or path.stat().st_size == 0:
+        return False
+    try:
+        with closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=0.2)) as conn:
+            row = conn.execute(
+                "SELECT count(*) FROM sqlite_schema WHERE type = 'table' "
+                "AND name IN ('schema_meta', ?)",
+                (table,),
+            ).fetchone()
+            return row is not None and row[0] == 2
+    except sqlite3.DatabaseError as exc:
+        if getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_NOTADB:
+            return False
+        raise

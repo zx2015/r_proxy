@@ -263,7 +263,7 @@ class TestTtl:
         assert c.get_live("a.com", now=10_000_000.0) is not None
 
     def test_plain_get_does_not_expire(self) -> None:
-        """``get`` 承诺无副作用读取：过期判定只属于 ``get_live``。"""
+        """``get`` 不判定过期，TTL 判定只属于 ``get_live``。"""
         c = cache(ttl=100.0, entries=[auto("a.com", "u", last_used_at=0.0)])
         assert c.get("a.com") is not None
         assert c.size == 1
@@ -295,3 +295,13 @@ class TestTtl:
         c = cache(ttl=100.0, entries=[auto("old.com", "u", last_used_at=0.0)])
         assert c.entries(now=100.0) == []
         assert c.size == 1
+
+
+def test_readonly_lookup_cannot_mutate_cached_binding() -> None:
+    c = cache(ttl=100.0, entries=[auto("a.com", "u", last_used_at=0.0)])
+    entry = c.get_live("a.com", now=10.0, touch=False)
+    assert entry is not None
+    entry.upstream = "other"
+    original = c.get_live("a.com", now=10.0)
+    assert original is not None
+    assert original.upstream == "u"

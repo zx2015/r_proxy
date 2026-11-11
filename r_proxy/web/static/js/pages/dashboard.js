@@ -7,13 +7,13 @@
  */
 
 import { api } from "../api.js";
-import { badge, button, clear, el, emptyRow, input, select, table, td, text } from "../dom.js";
-import { ago, bytes, circuit, duration, millis, percent, timestamp } from "../format.js";
-import { clearNotice, confirmAction, describeError, notify, section, toolbar } from "../ui.js";
+import { button, clear, el, emptyRow, input, select, table, td, text } from "../dom.js";
+import { ago, bytes, duration, millis, percent, timestamp } from "../format.js";
+import { clearNotice, describeError, notify, section, toolbar } from "../ui.js";
 
 const PAGE_SIZE = 50;
 const LOG_COLUMNS = 9;
-const HEALTH_COLUMNS = 9;
+const HEALTH_COLUMNS = 7;
 const SWITCH_COLUMNS = 5;
 const TRAFFIC_COLUMNS = 4;
 // 主机流量榜是一次聚合查询，成本明显高于其余板块，独立走 30 秒一档，
@@ -41,7 +41,7 @@ function mount(root) {
   root.appendChild(
     section("出口健康", [
       shell(
-        ["出口", "优先级", "熔断", "连续失败", "累计成功", "累计失败", "成功率", "流量", "操作"],
+        ["出口", "优先级", "连续出口级失败", "累计成功", "累计失败", "成功率", "流量"],
         nodes.healthBody,
       ),
     ]),
@@ -239,34 +239,17 @@ function renderHealth(upstreams) {
     return;
   }
   for (const item of upstreams) {
-    const state = circuit(item.circuit_state);
-    const reset = button("重置熔断", () => void resetCircuit(item.name), {
-      disabled: item.circuit_state === "closed",
-    });
     body.appendChild(
       el("tr", {}, [
         td(item.enabled ? item.name : `${item.name}（已禁用）`),
         td(item.priority),
-        el("td", {}, [badge(state.label, state.kind)]),
         td(item.consecutive_failures),
         td(item.total_success),
         td(item.total_failure),
         td(percent(item.success_rate)),
         td(`${bytes(item.bytes_up_total)} ↑ / ${bytes(item.bytes_down_total)} ↓`),
-        el("td", {}, [reset]),
       ]),
     );
-  }
-}
-
-async function resetCircuit(name) {
-  if (!confirmAction(`重置出口 ${name} 的熔断状态？累计计数会保留。`)) return;
-  try {
-    await api.resetCircuit(name);
-    notify(nodes.notice, "ok", `已重置 ${name} 的熔断状态。`);
-    await refresh();
-  } catch (err) {
-    notify(nodes.notice, "bad", describeError(err));
   }
 }
 

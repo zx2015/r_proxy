@@ -1,10 +1,8 @@
-"""出口健康与熔断状态机。
+"""出口健康统计（0.3.3 起不再包含全局熔断）。
 
 对应设计：docs/design/DD_ROUTING.md §4。
 
-状态完全在内存中。``open → half_open`` 的迁移在**查询时**惰性判定而非用定时器：
-定时器要为每个出口维护 ``call_later`` 句柄，热重载删除出口时容易泄漏；而没有
-请求时的状态迁移本身毫无意义。
+统计完全在内存中，定期落盘；兼容接口不再影响路由准入。
 """
 
 from __future__ import annotations
@@ -19,9 +17,9 @@ from r_proxy.contracts import FailureKind
 
 
 class HealthState(Enum):
+    """Deprecated since 0.3.3：仅兼容旧存储/API；移除版本尚未确定。"""
+
     CLOSED = auto()
-    OPEN = auto()
-    HALF_OPEN = auto()
 
 
 @dataclass(slots=True)
@@ -29,13 +27,11 @@ class UpstreamHealth:
     name: str
     state: HealthState = HealthState.CLOSED
     consecutive_failures: int = 0
-    opened_at: float = 0.0
-    probe_in_flight: bool = False
     total_success: int = 0
     total_failure: int = 0
     last_success_at: float = 0.0
     last_error: str | None = None
-    # 叠加在健康状态之上的独立标志，不是第四个状态：出口仍留在候选链里。
+    # 认证错误仅作观察标志，不限制路由。
     auth_error: bool = False
     # 与熔断状态机无关的两个纯累计字段，见 HealthTable.add_traffic。
     total_bytes_up: int = 0
@@ -44,42 +40,15 @@ class UpstreamHealth:
 
 class HealthTable:
     def __init__(self, cfg: CircuitBreakerConfig) -> None:
-        self._cfg = cfg
+        # 旧配置仅为兼容参数，不参与健康统计或路由。
         self._health: dict[str, UpstreamHealth] = {}
 
     def is_available(self, name: str, *, now: float) -> bool:
-        """该出口现在能否进入候选链。
-
-        **不是纯查询方法**：会顺带完成 ``open → half_open`` 的惰性迁移（写
-        `self._health[name].state`），因此对 ``half_open`` 出口连续调用只有
-        第一次配合 :meth:`acquire_probe` 能放行探测。只想看一眼状态而不想
-        触发迁移的调用方不存在——`state_of`/`all`/`views.health_info` 都特意
-        经它才能拿到不过期的状态（见各自文档），没有绕开它的安全用法。
-        """
-        health = self._health.get(name)
-        if health is None or health.state is HealthState.CLOSED:
-            return True
-        if health.state is HealthState.OPEN:
-            if now - health.opened_at < self._cfg.cooldown_seconds:
-                return False
-            health.state = HealthState.HALF_OPEN
-            health.probe_in_flight = False
-        return not health.probe_in_flight
+        """Deprecated since 0.3.3：恒为 True，不参与路由准入。"""
+        return True
 
     def acquire_probe(self, name: str, *, allow_open: bool = False) -> bool:
-        """尝试获取 ``half_open`` 或显式放宽 OPEN 状态的探测名额。
-
-        **必须是同步方法**：中间若有 ``await``，两个请求可能都读到
-        ``probe_in_flight == False`` 然后都置 ``True``，闸门就失效了。
-        """
-        health = self._health.get(name)
-        if health is None or health.state is HealthState.CLOSED:
-            return True
-        if health.state is HealthState.OPEN and not allow_open:
-            return True
-        if health.probe_in_flight:
-            return False
-        health.probe_in_flight = True
+        """Deprecated since 0.3.3：恒为 True，不再预留探针。"""
         return True
 
     def record_result(
@@ -91,13 +60,12 @@ class HealthTable:
         now: float,
         error: str | None = None,
     ) -> None:
-        # direct 的失败一律降级：它被熔断会导致内网与 localhost 全部不可访问。
+        # direct 失败属于目标路径问题，不累加出口级连续失败。
         # 放在唯一收敛点上，比依赖每个调用方都传对 kind 更可靠。
         if name == DIRECT_NAME and not ok:
             kind = FailureKind.ROUTE_ERROR
 
         health = self._health.setdefault(name, UpstreamHealth(name))
-        health.probe_in_flight = False
 
         if ok:
             health.total_success += 1
@@ -115,14 +83,6 @@ class HealthTable:
             return
 
         health.consecutive_failures += 1
-        if health.state is HealthState.HALF_OPEN:
-            health.state = HealthState.OPEN
-            # 必须重置：否则 now - opened_at 仍大于冷却期，
-            # 下一个请求立刻又变 half_open，退化为无冷却的连续重试。
-            health.opened_at = now
-        elif self._cfg.enabled and health.consecutive_failures >= self._cfg.fail_threshold:
-            health.state = HealthState.OPEN
-            health.opened_at = now
 
     def mark_auth_error(self, name: str) -> None:
         """标记凭据错误。不移出候选链——用户可能正在修，或只有部分目标要求认证。"""
@@ -140,10 +100,8 @@ class HealthTable:
         health.total_bytes_down += bytes_down
 
     def state_of(self, name: str, *, now: float) -> HealthState:
-        """当前状态。Web 查询也必须经此，否则会显示 ``open`` 而实际冷却已过。"""
-        self.is_available(name, now=now)
-        health = self._health.get(name)
-        return HealthState.CLOSED if health is None else health.state
+        """Deprecated since 0.3.3：兼容值恒为 CLOSED，不反映可用性。"""
+        return HealthState.CLOSED
 
     def snapshot_of(self, name: str) -> UpstreamHealth:
         """状态副本。调用方改动它不影响权威状态。"""
@@ -151,8 +109,6 @@ class HealthTable:
         return dataclasses.replace(health) if health is not None else UpstreamHealth(name)
 
     def all(self, *, now: float) -> list[UpstreamHealth]:
-        for name in list(self._health):
-            self.is_available(name, now=now)
         return [dataclasses.replace(h) for h in self._health.values()]
 
     def restore_counters(
@@ -166,8 +122,7 @@ class HealthTable:
     ) -> None:
         """启动回填累计计数，供 Web 展示历史成功率。
 
-        **不回填熔断状态**：重启可能正是运维在修网络，带着旧的 ``open``
-        启动会让刚修好的出口继续被拒绝一整个冷却期。
+        历史熔断状态不恢复；兼容状态始终为 closed。
         """
         health = self._health.setdefault(name, UpstreamHealth(name))
         health.total_success = total_success
@@ -179,20 +134,12 @@ class HealthTable:
         self._health.pop(name, None)
 
     def clear_circuit(self, name: str) -> None:
-        """手动解除熔断（Web 界面的「重置」按钮）。
-
-        与 :meth:`reset` 的区别是**保留累计计数**：重置熔断的意图是「再给它
-        一次机会」，不是「忘掉这个出口的历史」，而看板上的历史成功率正来自
-        这两个计数。顺带清掉 ``auth_error``——运维点重置通常正是因为刚改完
-        凭据，标志会在下一次认证失败时自己回来。
-        """
+        """兼容旧重置接口：清连续失败与认证标志，保留累计计数和流量。"""
         health = self._health.get(name)
         if health is None:
             return
         health.state = HealthState.CLOSED
         health.consecutive_failures = 0
-        health.probe_in_flight = False
-        health.opened_at = 0.0
         health.auth_error = False
 
     def forget_except(self, names: Iterable[str]) -> None:
@@ -203,5 +150,5 @@ class HealthTable:
                 del self._health[name]
 
     def reconfigure(self, cfg: CircuitBreakerConfig) -> None:
-        """热重载熔断参数。已有观测结果保留——它们是花时间学来的。"""
-        self._cfg = cfg
+        """兼容历史配置热重载，不改变累计统计。"""
+        # 旧配置仅为兼容参数，不参与健康统计或路由。

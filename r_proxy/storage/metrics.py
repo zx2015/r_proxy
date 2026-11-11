@@ -86,7 +86,7 @@ class MetricsReporter:
         self._previous = current
 
         if (dropped := current.dropped_critical - previous.dropped_critical) > 0:
-            logger.error("写入队列丢弃了 %d 条关键操作，对应的粘性或熔断状态重启后会丢失", dropped)
+            logger.error("写入队列丢弃了 %d 条关键操作，对应的粘性或健康统计重启后会丢失", dropped)
         if (errors := current.write_errors - previous.write_errors) > 0:
             logger.error("批量写入失败 %d 次，检查磁盘空间与数据库文件权限", errors)
         if (lossy := current.dropped_lossy - previous.dropped_lossy) > 0:

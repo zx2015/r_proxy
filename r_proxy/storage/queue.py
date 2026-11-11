@@ -260,7 +260,7 @@ def request_log(
 ) -> WriteOp:
     """一次出口尝试的记录。同一 ``request_id`` 的多行按 ``attempt_index`` 构成切换链。
 
-    优先级是 ``LOSSY``：诊断价值高，但丢了不改变任何行为。粘性与熔断状态丢了
+    优先级是 ``LOSSY``：诊断价值高，但丢了不改变任何行为。粘性与健康统计丢了
     会让路由走错，日志丢了只是看不到——队列告急时先牺牲这一类是对的。
 
     ``error`` 直接取自 ``AttemptOutcome.error``，只含异常类型名或 errno 名，
@@ -410,7 +410,7 @@ class WriteQueue:
 
     @property
     def dropped_critical(self) -> int:
-        """**非零即为严重问题**：粘性或熔断状态没能落盘，重启后会丢失。"""
+        """**非零即为严重问题**：粘性或健康统计没能落盘，重启后会丢失。"""
         return self.dropped[Priority.CRITICAL]
 
     def put(self, op: WriteOp) -> bool:

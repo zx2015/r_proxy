@@ -160,7 +160,7 @@ async def health(app: AppDep) -> HealthResponse:
 
 @router.post("/health/{name}/reset", dependencies=[Authenticated])
 async def reset_health(name: str, request: Request, app: AppDep) -> UpstreamHealthItem:
-    """手动解除熔断。直接改内存状态，落盘由周期任务负责。"""
+    """兼容旧接口：清连续失败和认证标志，保留累计统计及负面记忆。"""
     cfg = app.snapshot.upstream(name)
     if cfg is None:
         raise HTTPException(404, detail="出口不存在")

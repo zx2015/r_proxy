@@ -207,7 +207,7 @@ class TestRoundRobin:
         router.build_chain(target(), snap, EMPTY_RULE_SET, state, now=0.0)
         assert state.cursors.next(10) == 1
 
-    def test_rotation_is_stable_when_a_member_becomes_unavailable(self, router: Router) -> None:
+    def test_rotation_keeps_members_with_upstream_failures(self, router: Router) -> None:
         snap = make_snapshot(
             upstream("a", priority=10),
             upstream("b", priority=10),
@@ -220,7 +220,7 @@ class TestRoundRobin:
             router.build_chain(target(), snap, EMPTY_RULE_SET, state, now=1.0).chain
             for _ in range(6)
         }
-        assert chains == {("a", "c"), ("c", "a")}
+        assert chains == {("a", "b", "c"), ("b", "c", "a"), ("c", "a", "b")}
 
 
 class TestFilters:
@@ -231,13 +231,16 @@ class TestFilters:
         state = RuntimeState.from_snapshot(snap)
         assert router.build_chain(target(), snap, EMPTY_RULE_SET, state, now=0.0).chain == ("a",)
 
-    def test_open_breaker_excludes_the_upstream(self, router: Router) -> None:
+    def test_repeated_upstream_errors_do_not_exclude_the_upstream(self, router: Router) -> None:
         snap = make_snapshot(
             upstream("a", priority=10), upstream("b", priority=20), routing=BREAKER
         )
         state = RuntimeState.from_snapshot(snap)
         open_breaker(state, "a")
-        assert router.build_chain(target(), snap, EMPTY_RULE_SET, state, now=1.0).chain == ("b",)
+        assert router.build_chain(target(), snap, EMPTY_RULE_SET, state, now=1.0).chain == (
+            "a",
+            "b",
+        )
 
     def test_route_memory_excludes_the_upstream_for_that_host_only(self, router: Router) -> None:
         snap = make_snapshot(upstream("a", priority=10), upstream("b", priority=20))
@@ -376,7 +379,7 @@ class TestRelaxation:
         )
         state = RuntimeState.from_snapshot(snap)
         for name in ("a", "b", "c"):
-            open_breaker(state, name)
+            state.memory.block("example.com", name, now=0.0, reason="route_error")
         decision = router.build_chain(target(), snap, EMPTY_RULE_SET, state, now=1.0)
         chain = decision.chain
         assert decision.relaxed is True
@@ -560,10 +563,10 @@ class TestStickyPrepend:
         state.sticky.record_success("example.com", "b", now=0.0)
         assert router.build_chain(target(), snap, EMPTY_RULE_SET, state, now=0.0).switchable is True
 
-    def test_a_sticky_upstream_in_cooldown_is_neither_prepended_nor_cleared(
+    def test_a_sticky_upstream_remains_preferred_after_upstream_errors(
         self, router: Router
     ) -> None:
-        """清除是执行层的职责。路由层因熔断暂时跳过它，不代表这个绑定是错的。"""
+        """出口级失败不再影响粘性前置，绑定保留。"""
         snap = make_snapshot(
             upstream("a", priority=10), upstream("b", priority=20), routing=BREAKER
         )
@@ -571,8 +574,8 @@ class TestStickyPrepend:
         state.sticky.record_success("example.com", "b", now=0.0)
         open_breaker(state, "b")
         decision = router.build_chain(target(), snap, EMPTY_RULE_SET, state, now=1.0)
-        assert decision.chain == ("a",)
-        assert decision.source == "priority"
+        assert decision.chain == ("b", "a")
+        assert decision.source == "auto"
         assert state.sticky.get("example.com") is not None
 
     def test_a_sticky_upstream_with_negative_memory_is_not_prepended(self, router: Router) -> None:

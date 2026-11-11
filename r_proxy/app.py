@@ -8,13 +8,15 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
+import sys
 import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from r_proxy.config.loader import ConfigError, load
+from r_proxy.config.loader import ConfigError, expand_user_path, load
 from r_proxy.config.model import ConfigSnapshot
 from r_proxy.config.validate import ValidationIssue, validate
 from r_proxy.egress.capability import probe_ipv6_egress
@@ -47,7 +49,10 @@ class Application:
         overrides: Mapping[str, object] | None = None,
         drain_timeout: float = DEFAULT_DRAIN_TIMEOUT,
     ) -> None:
-        self._config_path = config_path
+        try:
+            self._config_path = expand_user_path(config_path).absolute()
+        except ConfigError as exc:
+            raise StartupError(str(exc)) from exc
         self._overrides = dict(overrides or {})
         self._drain_timeout = drain_timeout
         self._snapshot: ConfigSnapshot | None = None
@@ -132,7 +137,7 @@ class Application:
         )
 
     async def start(self) -> None:
-        snapshot = self._load_snapshot()
+        snapshot = await asyncio.to_thread(self._load_snapshot)
         has_ipv6 = probe_ipv6_egress()
         loaded = await asyncio.to_thread(self._load_rules, snapshot)
         _raise_on_errors(
@@ -169,7 +174,11 @@ class Application:
             apply_initial_state(self._server.state, initial)
             # 决策层禁止 I/O，探测结果只能从这里注入。
             self._server.state.set_ipv6_egress(has_ipv6)
-            await self._server.start()
+            try:
+                await self._server.start()
+            except OSError as exc:
+                listen = snapshot.listen
+                raise _listener_error("代理", listen.host, listen.port, exc) from exc
             self._background = [
                 asyncio.create_task(
                     HealthPersister(storage.queue, initial=initial).run(self._server.state)
@@ -209,9 +218,20 @@ class Application:
                 exc.name,
             )
             return
+        except OSError as exc:
+            cfg = self.snapshot.webui
+            raise _listener_error("Web 管理界面", cfg.host, cfg.port, exc) from exc
         self._web = runner
-        cfg = self.snapshot.webui
-        logger.info("Web 管理界面监听于 %s:%s", cfg.host, cfg.port)
+        self._background.append(asyncio.create_task(self._log_web_address(runner)))
+
+    async def _log_web_address(self, runner: WebRunner) -> None:
+        try:
+            await runner.wait_started()
+            host, port = runner.bound_address
+        except Exception:
+            logger.warning("未能确认 Web 管理界面的绑定地址", exc_info=True)
+            return
+        logger.info("Web 管理界面监听于 %s:%s", host, port)
 
     async def stop(self) -> None:
         self._stopping.set()
@@ -273,7 +293,11 @@ class Application:
         失败时保留正在生效的快照：一次手滑的编辑不应该让代理停摆。新快照
         通过单次引用赋值替换，处理中的请求继续用它启动时取到的那一份。
         """
-        snapshot = self._load_snapshot()
+        snapshot = await asyncio.to_thread(self._load_snapshot)
+        if self._storage is not None:
+            changed_fields = self._storage.restart_required_fields(snapshot.database)
+            if changed_fields:
+                raise StartupError("存储配置变更需要重启：" + ", ".join(changed_fields))
         # 重探：网络环境可能在两次加载之间变化（拨号、切 Wi-Fi、容器换网）。
         has_ipv6 = probe_ipv6_egress()
         loaded = await asyncio.to_thread(self._load_rules, snapshot)
@@ -296,6 +320,16 @@ class Application:
         current = self._snapshot
         changed = current is None or current.config_version != snapshot.config_version
         store = await asyncio.to_thread(self._ensure_rules_db, snapshot)
+        if self._storage is not None:
+            try:
+                await asyncio.to_thread(
+                    self._storage.reconfigure,
+                    snapshot.database,
+                    snapshot.limits,
+                    float(snapshot.routing.sticky_ttl),
+                )
+            except StorageError as exc:
+                raise StartupError(str(exc)) from exc
         # 校验和建库都成功后再同时发布，期间不能把 Web 写入门面切到被拒绝的库。
         self._snapshot, self._rules, self._rules_store = snapshot, loaded.rule_set, store
         if self._server is not None:
@@ -378,3 +412,16 @@ def _nofile_limit() -> int | None:
     except (OSError, ValueError):
         return None
     return None if soft < 0 else soft
+
+
+def _listener_error(component: str, host: str, port: int, exc: OSError) -> StartupError:
+    prefix = f"{component}监听 {host}:{port} 失败："
+    if exc.errno in {errno.EADDRINUSE, 10048}:
+        hint = "端口已被占用。请确认端口归属和旧进程是否已退出，再重试。"
+        if sys.platform == "win32":
+            hint += "Windows 上也可能有尚未释放的连接，例如 TIME_WAIT。"
+    elif exc.errno in {errno.EACCES, errno.EPERM, 10013}:
+        hint = "没有监听权限。请检查服务账户权限或系统保留端口。"
+    else:
+        hint = str(exc)
+    return StartupError(prefix + hint)

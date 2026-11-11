@@ -25,6 +25,7 @@
 4. **Validation (验证)**:
    - 运行 `ruff check`、`mypy r_proxy` 以及相关测试套件。
    - 确保协议解析与路由逻辑有对应的测试用例覆盖。
+   - 握手超时必须覆盖 `write`、`drain()` 与读取的完整阶段；增加写侧阻塞回归，并按超时阶段区分失败统计。此前 HTTP 转发/relay 与 CONNECT 均出现过遗漏，不能只检查读侧 timeout（2026-11-11，见 `.learnings/knowledge/asyncio-limit-and-backpressure-pitfalls.md`）。
    - 若 asyncio 测试工作线程已空闲但事件循环仍等待，先检查 debug 日志是否出现 self-pipe `csock.send` 的 `PermissionError: Operation not permitted`。这是沙箱拦截内部唤醒的证据；使用获准的沙箱外环境重跑，不能据此修改生产异步逻辑或简单放宽测试超时。
 
 ---
@@ -208,3 +209,9 @@ sequenceDiagram
 ### 5.1d 数字 IPv4 前缀规则（2026-10-24 用户确认与上线）
 
 纯数字 IPv4 前缀通配符（如 `192.168.*`）只匹配合法 IPv4 地址，不匹配域名或 IPv6；分类为 `IPV4_WILDCARD`。运行匹配与保存交集检查必须使用相同地址类型约束。互斥规则不依赖优先级；同出口交叠仍拒绝。`exclusive-v2` 已上线，生产388条规则预检零冲突；此前数字前缀交叠和暂缓切换记录仅代表确认前的历史状态。
+
+### 0.3.3 全局熔断移除（2026-11-04 用户确认）
+
+> ⚠️ 已过时：此前关于 upstream_error 触发全局熔断、direct 永不熔断等状态机要求自0.3.3起不再适用。
+
+按用户要求移除全局熔断及半开探针过滤，只保留目标/出口负面记忆；失败分类用于统计与安全切换，任何健康统计不得阻断其他目标使用同一出口。旧配置/API/数据库字段仅兼容，不可重新开启熔断。参见[移除设计](docs/design/REMOVE_GLOBAL_CIRCUIT.md)。

@@ -6,10 +6,10 @@
 
 import { api } from "../api.js";
 import { badge, button, clear, el, emptyRow, field, input, select, table, td, text } from "../dom.js";
-import { ago, circuit, millis, percent } from "../format.js";
+import { ago, millis, percent } from "../format.js";
 import { clearNotice, confirmAction, describeError, notify, section, toolbar } from "../ui.js";
 
-const COLUMNS = 9;
+const COLUMNS = 8;
 const NAME_PATTERN = "[A-Za-z0-9][A-Za-z0-9._-]*";
 
 // 只认「结尾是冒号加数字」，故意宽松：IPv6 的冒号歧义交给后端判定，前端宁可
@@ -52,7 +52,7 @@ function mount(root) {
 
 function tableShell() {
   const built = table(
-    ["名称", "类型", "地址", "优先级", "启用", "熔断", "成功率", "最近成功", "操作"],
+    ["名称", "类型", "地址", "优先级", "启用", "成功率", "最近成功", "操作"],
     [],
   );
   built.replaceChild(nodes.tableBody, built.tBodies[0]);
@@ -128,14 +128,12 @@ function renderTable() {
 }
 
 function displayRow(item) {
-  const health = circuit(item.health.circuit_state);
   return el("tr", {}, [
     td(item.has_auth ? `${item.name}（含凭据）` : item.name),
     td(item.type),
     td(item.address),
     td(item.priority),
     el("td", {}, [badge(item.enabled ? "启用" : "停用", item.enabled ? "ok" : "muted")]),
-    el("td", {}, [badge(health.label, health.kind)]),
     td(percent(item.health.success_rate)),
     td(ago(item.health.last_success_age_seconds)),
     el("td", { class: "actions" }, [
@@ -174,7 +172,6 @@ function editorRow(item) {
     el("td", {}, [address]),
     el("td", {}, [priority]),
     el("td", {}, [enabled]),
-    td("—"),
     td("—"),
     td("—"),
     el("td", { class: "actions" }, [

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import threading
 import time
 from typing import TYPE_CHECKING
 
@@ -67,7 +68,7 @@ _TRIM_AUDIT_BY_ROWS = """
 class Retention:
     """按固定间隔在写者线程内执行清理。"""
 
-    __slots__ = ("_cfg", "_expiry", "_interval", "_next_run")
+    __slots__ = ("_cfg", "_expiry", "_interval", "_next_run", "_lock")
 
     def __init__(
         self,
@@ -77,6 +78,7 @@ class Retention:
         interval_seconds: float = DEFAULT_INTERVAL_SECONDS,
         first_run_immediately: bool = True,
     ) -> None:
+        self._lock = threading.RLock()
         self._cfg = cfg
         # 默认禁用粘性清理：只有 StorageService 显式注入策略时才生效，
         # 让旧调用点（不带 expiry 的测试）保持原行为。
@@ -85,6 +87,11 @@ class Retention:
         # 默认启动后立刻跑一次：进程可能刚好在上次清理前崩了，日志表已经
         # 超限，再等一小时只会让它继续涨。
         self._next_run = 0.0 if first_run_immediately else time.monotonic() + interval_seconds
+
+    def reconfigure(self, cfg: DatabaseConfig, expiry: StickyExpiryPolicy) -> None:
+        """与完整清理轮次串行，返回后新轮次只能使用新策略。"""
+        with self._lock:
+            self._cfg, self._expiry = cfg, expiry
 
     def maybe_run(
         self, connections: dict[Database, sqlite3.Connection], metrics: WriterMetrics
@@ -100,12 +107,13 @@ class Retention:
         return True
 
     def run(self, connections: dict[Database, sqlite3.Connection]) -> int:
-        state_conn = connections[Database.STATE]
-        return (
-            self._clean_logs(connections[Database.LOGS])
-            + self._clean_blocks(state_conn)
-            + self._clean_sticky(state_conn)
-        )
+        with self._lock:
+            state_conn = connections[Database.STATE]
+            return (
+                self._clean_logs(connections[Database.LOGS])
+                + self._clean_blocks(state_conn)
+                + self._clean_sticky(state_conn)
+            )
 
     def _clean_logs(self, conn: sqlite3.Connection) -> int:
         cutoff = int(time.time()) - self._cfg.retention_days * DAY_SECONDS

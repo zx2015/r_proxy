@@ -104,6 +104,7 @@ async def client(tmp_path: Path) -> AsyncIterator[httpx.AsyncClient]:
     app = Application(config_path=config)
     await app.start()
     async with httpx.AsyncClient(
+        trust_env=False,
         transport=httpx.ASGITransport(app=create_app(app), client=("127.0.0.1", 12345)),
         base_url="http://webui.test",
     ) as session:
@@ -443,7 +444,9 @@ class TestStaticHosting:
             return {"reached": True}
 
         transport = httpx.ASGITransport(app=web, client=("127.0.0.1", 12345))
-        async with httpx.AsyncClient(transport=transport, base_url="http://webui.test") as session:
+        async with httpx.AsyncClient(
+            trust_env=False, transport=transport, base_url="http://webui.test"
+        ) as session:
             response = await session.get("/api/added-later")
         await app.stop()
         assert response.json() == {"reached": True}

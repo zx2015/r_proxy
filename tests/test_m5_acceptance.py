@@ -180,6 +180,7 @@ class TestMatchingSemantics:
         hosts = ("api.github.com", "api.example.net")
         try:
             async with httpx.AsyncClient(
+                trust_env=False,
                 transport=httpx.ASGITransport(app=create_app(app), client=("127.0.0.1", 12345)),
                 base_url="http://webui.test",
             ) as client:
@@ -350,6 +351,7 @@ class TestWebWrites:
             )
         )
         client = httpx.AsyncClient(
+            trust_env=False,
             transport=httpx.ASGITransport(app=create_app(app), client=("127.0.0.1", 12345)),
             base_url="http://webui.test",
         )

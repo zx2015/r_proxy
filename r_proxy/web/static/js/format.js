@@ -50,17 +50,3 @@ export function millis(value) {
   if (value === null || value === undefined) return "—";
   return `${Math.round(value)} ms`;
 }
-
-/** 熔断状态的中文与配色档位。*/
-export function circuit(state) {
-  switch (state) {
-    case "closed":
-      return { label: "正常", kind: "ok" };
-    case "half_open":
-      return { label: "半开", kind: "warn" };
-    case "open":
-      return { label: "熔断", kind: "bad" };
-    default:
-      return { label: state ?? "未知", kind: "muted" };
-  }
-}

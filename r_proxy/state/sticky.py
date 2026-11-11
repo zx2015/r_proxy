@@ -52,29 +52,28 @@ class StickyCache:
         return self._ttl
 
     def get(self, host: str) -> StickyEntry | None:
-        """返回**活引用**而非副本：这是每请求都走的热路径。
-
-        调用方只读——**不会**因 TTL 触发删除。需要过期判定请用 :meth:`get_live`。
-        适合存活性检查、调试日志、metrics 计数等「看一眼不动状态」的场景。
-        """
+        """返回活引用并调整 LRU。需要判断 TTL 时使用 :meth:`get_live`。"""
         entry = self._entries.get(host)
         if entry is not None:
             self._entries.move_to_end(host)
         return entry
 
-    def get_live(self, host: str, *, now: float) -> StickyEntry | None:
-        """带惰性过期的查询。``auto`` 条目空闲达到 ``ttl`` 时**当场删除**并返回
-        ``None``；``manual`` 永不过期。
+    def get_live(
+        self, host: str, *, now: float, touch: bool = True
+    ) -> StickyEntry | None:
+        """按 TTL 查询条目。默认删除过期项，有效项调整 LRU 后返回活引用。
 
-        故意与 :meth:`get` 分开：路由热路径以外需要「只读」的代码不应承担过期
-        删除这种副作用，也避免每次拿到活引用都要重新判定 TTL。
+        touch=False 时保留条目及 LRU。过期项返回 None，有效项返回副本。
         """
         entry = self._entries.get(host)
         if entry is None:
             return None
-        if self._ttl > 0.0 and entry.source != "manual" and now - entry.last_used_at >= self._ttl:
-            del self._entries[host]
+        if self._expired(entry, now=now):
+            if touch:
+                del self._entries[host]
             return None
+        if not touch:
+            return dataclasses.replace(entry)
         self._entries.move_to_end(host)
         return entry
 

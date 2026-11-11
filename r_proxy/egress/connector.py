@@ -25,7 +25,7 @@ from r_proxy.contracts import (
 from r_proxy.egress.socks5 import socks5_handshake
 
 # 明确表示地址族不可达。归为 CAPABILITY_MISMATCH：记入日志便于诊断，
-# 但不写负面记忆、不累加熔断计数（PRD §4.3.6）。
+# 但不写负面记忆、不累加出口级失败计数（PRD §4.3.6）。
 CAPABILITY_ERRNOS = frozenset(
     {
         errno.ENETUNREACH,
@@ -88,8 +88,8 @@ def classify_transport(exc: BaseException, *, is_direct: bool) -> FailureKind:
     """对传输层异常做初步归类。
 
     连接对象决定归类：``direct`` 连的是**目标**，连不上说明这条路走不通
-    （``route_error``，且 direct 永不熔断）；上级代理连的是**代理自己**，
-    连不上说明这个出口整体不可用（``upstream_error``，计入熔断）。
+    （``route_error``，且 direct 只统计路径失败）；上级代理连的是**代理自己**，
+    连不上说明这个出口整体不可用（``upstream_error``，记录出口级失败统计）。
     只看 errno 无法区分二者——同一个 ``ECONNREFUSED`` 在两种场景下含义相反。
     """
     if isinstance(exc, OSError) and exc.errno in CAPABILITY_ERRNOS:
@@ -162,7 +162,7 @@ class UpstreamConnector:
         endpoint = upstream.endpoint
         if endpoint is None:
             # 启动校验（E_ADDRESS_FORMAT）本应拦下，走到这里说明配置绕过了校验。
-            # 归为 CAPABILITY_MISMATCH：这不是网络故障，熔断计数没有意义。
+            # 归为 CAPABILITY_MISMATCH：这不是网络故障，出口级失败计数没有意义。
             raise ConnectorError(FailureKind.CAPABILITY_MISMATCH, "BAD_UPSTREAM_ADDRESS")
         return endpoint
 
@@ -207,17 +207,19 @@ class UpstreamConnector:
             f"\r\n"
         ).encode("ascii")
 
+        waiting_for_response = False
         try:
-            conn.writer.write(request)
-            await conn.writer.drain()
             async with asyncio.timeout(timeout):
+                conn.writer.write(request)
+                await conn.writer.drain()
+                waiting_for_response = True
                 raw = await conn.reader.readuntil(b"\r\n\r\n")
         # TimeoutError 是 OSError 的子类，必须排在前面，否则永远走不到。
         except TimeoutError as exc:
-            # TCP 已经连上代理，它却一个字节都不回：代理是活的，卡在它到目标
-            # 那一段。归 upstream_error 会让被墙的目标把健康出口整个熔断，
-            # 连带其余目标一起不可用（DD_SWITCHING §8 同一条理由）。
-            raise ConnectorError(FailureKind.ROUTE_ERROR, error_name(exc)) from exc
+            # 写阶段超时表示代理不接收握手；drain 完成后等应答超时可能
+            # 卡在目标路径。区分失败统计，两者都不会触发全局熔断。
+            kind = FailureKind.ROUTE_ERROR if waiting_for_response else FailureKind.UPSTREAM_ERROR
+            raise ConnectorError(kind, error_name(exc)) from exc
         except OSError as exc:
             raise ConnectorError(FailureKind.UPSTREAM_ERROR, error_name(exc)) from exc
         except asyncio.IncompleteReadError as exc:
@@ -243,7 +245,7 @@ def _parse_handshake_response(raw: bytes) -> tuple[int, Headers]:
     用 ``latin-1`` 而非 ``ascii`` 解码：单字节编码对任何字节序列都不会抛异常，
     与 ``protocol/connection.py`` 解析普通响应头的方式一致。少数非标代理会在
     ``Server`` 等头里塞非 ASCII 字符，用 ``ascii`` 严格解码会让整次握手直接判
-    为 ``UPSTREAM_ERROR``，进而计入全局熔断——代理本身是通的，不该因为一个
+    为 ``UPSTREAM_ERROR``，进而记录出口级失败统计——代理本身是通的，不该因为一个
     头的字节而被拉黑。
     """
     if len(raw) > MAX_HANDSHAKE_BYTES:

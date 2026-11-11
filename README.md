@@ -5,7 +5,7 @@
 [![Web extra](https://img.shields.io/badge/%5Bweb%5D-fastapi%20%7C%20uvicorn%20%7C%20tomlkit-blueviolet.svg)](#%E5%BF%AB%E9%80%9F%E5%BC%80%E5%A7%8B)
 [![License](https://img.shields.io/badge/license-TBD-lightgrey.svg)](#%E8%AE%B8%E5%8F%AF%E8%AF%81)
 
-轻量级 HTTP/HTTPS 正向代理，具备多上级代理优先级故障切换、规则路由、粘性会话记忆、熔断保护与 Web 管理界面。代理核心使用 Python 3.12 标准库实现，**零运行时第三方依赖**；Web 管理界面作为可选组件按需安装。
+轻量级 HTTP/HTTPS 正向代理，具备多上级代理优先级故障切换、规则路由、粘性会话记忆与 Web 管理界面。代理核心使用 Python 3.12 标准库实现，**零运行时第三方依赖**；Web 管理界面作为可选组件按需安装。
 
 ## 特性
 
@@ -13,9 +13,9 @@
 - **多协议上级出口**：支持 HTTP 与 SOCKS5（RFC 1928/1929 用户名密码认证）上级代理以及 direct 直连，支持 L4 隧道、origin-form 转发与盲转发
 - **多上级代理与优先级故障切换**：出口按 `priority`（数字越小越优先）排序，同优先级组内轮询；出口不可用时按判据自动切换到下一个
 - **稳健的切换判据**：区分传输层失败与 HTTP 响应、区分"代理不可用"与"目标已处理"、非幂等方法不重试、大请求体流式转发后不可切换、CONNECT 建立前的客户端字节会缓存并在新隧道重放
-- **规则路由**：按主机名的有序规则表，支持精确匹配、`*.domain` 域名及子域、`host.*` 通配符、IP/IPv6 字面量、正则六种条件类型，首条命中即强制路由（跳过粘性与切换逻辑），只经 Web 界面维护
+- **规则路由**：按主机名的互斥规则集合，任意主机最多命中一条。支持精确匹配、`*.domain` 域名及子域、`host.*` 通配符、IP/IPv6 字面量，命中即强制路由（跳过粘性与切换逻辑），只经 Web 界面维护
 - **粘性会话记忆**：同一 host 自动复用上次成功的出口，减少每次请求都重新遍历候选链的开销；支持手动绑定（`manual`，优先级高于自动记忆）并可持久化跨重启
-- **熔断保护**：出口连续失败达到阈值后短暂剔除出候选链；`direct` 出口永不参与全局熔断，避免个别被墙站点拖垮内网直连
+- **目标级负面记忆**：按 `(host, upstream)` 暂时避开失败路径；0.3.3 起移除全局熔断，其他目标仍可尝试同一出口
 - **IPv4 → IPv6 网关**：入向仅接受 IPv4 客户端，出向支持连接纯 IPv6 目标，对 `direct` 出口启用 Happy Eyeballs（`RFC 8305`）
 - **SQLite 持久化**：`state.db`（粘性映射、健康状态，不可丢失）与 `logs.db`（请求审计、切换事件，可丢弃）分库存储，热路径不做同步磁盘 I/O，全部写入经唯一写者线程批量落盘
 - **Web 管理界面**（可选）：监控看板、请求日志动态状态码筛选、上级代理管理、粘性映射管理、规则编辑、全局配置，均通过 REST API 驱动
@@ -29,7 +29,7 @@
 |------|------|----------|
 | **热路径不阻塞** | `sqlite3` 与 `getaddrinfo` 是同步阻塞调用，在事件循环中调用会卡住所有连接转发 | 路由决策只读内存；DB 写入经队列由独立线程落盘；DNS 解析走 `loop.getaddrinfo`；Web 查询走 `asyncio.to_thread` |
 | **唯一写者** | 多 SQLite 写者会触发 `SQLITE_BUSY` 并丢更新（实测 4 并发写者丢失 75% 计数） | `state.db` / `logs.db` 各自一个写者线程，`rules.db` 归 Web 配置写入器；Web 进程数固定为 1 |
-| **失败归因** | 「代理坏了」「经这个代理到不了这个目标」「地址族不匹配」是三件不同的事 | 熔断只统计 `upstream_error`；`route_error` 只记 `(host, upstream)`；地址族不匹配在候选链构造阶段过滤 |
+| **失败归因** | 「代理坏了」「经这个代理到不了这个目标」「地址族不匹配」是三件不同的事 | 失败分类用于统计与切换；负面记忆按 `(host, upstream)` 隔离；地址族不匹配在候选链构造阶段过滤 |
 
 ```mermaid
 flowchart LR
@@ -227,7 +227,7 @@ password = "secret"       # 可选
 priority = 20
 ```
 
-路由规则不写在配置文件里，只能通过 Web 界面维护并存入 `rules.db`；这是为了支持首匹配胜出的有序表语义与在线编辑，详见 [`docs/requirements/RULES_CONFIG.md`](docs/requirements/RULES_CONFIG.md)。
+路由规则不写在配置文件里，只能通过 Web 界面维护并存入 `rules.db`；规则固定按条件字母排序，位置仅用于标识快照中的条目，保存时拒绝重叠，详见 [`docs/requirements/RULES_CONFIG.md`](docs/requirements/RULES_CONFIG.md)。
 
 ### 环境变量
 
@@ -235,6 +235,8 @@ priority = 20
 |------|------|
 | `R_PROXY_CONFIG` | 配置文件路径，未传 `--config` 时生效 |
 | `R_PROXY_WEB_TOKEN` | Web 界面认证 token，优先级高于配置文件中的 `webui.auth_token` |
+
+相对数据库路径以配置文件所在目录为基准。升级时请核对原来依赖工作目录的相对路径，并填写旧库的绝对路径。启动和 `--check` 在发现当前工作目录存在有效旧库、新位置缺失或无有效库表时报告 `E_LEGACY_DB_PATH`。两处有效库并存时提示核对。SQLite 库应放在本地文件系统。Windows 默认配置位置为 `%APPDATA%/r-proxy/config.toml`，旧用户目录配置仍可回退读取。服务托管与正常停止见 [部署说明](docs/design/DD_DEPLOY.md#034-跨平台运行补充)。
 
 ## 路由决策顺序
 
@@ -256,7 +258,7 @@ priority = 20
 | 监控看板 | `/` | 概览卡片、出口健康表、实时请求日志、切换事件流 |
 | 上级代理管理 | `/upstreams` | 增删改、优先级拖拽排序、启用开关、连通性测试 |
 | 粘性映射管理 | `/sticky` | 查看/清除自动记忆、手动改绑、固化为规则、负面记忆管理 |
-| 规则编辑 | `/rules` | 有序规则表的增删改、拖拽排序、语法校验 |
+| 规则编辑 | `/rules` | 互斥规则的增删改、条件字母排序、语法与交叠校验 |
 | 全局设置 | `/settings` | 监听地址、超时、切换策略等配置项的表单编辑 |
 
 安全要求：非回环绑定必须配置 `auth_token`，否则拒绝启动；启用认证后 `/api/*` 全部需要 token（包含只读接口）；比较用 `secrets.compare_digest`；日志中只记 token 哈希前 8 位。详见 [`docs/requirements/WEBUI_SPEC.md`](docs/requirements/WEBUI_SPEC.md) §7。
@@ -280,7 +282,7 @@ r_proxy/
 ├── server.py            # 服务器生命周期
 ├── handler.py            # 请求处理入口（HTTP + CONNECT）
 ├── protocol/             # 请求/响应解析、连接层
-├── routing/              # 候选链构造、粘性、健康与熔断状态机
+├── routing/              # 候选链构造、粘性、健康统计
 ├── egress/                # 出口连接器（direct / http 上级）
 ├── storage/               # 三库 schema、写者线程、写队列
 ├── config/                # 配置模型、加载、校验、热重载
@@ -337,3 +339,11 @@ pytest
 ## 许可证
 
 > ⚠️ 待定：项目尚未在仓库根目录声明 `LICENSE` 文件。在添加之前，默认为「保留所有权利」（All rights reserved）。如需以开源协议发布，可在 `LICENSE` 中选择 MIT / Apache-2.0 / BSD-3-Clause 等常见协议后再行调整。
+
+### 0.3.4 热重载与路由预览
+
+日志保留与粘性过期策略随热重载更新。Web 恢复备份时提前校验需重启的存储字段。路由预览只读取当前决策所需的状态。Compose 镜像标签为 `r-proxy:0.3.4`。
+
+### 0.3.3 全局熔断移除
+
+旧 `[routing.circuit_breaker]` 配置仍可加载，但不会生效。负面记忆、自动切换和健康统计继续工作；界面不再提供熔断设置。详见[兼容与升级设计](docs/design/REMOVE_GLOBAL_CIRCUIT.md)。

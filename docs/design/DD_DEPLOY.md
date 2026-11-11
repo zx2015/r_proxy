@@ -2,6 +2,11 @@
 
 | 版本号 | 日期 | 变更说明 | 作者 |
 | :--- | :--- | :--- | :--- |
+| v0.3.4-legacy-review | 2026-11-11 | 补齐双库升级诊断和 Web 端口冲突后果 | Agent |
+| v0.3.4-upgrade | 2026-11-11 | 升级预检、端口诊断和 Windows 服务停止 | Agent |
+| v0.3.4-platform | 2026-11-11 | 跨平台路径、Windows 正常停止和日志验收 | Agent |
+| v0.3.4-review | 2026-11-11 | 只读路由预览与存储重启字段预校验 | Agent |
+| v0.3.3-removal | 2026-11-04 | 移除全局熔断，保留负面记忆与统计；见末尾修订 | Agent |
 | v1.14.0 | 2026-10-24 | 版本升级至0.3.2并重建容器，部署有效期小时输入与悬停提示 | Agent |
 | v1.13.0 | 2026-10-24 | 版本升级至0.3.1并重建正式容器，全局设置增加自动粘性有效期入口 | Agent |
 | v1.12.0 | 2026-10-24 | 用户确认IPv4前缀IP-only后正式升级完成：388规则零冲突、1460测试、备份/回退标签、生产Web/HTTP/CONNECT与源码树验证 | Agent |
@@ -807,3 +812,54 @@ docker compose up -d r-proxy
 ### 18.1 v0.3.2 Git交付前完整验证
 
 2026-10-24用户授权提交并push。获取origin后，本地main与origin/main相同，无待合并提交。交付前完整pytest为1471 passed、2条既有websockets依赖弃用警告；Ruff、MyPy及diff检查通过。提交包含互斥规则、IPv4专用通配符、规则列表筛选/字母序/分页/取消调序、自动粘性有效期小时输入与提示、0.3.2版本及配套文档测试；.learnings、TODO.md及.Codex按本地规则排除。上文“不发布Git提交”为此前部署时状态，此次按新授权交付。
+
+## 0.3.4：评审整改发布准备
+
+0.3.4 使用独立镜像标签。发布时按本文既有流程保留当前 0.3.3 镜像和配置、SQLite 备份，先预检候选镜像，再重建单个 r-proxy 服务并验证实际运行版本、健康状态及 HTTP/CONNECT 负载。
+
+## 0.3.3：全局熔断移除修订
+
+> ⚠️ 已过时：本文早期关于全局熔断、冷却、半开探针和相关界面的描述自0.3.3起由本节取代，其余有效内容保留。
+
+移除全局健康状态对路由的过滤，保留目标/出口负面记忆、失败切换与统计。旧配置/API/数据库字段仅兼容，不能重新开启功能。完整接口兼容、验收及实施计划见[移除设计](REMOVE_GLOBAL_CIRCUIT.md)。
+
+### 0.3.3 正式容器升级记录（2026-11-04）
+
+- 先同步需求/设计再实现全局熔断移除；完整测试1462 passed，另对旧Web设置写入enabled=true不能开启功能的断言定向通过。Ruff、MyPy及前端JS语法检查通过。
+- 持久回退备份：`/media/data/r-proxy-docker/rollback/pre-0.3.3-20261104-071649`，配置与三个SQLite库通过SQLite backup API一致性备份；目录0700、文件0600。旧镜像保留为`r-proxy:pre-no-circuit-20261104`。
+- 构建：`DOCKER_BUILDKIT=0 docker compose build r-proxy`。新镜像以生产config/data只读挂载、network=none运行`r-proxy --check`退出0后，执行`docker compose up -d --no-deps --force-recreate r-proxy`。
+- 正式镜像`r-proxy:0.3.3`，image ID `sha256:e7e33cde7fb7b857a7222e38f3c8cabebc9af5c62b4bf563ee1e4401c9af2528`，启动于2026-11-04 07:19:21（本地），running/healthy、RestartCount=0。
+- 实际鉴权API返回版本0.3.3、circuit_breaker.enabled=false、5个出口均为兼容closed状态；配置文件SHA与规则逻辑内容SHA升级前后不变。79个运行文件与工作区内容核对通过（忽略文件尾部空白；format.js仅多一个空行）。
+- 经正式6060端口，以临时本地HTTP服务校验200及完整响应体，以临时本地echo服务校验CONNECT 200之后真实负载往返，均通过；未编辑生产规则、出口或负面记忆。
+- 回退可将Compose镜像临时指定为保留的旧镜像并使用`--no-build`重建；本轮没有破坏性schema迁移，不应直接覆盖运行数据库。必要恢复备份须先停服务并核对恢复范围。
+
+## 0.3.4 跨平台运行补充
+
+- 服务启动建议显式使用绝对配置路径。三个库的相对路径以配置目录为基准。已有相对配置若依赖原 CWD，应在升级前核对实际库位置，必要时写入旧库的绝对路径，避免指向空库。库及 WAL/SHM 旁文件使用服务宿主的本地文件系统，SMB/NFS 共享可用于存放备份。
+- Windows 用户默认配置路径示例为 `%APPDATA%/r-proxy/config.toml`。如新位置无文件，继续识别原用户目录下的 `.config/r-proxy/config.toml`。确认环境变量属于实际运行账户。
+- Windows 控制台可使用 Ctrl+C 或 Ctrl+Break。程序处理 SIGINT、SIGTERM、SIGBREAK 并请求正常关停，验收应看到存储关闭日志并验证最后一批写入可恢复。程序化发送 Ctrl+Break 需要共享控制台及正确的目标进程组，参见 [GenerateConsoleCtrlEvent](https://learn.microsoft.com/en-us/windows/console/generateconsolectrlevent)。
+- Windows 服务控制管理器发送 [SERVICE_CONTROL_STOP](https://learn.microsoft.com/en-us/windows/win32/services/service-control-requests)。服务包装器负责将它转换为子进程支持的关闭方式并等待退出。直接终止进程无法排空队列。关闭控制台窗口也不等同于发送 Ctrl+Break。
+- Windows CLI 使用 UTF-8 写标准输出和错误流。服务包装器或 Python 启动脚本可提前设置 `PYTHONUTF8=1`，日志收集端按 UTF-8 读取。
+- 快速重启遇到地址占用时，先等旧进程退出并核对代理和 Web 端口的持有者，稍等（例如 1 秒）再重试启动。Windows 的端口复用语义与 POSIX 有差异，不能仅凭错误认定是 TIME_WAIT。见 [Winsock 端口复用说明](https://learn.microsoft.com/en-us/windows/win32/winsock/using-so-reuseaddr-and-so-exclusiveaddruse)。
+- Web 配置 `port=0` 时用启动日志中的实际绑定端口访问。跨平台验收还应检查改变工作目录后的库路径、Windows 重定向中文输出，以及原始配置字节改变后的 `config_version`。
+
+### 跨平台回归验收清单
+
+- Windows 验证 `~` 展开、常规 NTFS 路径大小写比较以及配置和备份继承的目录 ACL。
+- 三平台验证无 IPv6 条件下的探测降级，以及双栈可用时由 asyncio 执行的 Happy Eyeballs。
+- 检查运行态计时使用单调时钟，持久化使用 Unix 时间戳，看板日期按本地时区划分。
+- 用同一服务返回的 `config_version` 提交编辑。原始字节和换行不同会产生不同版本。
+
+### 0.3.4 旧库升级预检
+
+1. 在替换程序前确认旧服务的工作目录与运行身份，核对三个实际数据库的路径。规则库同时核对规则行数及 revision。
+2. 现有部署应将三个 `database.*_path` 明确填写为旧库的绝对路径，保留备份。使用原服务账户和工作目录运行新版 `r-proxy --check --config <配置路径>`。若报 `E_LEGACY_DB_PATH`，按诊断检查旧库与候选位置。
+3. 启动后检查规则数量、revision 和内存回填。启动保护检查当前工作目录下的有效旧库。候选位置缺失或无对应库表时阻断，两处有效且指向不同文件时告警。
+
+代理或显式启用的 Web 监听绑定失败时，CLI 输出组件名、地址与处理提示，退出码为 2。Windows 地址冲突可能来自现有监听或尚未释放的连接，核对归属再重试。Web 端口冲突导致整个服务退出码 2，代理也不可用。请先释放端口或修改 `webui.port`，再启动服务。启动失败会回收已启动的代理和写者线程。可选 Web 依赖缺失仍沿用既有降级行为。
+
+### Windows 服务包装器停止配置
+
+- NSSM：保留应用控制台并启用 Ctrl+C 阶段。例如 `nssm set r-proxy AppNoConsole 0`，确认 `AppStopMethodSkip` 未包含掩码值 1。使用 `nssm set r-proxy AppStopMethodConsole 30000` 配置发送 Ctrl+C 后的等待时间，单位毫秒。按实测最大关停耗时调整。见 [NSSM Service shutdown](https://nssm.cc/usage#shutdown)。
+- WinSW v3：使用控制台可用的启动方式（`<hidewindow>false</hidewindow>`），并设置例如 `<stoptimeout>30sec</stoptimeout>`。WinSW 尝试 Ctrl+C，失败或超时会强制结束。见 [WinSW stoptimeout](https://github.com/winsw/winsw/blob/v3/docs/xml-config-file.md#stoptimeout)。
+- 两者均须实测停止时出现存储关闭总账，并在重启后核对尾批状态。强杀可能丢失尚未提交及仍在排队的数据。刷新周期和批大小无法给强杀损失设定上限。

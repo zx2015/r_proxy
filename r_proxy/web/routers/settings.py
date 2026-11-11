@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from r_proxy.app import StartupError
 from r_proxy.config.model import ConfigSnapshot
 from r_proxy.storage.queue import config_audit
+from r_proxy.storage.service import STORAGE_RESTART_FIELDS
 from r_proxy.web import queries, toml_edit
 from r_proxy.web.config_writer import ConfigConflict, ConfigInvalid
 from r_proxy.web.deps import AppDep, Authenticated, WriterDep, client_ip
@@ -46,7 +47,14 @@ router = APIRouter()
 AuditQueryDep = Annotated[AuditQuery, Depends()]
 
 # 改了要重启才生效的项。界面据此标注，避免用户以为改完就生效了（WEBUI_SPEC §6.3）。
-RESTART_REQUIRED = ("listen.host", "listen.port", "webui.host", "webui.port", "webui.auth_token")
+RESTART_REQUIRED = (
+    "listen.host",
+    "listen.port",
+    "webui.host",
+    "webui.port",
+    "webui.auth_token",
+    *(f"database.{field}" for field in STORAGE_RESTART_FIELDS),
+)
 
 
 @router.get("/settings", dependencies=[Authenticated])
@@ -69,6 +77,8 @@ async def update_settings(
     让客户端指定点分键就等于允许它写 `webui.auth_token`，或者写进任何一个加载器
     不认识的键——后者会让下一次启动直接失败。
     """
+    if body.circuit_breaker_enabled is True:
+        raise HTTPException(400, detail="全局熔断已移除，不能启用 circuit_breaker")
     changes = body.changes()
     if not changes:
         raise HTTPException(400, detail="没有要修改的设置")
@@ -206,7 +216,7 @@ def _project(snapshot: ConfigSnapshot) -> SettingsResponse:
                 window_seconds=r.status_switch_rate_limit.window_seconds,
             ),
             circuit_breaker=CircuitBreakerSettings(
-                enabled=r.circuit_breaker.enabled,
+                enabled=False,
                 fail_threshold=r.circuit_breaker.fail_threshold,
                 cooldown_seconds=r.circuit_breaker.cooldown_seconds,
             ),

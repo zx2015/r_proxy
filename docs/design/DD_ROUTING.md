@@ -2,6 +2,8 @@
 
 | 版本 | 日期 | 变更说明 | 作者 |
 | :--- | :--- | :--- | :--- |
+| v0.3.4-review | 2026-11-11 | 同步只读决策、游标及缓存查询契约 | Agent |
+| v0.3.3-removal | 2026-11-04 | 移除全局熔断，保留负面记忆与统计；见末尾修订 | Agent |
 | v1.9.1 | 2026-10-24 | 唯一规则匹配已实现且不再比较position；补充新规则集有效后原子发布，生产迁移仍待处理 | Agent |
 | v1.9.0 | 2026-10-24 | 新增 §11 互斥规则接入目标：运行时只使用已验证规则集，唯一匹配不比较 position；规则未命中的出口优先级与粘性路径保持既有职责 | Agent |
 | v1.8.0 | 2026-10-22 | 澄清 Happy Eyeballs 适用范围：最终目标经 `direct` 连接时由本机解析；若上级代理地址自身是域名，本机建立到上级代理的连接也会对该域名做双栈竞速；经上级代理访问的最终目标仍由上级解析 | Agent |
@@ -34,15 +36,16 @@ class Router:
         target: RequestTarget,
         snapshot: ConfigSnapshot,
         rule_set: RuleSet,
-        state: RuntimeStateView,       # 只读视图
+        state: RuntimeStateView,
         *,
         now: float,
+        update_state: bool = True,
     ) -> Decision: ...
 ```
 
 `now` 由调用方传入而非内部取 `time.monotonic()`：使全部时间相关逻辑（冷却期、TTL、限流窗口）在测试中可控，无需 sleep 或 mock 时钟。
 
-**`RuntimeStateView` 是只读协议**，`Router` 拿不到任何写方法。状态变更由 `AttemptExecutor` 在得到结果后执行，二者职责不混淆。
+`RuntimeStateView` 只声明路由依赖的负面记忆、粘性缓存、游标和 IPv6 能力。正常决策可推进游标和维护缓存。请求结果产生的学习、失败统计及落盘由 `AttemptExecutor` 处理。
 
 ---
 
@@ -58,9 +61,9 @@ flowchart TD
     C3 -->|否| C4[502 ipv6_unavailable<br/>+ 规则行号]
     C3 -->|是| C5["Decision(chain=(t,),<br/>switchable=False)"]
 
-    B -->|否| D[四道过滤]
+    B -->|否| D[检查启用状态、地址族与负面记忆]
     D --> E{过滤后为空?}
-    E -->|是| F[放宽：忽略熔断与负面记忆<br/>地址族过滤不放宽]
+    E -->|是| F[放宽：忽略负面记忆<br/>地址族过滤不放宽]
     F --> G{仍为空?}
     G -->|是| H[502 no_available_upstream]
     G -->|否| I
@@ -98,49 +101,43 @@ flowchart TD
 
 `manual` 的保护在存储层实现（UPSERT 带 `WHERE source != 'manual'`，见 [DD_STORAGE.md](./DD_STORAGE.md) §4.3）。路由层只需按「manual 优先于 auto」取值。
 
+### 2.3 只读决策模式
+
+`build_chain(..., update_state=False)` 复用正常决策的规则匹配、候选过滤、轮询排序和粘性前置。它不推进游标、不删除过期项、不调整 LRU 顺序。过期判定继续生效，预览只查询目标及候选出口所需的条目，不遍历或复制整份运行状态。调用过程没有 await，在同一事件循环截面完成。Web 入口见 [DD_WEB](DD_WEB.md)，状态方法见 §7.7。
+
 ---
 
 ## 3. 候选链构造
 
-### 3.1 四道过滤
+### 3.1 三道过滤
 
 ```python
-def _filter_usable(
-    self, target, snapshot, state, *, now, relaxed: bool
-) -> list[str]:
-    usable: list[str] = []
+def _filter_usable(self, target, snapshot, state, *, now, relaxed: bool, touch: bool):
+    usable: set[str] = set()
     for u in snapshot.upstreams:
-        if not u.enabled:                                    # 1
+        if not u.enabled:
             continue
-        if not self._family_ok(u, target, state):            # 4：永不放宽
+        if not _family_ok(u, target, has_ipv6_egress=state.has_ipv6_egress):
             continue
-        if not relaxed:
-            if not state.health.is_available(u.name, now=now):   # 2
-                continue
-            if state.memory.is_blocked(target.host, u.name, now=now):  # 3
-                continue
-        usable.append(u.name)
+        if not relaxed and state.memory.is_blocked(target.host, u.name, now=now, touch=touch):
+            continue
+        usable.add(u.name)
     return usable
 ```
 
-四道条件的语义差异是本模块最容易做错的地方：
+| 条件 | 性质 | 参与放宽 |
+|------|------|----------|
+| `enabled` | 用户意图 | 否 |
+| 无负面记忆 | 时效性判断，可能过时 | 是 |
+| 地址族能力匹配 | 结构性事实 | 否 |
 
-| 序号 | 条件 | 性质 | 参与放宽 |
-|------|------|------|----------|
-| 1 | `enabled` | 用户意图 | **否** |
-| 2 | 未熔断 | 时效性判断，可能过时 | 是 |
-| 3 | 无负面记忆 | 时效性判断，可能过时 | 是 |
-| 4 | 地址族能力匹配 | **结构性**事实 | **否** |
-
-放宽的目的是「宁可试一次也别让用户完全上不去网」。这对条件 2、3 成立——它们是基于历史观测的推断，可能已经不准。但对条件 4 不成立：本机没有 IPv6 出口，目标只有 IPv6 地址，放宽后再试一次的结果必然还是 `ENETUNREACH`，除了多消耗一次超时之外没有任何收益。
-
-条件 1 不放宽是因为它是用户的明确指令，不是系统的推断。
+放宽允许再尝试曾失败的路径。若本机没有 IPv6 出口、目标只有 IPv6 地址，重试仍会失败。0.3.3 以前还有全局熔断过滤，参见末尾修订。
 
 ### 3.2 分组排序与轮询
 
 ```python
 def _order(self, usable: set[str], snapshot: ConfigSnapshot,
-           state: RuntimeStateView) -> list[str]:
+           state: RuntimeStateView, *, advance: bool) -> tuple[str, ...]:
     chain: list[str] = []
     for priority, members in snapshot.priority_groups:
         present = [m for m in members if m in usable]
@@ -149,15 +146,15 @@ def _order(self, usable: set[str], snapshot: ConfigSnapshot,
         if len(present) == 1:
             chain.append(present[0])
             continue
-        cursor = state.cursors.next(priority, len(present))
+        cursor = state.cursors.next(priority) if advance else state.cursors.peek(priority)
         offset = cursor % len(present)
         chain.extend(present[offset:] + present[:offset])
-    return chain
+    return tuple(chain)
 ```
 
 `priority_groups` 已在配置加载时构建并排序（[DD_CONFIG.md](./DD_CONFIG.md) §2.1），此处只做过滤与旋转。
 
-**游标推进的时机是构造候选链时，不是请求成功时**。若只在成功时推进，某出口连续失败的场景下游标不动，每个请求都从同一个坏出口开始。构造时推进保证了负载在组内均摊。
+**正常决策（`update_state=True`）在构造候选链时推进游标**。只读决策通过 `peek` 使用当前值。若只在成功时推进，某出口连续失败的场景下游标不动，每个请求都从同一个坏出口开始。构造时推进保证了负载在组内均摊。
 
 **单成员组不消耗游标**（`len(present) == 1` 的分支）。取模后偏移恒为 0，推进游标只是无谓的状态变化。
 
@@ -169,8 +166,11 @@ class CursorTable:
     def __init__(self) -> None:
         self._c: dict[int, int] = {}
 
-    def next(self, priority: int, _size: int) -> int:
-        v = self._c.get(priority, 0)
+    def peek(self, priority: int) -> int:
+        return self._c.get(priority, 0)
+
+    def next(self, priority: int) -> int:
+        v = self.peek(priority)
         self._c[priority] = v + 1
         return v
 
@@ -201,7 +201,7 @@ def _direct_first(chain, target, snapshot) -> tuple[str, ...]:
 
 **粘性仍然定链首。** 重排发生在 `_apply_sticky` 之前，已经学会走上级代理的内网主机不受影响。本调整只改变「还没学到任何东西」时的第一步。
 
-**`direct` 不在 `usable` 中就不插回去。** 它可能被禁用、熔断或干脆不在配置里，那几道过滤各有各的理由，绕过去只会白等一次超时。
+**`direct` 不在 `usable` 中就不插回去。** 它可能被禁用、有负面记忆或不在配置里，那几道过滤各有各的理由，绕过去只会白等一次超时。
 
 只认 **IP 字面量**（`RequestTarget.is_private_literal`，含私网、回环、链路本地两个地址族）。域名要解析才知道落在哪个网段，而热路径上不做解析——与 §5.3 对域名给 `UNKNOWN` 是同一条理由。用户要让某个内网域名直连，写一条规则即可。
 
@@ -213,15 +213,15 @@ def _direct_first(chain, target, snapshot) -> tuple[str, ...]:
 
 ```python
 def _apply_sticky(self, chain: list[str], target, state,
-                  usable: set[str]) -> tuple[list[str], str]:
-    entry = state.sticky.get(target.host)
+                  usable: set[str], *, now: float, touch: bool) -> tuple[list[str], str]:
+    entry = state.sticky.get_live(target.host, now=now, touch=touch)
     if entry is None or entry.upstream not in usable:
         return chain, "priority"
     head = entry.upstream
     return [head] + [u for u in chain if u != head], entry.source
 ```
 
-粘性出口若已不在 `usable` 中（被禁用、熔断、有负面记忆、地址族不匹配），**不前置也不清除**。清除是执行层的职责——只有真正尝试失败才累加 `fail_count`。路由层因为熔断而暂时跳过它，不代表这个粘性绑定是错的。
+粘性出口若已不在 `usable` 中（被禁用、有负面记忆、地址族不匹配），**不前置也不清除**。清除是执行层的职责——只有真正尝试失败才累加 `fail_count`。路由层因为负面记忆而暂时跳过它，不代表这个粘性绑定是错的。
 
 ### 3.4 完整示例
 
@@ -562,14 +562,16 @@ class RouteMemory:
         self._cap = capacity
         self._m: OrderedDict[tuple[str, str], RouteBlock] = OrderedDict()
 
-    def is_blocked(self, host: str, upstream: str, *, now: float) -> bool:
+    def is_blocked(self, host: str, upstream: str, *, now: float, touch: bool = True) -> bool:
         b = self._m.get((host, upstream))
         if b is None:
             return False
         if now >= b.blocked_until:
-            del self._m[(host, upstream)]        # 惰性过期
+            if touch:
+                del self._m[(host, upstream)]    # 惰性过期
             return False
-        self._m.move_to_end((host, upstream))
+        if touch:
+            self._m.move_to_end((host, upstream))
         return True
 
     def block(self, host: str, upstream: str, *, now: float, reason: str) -> None:
@@ -769,28 +771,17 @@ while len(self._entries) > self._capacity:
 
 §7.1–§7.6 描述的清除条件全部是「事件触发」：失败达阈值、出口被删、LRU 超容、重启回填截断。一个冷门 host 的 `auto` 绑定会无限期占住内存 LRU 容量与磁盘 `host_upstream` 表，即便它对应的访问模式早已不存在。本节引入**时间触发**的失效。
 
-**语义**：`auto` 条目若连续 `routing.sticky_ttl` 秒（默认 2_592_000 = 30 天）未被命中（`record_success` 会刷新 `last_used_at`），下次被路由决策查询时即视为不存在并删除。`manual` 是用户声明，不参与过期。`sticky_ttl = 0` 表示禁用过期（与 `happy_eyeballs_delay` 的「0 表示关闭」同一约定）。
+**语义**：`auto` 条目若连续 `routing.sticky_ttl` 秒（默认 2_592_000 = 30 天）未被命中（`record_success` 会刷新 `last_used_at`），下次被路由决策查询时即视为不存在，正常决策还会将其删除。`manual` 是用户声明，不参与过期。`sticky_ttl = 0` 表示禁用过期（与 `happy_eyeballs_delay` 的「0 表示关闭」同一约定）。
 
-**`get` 与 `get_live` 分离**：
+**状态查询契约**：
 
-```python
-def get(self, host: str) -> StickyEntry | None:
-    """无副作用读取。返回活引用，**不**因 TTL 触发删除。
-    适合存活性检查、调试日志、metrics 计数等「看一眼不动状态」的场景。"""
+| 方法 | 正常决策 | 只读决策 |
+|------|----------|----------|
+| `CursorTable.next(priority)` / `peek(priority)` | `next` 读取并推进，调用处取模 | `peek` 读取，缺省为 0 |
+| `RouteMemory.is_blocked(host, upstream, *, now, touch=True)` | 过期则删除，有效则调整 LRU | `touch=False`，仅判断当前封锁是否有效 |
+| `StickyCache.get_live(host, *, now, touch=True)` | 过期则删除，有效则调整 LRU 并返回活引用 | `touch=False`，过期返回 None，有效返回单条副本 |
 
-def get_live(self, host: str, *, now: float) -> StickyEntry | None:
-    """带惰性过期的查询。auto 条目空闲达到 ttl 时当场删除并返回 None。"""
-    entry = self._entries.get(host)
-    if entry is None:
-        return None
-    if self._ttl > 0.0 and entry.source != "manual" and now - entry.last_used_at >= self._ttl:
-        del self._entries[host]
-        return None
-    self._entries.move_to_end(host)
-    return entry
-```
-
-`Router._apply_sticky`（§3.3）改用 `get_live`；Web 与测试里的存在性断言仍用 `get`。把过期判定塞进 `get` 会让「无副作用读取」的承诺失效，且让所有断言型调用都背上「过期就删除」的副作用。
+`StickyCache.get` 返回活引用并调整 LRU，不做 TTL 检查。路由的粘性前置统一使用 `get_live`。
 
 **`entries(now)` 过滤过期 auto**：Web 列表必须显示「真正还在生效的绑定」，否则界面与路由行为对不上。`entries` 只过滤不删除——查询路径保持只读，删除留给下次 `get_live` 或 LRU 淘汰。
 
@@ -800,7 +791,7 @@ def get_live(self, host: str, *, now: float) -> StickyEntry | None:
 
 | 路径 | 时机 | 作用 |
 |------|------|------|
-| 内存 `get_live` | 每次路由查询 | 权威决策：过期即删 |
+| 内存 `get_live` | 每次路由查询 | 正常决策删除过期项，只读决策仅过滤 |
 | `Retention._clean_sticky` | 写者线程每小时 | 磁盘上 `auto` 行 `updated_at < cutoff` 即删（[DD_STORAGE §6.3](./DD_STORAGE.md)） |
 | `_load_sticky` 回填过滤 | 启动时 | `auto` 行 `updated_at < cutoff` 不回填，避免白占 LRU 容量（[DD_STORAGE §5.1](./DD_STORAGE.md)） |
 
@@ -924,3 +915,9 @@ async def execute(self, target: RequestTarget, decision: Decision,
 ### 11.2 IPv4专用语义上线
 
 纯数字IPv4通配符通过parse_ip并要求IPv4；域名请求不能被其强制路由。正式容器已加载23条该类型和365条互斥域名后缀，实际路由测试验证数字前缀IP命中该IP规则、相同数字前缀域名命中其域名后缀。出口优先级、粘性与规则失败不切换的职责保持原约定。上线记录见 [DD_DEPLOY §15](./DD_DEPLOY.md#15-2026-10-24-ipv4专用通配符确认后的正式升级)。
+
+## 0.3.3：全局熔断移除修订
+
+> ⚠️ 已过时：本文早期关于全局熔断、冷却、半开探针和相关界面的描述自0.3.3起由本节取代，其余有效内容保留。
+
+移除全局健康状态对路由的过滤，保留目标/出口负面记忆、失败切换与统计。旧配置/API/数据库字段仅兼容，不能重新开启功能。完整接口兼容、验收及实施计划见[移除设计](REMOVE_GLOBAL_CIRCUIT.md)。

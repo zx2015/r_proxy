@@ -123,7 +123,9 @@ class RateLimitConfig:
 
 @dataclass(frozen=True, slots=True)
 class CircuitBreakerConfig:
-    enabled: bool = True
+    """历史配置兼容；全局熔断已移除。"""
+
+    enabled: bool = False
     fail_threshold: int = 5
     cooldown_seconds: int = 60
 

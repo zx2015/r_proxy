@@ -28,7 +28,8 @@ class Decision:
     rule_position: int | None = None
     # 规则强制路由时为 False：候选链长度恒为 1，失败原样返回不顺延。
     switchable: bool = True
-    # 候选链是在忽略熔断与负面记忆后构造的；执行层仍需保留 half-open 探针配额。
+    # 候选链是在忽略目标级负面记忆后构造的，不放宽启用与地址族限制。
+    # 执行层仅用于 relaxed_route 调试日志，不改变出口准入。
     relaxed: bool = False
     # 候选链为空时说明为什么，供日志与错误响应区分「没有出口」和「都不可用」。
     empty_reason: str | None = None

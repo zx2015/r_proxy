@@ -42,16 +42,21 @@ class RouteMemory:
         """当前生效的记忆时长。日志里要能说清「多久之后会再试一次」。"""
         return self._ttl
 
-    def is_blocked(self, host: str, upstream: str, *, now: float) -> bool:
+    def is_blocked(
+        self, host: str, upstream: str, *, now: float, touch: bool = True
+    ) -> bool:
+        """检查有效期，touch=False 时保留原条目及 LRU 顺序。"""
         key = (host, upstream)
         block = self._blocks.get(key)
         if block is None:
             return False
         if now >= block.blocked_until:
             # 惰性过期：定时扫全表要遍历，摊到查询上则只清理被访问到的键。
-            del self._blocks[key]
+            if touch:
+                del self._blocks[key]
             return False
-        self._blocks.move_to_end(key)
+        if touch:
+            self._blocks.move_to_end(key)
         return True
 
     def block(self, host: str, upstream: str, *, now: float, reason: str) -> None:

@@ -73,6 +73,7 @@ async def running(tmp_path: Path, *, address: str = "127.0.0.1:1") -> Applicatio
 
 def client_for(app: Application) -> httpx.AsyncClient:
     return httpx.AsyncClient(
+        trust_env=False,
         transport=httpx.ASGITransport(app=create_app(app), client=("127.0.0.1", 12345)),
         base_url="http://webui.test",
     )
@@ -110,7 +111,9 @@ class TestUpstreamList:
         assert "squid-user" not in raw
         assert "password" not in raw
 
-    async def test_health_is_nested_and_reflects_the_circuit(self, tmp_path: Path) -> None:
+    async def test_health_is_nested_and_preserves_statistics_after_errors(
+        self, tmp_path: Path
+    ) -> None:
         app = await running(tmp_path)
         try:
             for _ in range(5):
@@ -126,8 +129,8 @@ class TestUpstreamList:
         finally:
             await app.stop()
         health = body["upstreams"][0]["health"]
-        assert health["circuit_state"] == "open"
-        assert health["available"] is False
+        assert health["circuit_state"] == "closed"
+        assert health["available"] is True
         assert health["consecutive_failures"] == 5
 
     async def test_the_flat_health_endpoint_keeps_its_shape(

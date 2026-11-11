@@ -947,3 +947,14 @@ class TestRetention:
         finally:
             for c in conns.values():
                 c.close()
+
+
+def test_open_write_rejects_non_wal_and_closes_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conn = sqlite3.connect(":memory:")
+    monkeypatch.setattr(sqlite3, "connect", lambda *args, **kwargs: conn)
+    with pytest.raises(StorageError, match="WAL"):
+        open_write(tmp_path / "state.db", Database.STATE)
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        conn.execute("SELECT 1")

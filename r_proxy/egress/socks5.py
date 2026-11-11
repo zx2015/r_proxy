@@ -32,7 +32,7 @@ def _classify_rep(rep: int) -> FailureKind:
 
     映射规则详见 docs/design/DD_SOCKS5.md §3：
     - 0x03..0x06 为目标网络/主机/端口问题，只记目标负面记忆 (ROUTE_ERROR)。
-    - 0x08 为地址类型不支持 (CAPABILITY_MISMATCH)，不记熔断不记负面记忆。
+    - 0x08 为地址类型不支持 (CAPABILITY_MISMATCH)，不记出口级失败不记负面记忆。
     - 其余 (0x01, 0x02, 0x07 及未分配代码) 归为上级代理故障或限制 (UPSTREAM_ERROR)。
     """
     if rep in (
@@ -150,7 +150,7 @@ async def read_connect_reply(reader: asyncio.StreamReader) -> None:
     1. 阶段一：原子读取前 4 字节，第一时间捕获 REP 响应码。
     2. 阶段二：读取服务端返回的 BND 绑定地址与端口，对齐传输流。
        部分非标代理在建连失败（如 rep=0x05）时会立即掐断连接 (EOF)。
-       若此时抛出 IncompleteReadError，绝不能覆盖已解析出的 rep 归类，否则会导致误熔断。
+       若此时抛出 IncompleteReadError，绝不能覆盖已解析出的 rep 归类，否则会导致错误归类。
     """
     head = await reader.readexactly(4)
     ver, rep, _rsv, atyp = struct.unpack("!BBBB", head)

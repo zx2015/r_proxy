@@ -1,4 +1,4 @@
-"""state/health.py 的熔断状态机测试。
+"""state/health.py 的健康统计与历史兼容接口测试。
 
 对应设计：docs/design/DD_ROUTING.md §4
 """
@@ -40,10 +40,10 @@ class TestOpening:
         assert table.is_available("proxy", now=10.0) is True
         assert table.state_of("proxy", now=10.0) is HealthState.CLOSED
 
-    def test_opens_at_the_threshold(self, table: HealthTable) -> None:
+    def test_old_threshold_does_not_exclude_the_exit(self, table: HealthTable) -> None:
         fail(table, "proxy", times=5)
-        assert table.is_available("proxy", now=10.0) is False
-        assert table.state_of("proxy", now=10.0) is HealthState.OPEN
+        assert table.is_available("proxy", now=10.0) is True
+        assert table.state_of("proxy", now=10.0) is HealthState.CLOSED
 
     def test_success_clears_the_failure_streak(self, table: HealthTable) -> None:
         """必须是「连续」失败：中间一次成功就重新计数。"""
@@ -93,70 +93,6 @@ class TestDirectNeverOpens:
         assert table.snapshot_of("direct").consecutive_failures == 0
 
 
-class TestCooldownAndHalfOpen:
-    def test_stays_unavailable_during_cooldown(self, table: HealthTable) -> None:
-        fail(table, "proxy", times=5)
-        assert table.is_available("proxy", now=4.0 + 59.0) is False
-
-    def test_migrates_to_half_open_after_cooldown(self, table: HealthTable) -> None:
-        """迁移在查询时惰性判定，不用定时器。"""
-        fail(table, "proxy", times=5)
-        assert table.is_available("proxy", now=200.0) is True
-        assert table.state_of("proxy", now=200.0) is HealthState.HALF_OPEN
-
-    def test_half_open_admits_exactly_one_probe(self, table: HealthTable) -> None:
-        """M2-13：half_open 期间 10 个并发只放行 1 个。"""
-        fail(table, "proxy", times=5)
-        table.is_available("proxy", now=200.0)
-        admitted = [table.acquire_probe("proxy") for _ in range(10)]
-        assert admitted.count(True) == 1
-
-    def test_closed_state_never_needs_a_probe_slot(self, table: HealthTable) -> None:
-        assert all(table.acquire_probe("proxy") for _ in range(10))
-
-    def test_successful_probe_closes_the_breaker(self, table: HealthTable) -> None:
-        fail(table, "proxy", times=5)
-        table.is_available("proxy", now=200.0)
-        assert table.acquire_probe("proxy") is True
-        table.record_result("proxy", ok=True, kind=FailureKind.ROUTE_ERROR, now=201.0)
-        assert table.state_of("proxy", now=201.0) is HealthState.CLOSED
-        assert table.is_available("proxy", now=201.0) is True
-
-    def test_failed_probe_reopens_and_restarts_the_cooldown(self, table: HealthTable) -> None:
-        """不重置 opened_at 会让下一个请求立刻又变 half_open，退化为无冷却重试。"""
-        fail(table, "proxy", times=5)
-        table.is_available("proxy", now=200.0)
-        table.acquire_probe("proxy")
-        table.record_result("proxy", ok=False, kind=FailureKind.UPSTREAM_ERROR, now=201.0)
-
-        assert table.state_of("proxy", now=201.0) is HealthState.OPEN
-        assert table.is_available("proxy", now=250.0) is False
-        assert table.is_available("proxy", now=262.0) is True
-
-    def test_a_single_upstream_error_in_half_open_reopens_it(self, table: HealthTable) -> None:
-        """half_open 下不需要再攒够 threshold 次。"""
-        fail(table, "proxy", times=5)
-        table.is_available("proxy", now=200.0)
-        table.record_result("proxy", ok=False, kind=FailureKind.UPSTREAM_ERROR, now=201.0)
-        assert table.state_of("proxy", now=201.0) is HealthState.OPEN
-
-    def test_route_error_in_half_open_releases_the_slot_without_reopening(
-        self, table: HealthTable
-    ) -> None:
-        fail(table, "proxy", times=5)
-        table.is_available("proxy", now=200.0)
-        table.acquire_probe("proxy")
-        table.record_result("proxy", ok=False, kind=FailureKind.ROUTE_ERROR, now=201.0)
-        assert table.state_of("proxy", now=201.0) is HealthState.HALF_OPEN
-        assert table.acquire_probe("proxy") is True
-
-    def test_probe_slot_is_released_when_the_result_arrives(self, table: HealthTable) -> None:
-        fail(table, "proxy", times=5)
-        table.is_available("proxy", now=200.0)
-        table.acquire_probe("proxy")
-        assert table.acquire_probe("proxy") is False
-        table.record_result("proxy", ok=False, kind=FailureKind.ROUTE_ERROR, now=201.0)
-        assert table.acquire_probe("proxy") is True
 
 
 class TestMonotonicTimestamps:
@@ -181,14 +117,14 @@ class TestAuthError:
         table.record_result("proxy", ok=True, kind=FailureKind.ROUTE_ERROR, now=2.0)
         assert table.snapshot_of("proxy").auth_error is False
 
-    def test_repeated_auth_errors_still_open_the_breaker_through_upstream_error(
+    def test_repeated_auth_errors_only_update_statistics(
         self, table: HealthTable
     ) -> None:
-        """407 计 UPSTREAM_ERROR，连续 5 次自然熔断，不需要额外的移除逻辑。"""
+        """407 计出口级连续失败，但不限制任何出口的路由。"""
         for i in range(5):
             table.mark_auth_error("proxy")
             table.record_result("proxy", ok=False, kind=FailureKind.UPSTREAM_ERROR, now=float(i))
-        assert table.is_available("proxy", now=6.0) is False
+        assert table.is_available("proxy", now=6.0) is True
 
 
 class TestObservability:
@@ -215,11 +151,11 @@ class TestObservability:
         table.record_result("b", ok=True, kind=FailureKind.ROUTE_ERROR, now=1.0)
         assert {h.name for h in table.all(now=1.0)} == {"a", "b"}
 
-    def test_state_queries_use_the_same_lazy_migration_as_routing(self, table: HealthTable) -> None:
+    def test_state_queries_stay_closed_at_any_timestamp(self, table: HealthTable) -> None:
         """Web 查询也必须传 now 走同一份判定，否则显示 open 而实际冷却已过。"""
         fail(table, "proxy", times=5)
-        assert table.state_of("proxy", now=10.0) is HealthState.OPEN
-        assert table.state_of("proxy", now=200.0) is HealthState.HALF_OPEN
+        assert table.state_of("proxy", now=10.0) is HealthState.CLOSED
+        assert table.state_of("proxy", now=200.0) is HealthState.CLOSED
 
 
 class TestTraffic:
@@ -240,7 +176,7 @@ class TestTraffic:
         table.add_traffic("proxy", bytes_up=10, bytes_down=20)
         snap = table.snapshot_of("proxy")
         assert (snap.total_bytes_up, snap.total_bytes_down) == (10, 20)
-        assert table.state_of("proxy", now=10.0) is HealthState.OPEN
+        assert table.state_of("proxy", now=10.0) is HealthState.CLOSED
 
     def test_restore_counters_seeds_bytes_from_backfill(self, table: HealthTable) -> None:
         table.restore_counters(
@@ -263,13 +199,13 @@ class TestReset:
         assert table.is_available("proxy", now=10.0) is True
         assert table.snapshot_of("proxy").total_failure == 0
 
-    def test_reconfigure_applies_the_new_threshold_without_losing_history(
+    def test_reconfigure_cannot_reenable_exclusion_or_lose_history(
         self, table: HealthTable
     ) -> None:
         fail(table, "proxy", times=3)
         table.reconfigure(CircuitBreakerConfig(fail_threshold=3, cooldown_seconds=60))
         fail(table, "proxy", times=1, now=10.0)
-        assert table.is_available("proxy", now=11.0) is False
+        assert table.is_available("proxy", now=11.0) is True
 
     def test_disabled_breaker_never_opens(self, table: HealthTable) -> None:
         table.reconfigure(CircuitBreakerConfig(enabled=False))

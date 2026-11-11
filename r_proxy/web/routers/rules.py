@@ -113,7 +113,7 @@ async def route_test(body: RouteTestRequest, app: AppDep) -> RouteTestResponse:
         raise HTTPException(400, detail=f"无法解析 URL: {exc}") from exc
 
     decision = Router().build_chain(
-        target, app.snapshot, app.rules, app.state, now=time.monotonic()
+        target, app.snapshot, app.rules, app.state, now=time.monotonic(), update_state=False
     )
     hit = match(app.rules, target)
     return RouteTestResponse(

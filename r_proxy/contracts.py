@@ -42,7 +42,7 @@ class Method(Enum):
 class FailureKind(Enum):
     """失败归类，决定计入哪种计数。见 PRD §4.3.6。"""
 
-    UPSTREAM_ERROR = auto()  # 出口本身不可用，计入全局熔断
+    UPSTREAM_ERROR = auto()  # 出口本身不可用，记录出口级失败统计
     ROUTE_ERROR = auto()  # 经该出口到不了此目标，只记 (host, upstream) 负面记忆
     CAPABILITY_MISMATCH = auto()  # 结构性不可达，两者都不计
     NOT_A_FAILURE = auto()  # 如空闲连接回收的 408

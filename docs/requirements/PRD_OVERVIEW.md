@@ -2,6 +2,8 @@
 
 | 版本 | 日期 | 变更说明 | 作者 |
 |------|------|----------|------|
+| v0.3.4-platform | 2026-11-11 | 增补相对路径、Windows 正常停止和日志验收 | Agent |
+| v0.3.3-removal | 2026-11-04 | 移除全局熔断，保留负面记忆与统计；见末尾修订 | Agent |
 | v1.9.0 | 2026-11-10 | 明确 Linux、Windows、macOS 三平台原生支持；新增平台差异、安全与跨平台验收要求 | Agent |
 | v1.0.0 | 2026-08-12 | 初始版本，整理用户 6 项核心需求 | Agent |
 | v1.1.0 | 2026-08-12 | Web 管理界面纳入本期范围；上级代理与直连支持优先级配置，自动切换按优先级顺序执行 | Agent |
@@ -1159,6 +1161,9 @@ r-proxy **必须支持 Linux、Windows、macOS 三个操作系统**。三平台�
 | OS-04 | LF/CRLF 配置保存与注入重载失败 | TOML 可解析、无 CRCRLF；失败恢复后的文件逐字节等于保存前内容 |
 | OS-05 | 正常停止、重启及守护进程托管 | 无残留监听或不可退出状态；规则和持久化状态可恢复 |
 | OS-06 | 配置与备份访问权限 | 按服务运行账户验证 Unix 权限或 Windows ACL，凭据不向未授权账户开放 |
+| OS-07 | 从不同工作目录启动、校验及重载同一份配置 | 三个相对库路径均以配置文件目录解析。库位于本地文件系统且写连接成功启用 WAL |
+| OS-08 | Windows 控制台 Ctrl+Break、服务包装器停止及日志重定向 | 控制台正常停止能排空队列。包装器须单独验证停止方式。重定向 stdout/stderr 可读出 UTF-8 中文 |
+| OS-09 | Web 端口自动分配 | 启动日志包含实际绑定的端口 |
 
 设计细节见 [DD_CONFIG](../design/DD_CONFIG.md)；Web 写回契约见 [WEBUI_SPEC](./WEBUI_SPEC.md)。上述为需求与验收目标，实际平台验证结果另记部署记录，不以本节替代运行证据。
 
@@ -1531,3 +1536,9 @@ max_client_connections × (switch_buffer_bytes + 双向转发缓冲)
 - [WEBUI_SPEC.md](./WEBUI_SPEC.md) — Web 管理界面需求与 REST API
 - [../../study/sqlite-storage-benchmark.md](../../study/sqlite-storage-benchmark.md) — 存储层选型实测与架构决策
 - [../design/ARCH_OVERVIEW.md](../design/ARCH_OVERVIEW.md) — 架构概览（待随实现更新）
+
+## 0.3.3：全局熔断移除修订
+
+> ⚠️ 已过时：本文早期关于全局熔断、冷却、半开探针和相关界面的描述自0.3.3起由本节取代，其余有效内容保留。
+
+移除全局健康状态对路由的过滤，保留目标/出口负面记忆、失败切换与统计。旧配置/API/数据库字段仅兼容，不能重新开启功能。完整接口兼容、验收及实施计划见[移除设计](../design/REMOVE_GLOBAL_CIRCUIT.md)。

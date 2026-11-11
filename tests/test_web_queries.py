@@ -136,6 +136,7 @@ async def running(tmp_path: Path, rows: Sequence[dict[str, object]] = ()) -> App
 
 def client_for(app: Application) -> httpx.AsyncClient:
     return httpx.AsyncClient(
+        trust_env=False,
         transport=httpx.ASGITransport(app=create_app(app), client=("127.0.0.1", 12345)),
         base_url="http://webui.test",
     )
@@ -499,7 +500,7 @@ class TestHealthEndpoint:
         entry = next(u for u in body["upstreams"] if u["name"] == "proxy-a")
         assert (entry["bytes_up_total"], entry["bytes_down_total"]) == (100, 200)
 
-    async def test_health_reports_the_open_circuit(self, tmp_path: Path) -> None:
+    async def test_health_reports_failures_without_excluding_the_exit(self, tmp_path: Path) -> None:
         app = await running(tmp_path)
         try:
             _trip(app)
@@ -508,17 +509,13 @@ class TestHealthEndpoint:
         finally:
             await app.stop()
         entry = body["upstreams"][0]
-        assert entry["circuit_state"] == "open"
-        assert entry["available"] is False
+        assert entry["circuit_state"] == "closed"
+        assert entry["available"] is True
         assert entry["consecutive_failures"] == 5
         assert entry["success_rate"] == 0.0
 
-    async def test_an_elapsed_cooldown_shows_as_half_open(self, tmp_path: Path) -> None:
-        """冷却期已过时必须显示 ``half_open``。
-
-        状态迁移是查询时惰性完成的，Web 若直接读字段会显示一个早已不成立的
-        ``open``——运维会以为出口还被拦着。
-        """
+    async def test_old_cooldown_has_no_effect_on_health_output(self, tmp_path: Path) -> None:
+        """旧冷却配置无效，健康响应始终为closed。"""
         app = await running(tmp_path)
         try:
             _trip(app, now=time.monotonic() - 3600)
@@ -526,7 +523,7 @@ class TestHealthEndpoint:
                 body = (await client.get("/api/health")).json()
         finally:
             await app.stop()
-        assert body["upstreams"][0]["circuit_state"] == "half_open"
+        assert body["upstreams"][0]["circuit_state"] == "closed"
         assert body["upstreams"][0]["available"] is True
 
     async def test_resetting_closes_the_circuit_and_keeps_the_counters(

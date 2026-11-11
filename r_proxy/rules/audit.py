@@ -18,7 +18,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from r_proxy.config.loader import DEFAULT_RULES_PATH
+from r_proxy.config.loader import (
+    DEFAULT_RULES_PATH,
+    ConfigError,
+    expand_user_path,
+    resolve_database_path,
+)
 from r_proxy.rules import loader as rules_loader
 
 MAX_AUDIT_RULES = 5_000
@@ -119,15 +124,18 @@ def _resolve_database(config: dict[str, Any], config_path: Path, data_dir: Path 
     raw = _table(config.get("database", {}), "database").get("rules_path", DEFAULT_RULES_PATH)
     if not isinstance(raw, str) or not raw:
         raise AuditError("database.rules_path 必须为非空路径字符串")
-    path = Path(raw).expanduser()
-    if data_dir is not None and path.is_relative_to("/data"):
-        path = data_dir / path.relative_to("/data")
-        if not path.resolve().is_relative_to(data_dir.resolve()):
-            raise AuditError("容器数据路径越出了显式映射目录")
-    elif not path.is_absolute():
-        # 配置加载器原先按工作目录展开相对路径；离线工具不能默猜容器工作目录。
-        raise AuditError("rules_path 为相对路径，请先提供明确的绝对路径配置副本")
-    resolved = path.resolve()
+    try:
+        path = expand_user_path(Path(raw))
+        if data_dir is not None and path.is_relative_to("/data"):
+            resolved = (data_dir / path.relative_to("/data")).resolve()
+            if not resolved.is_relative_to(data_dir.resolve()):
+                raise AuditError("容器数据路径越出了显式映射目录")
+        else:
+            resolved = resolve_database_path(
+                raw, config_path.absolute().parent, field="database.rules_path"
+            ).resolve()
+    except (ConfigError, OSError, RuntimeError) as exc:
+        raise AuditError(str(exc)) from exc
     if not resolved.is_file():
         raise AuditError(f"规则数据库不存在或不是普通文件：{resolved}")
     if resolved == config_path.resolve():
@@ -188,8 +196,11 @@ def _snapshot(database: Path) -> tuple[tuple[StoredRule, ...], str | None, str |
 def audit_config(config_path: Path, *, data_dir: Path | None = None) -> AuditReport:
     """在只读事务内盘点原始规则，再离线进行严格分析；不输出配置认证内容。"""
     try:
+        config_path = expand_user_path(config_path)
         with config_path.open("rb") as stream:
             config = tomllib.load(stream)
+    except ConfigError as exc:
+        raise AuditError(str(exc)) from exc
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise AuditError(f"无法读取 TOML 配置（{type(exc).__name__}）") from exc
     database = _resolve_database(config, config_path, data_dir)

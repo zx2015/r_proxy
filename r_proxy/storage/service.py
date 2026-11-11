@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 
 from r_proxy.config.model import DatabaseConfig, LimitsConfig
@@ -18,15 +19,26 @@ from r_proxy.storage.metrics import StorageMetrics
 from r_proxy.storage.queue import Priority, WriteQueue
 from r_proxy.storage.reader import InitialState, ReadOnlyPool, load_initial_state
 from r_proxy.storage.retention import Retention
+from r_proxy.storage.schema import StorageError
 from r_proxy.storage.writer import WriterThread
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_STOP_TIMEOUT = 10.0
+STORAGE_RESTART_FIELDS = ("state_path", "logs_path", "write_queue_size")
 
 
 class StorageService:
-    __slots__ = ("_cfg", "_expiry", "_limits", "_thread", "logs_reader", "queue", "state_reader")
+    __slots__ = (
+        "_cfg",
+        "_expiry",
+        "_limits",
+        "_thread",
+        "_lock",
+        "logs_reader",
+        "queue",
+        "state_reader",
+    )
 
     def __init__(
         self,
@@ -35,6 +47,7 @@ class StorageService:
         *,
         sticky_policy: StickyExpiryPolicy | None = None,
     ) -> None:
+        self._lock = threading.Lock()
         self._cfg = cfg
         self._limits = limits
         self._expiry = sticky_policy or StickyExpiryPolicy()
@@ -42,6 +55,23 @@ class StorageService:
         self._thread = WriterThread(self.queue, cfg, retention=Retention(cfg, expiry=self._expiry))
         self.state_reader = ReadOnlyPool(cfg.state_path)
         self.logs_reader = ReadOnlyPool(cfg.logs_path)
+
+    def reconfigure(self, cfg: DatabaseConfig, limits: LimitsConfig, sticky_ttl: float) -> None:
+        """更新下一轮清理与批量写入策略；调用方在线程中等待清理完成。"""
+        with self._lock:
+            changed = self.restart_required_fields(cfg)
+            if changed:
+                raise StorageError("存储配置变更需要重启：" + ", ".join(changed))
+            expiry = StickyExpiryPolicy(sticky_ttl)
+            self._thread.reconfigure(cfg, expiry)
+            self._cfg, self._limits, self._expiry = cfg, limits, expiry
+
+    def restart_required_fields(self, cfg: DatabaseConfig) -> list[str]:
+        return [
+            f"database.{field}"
+            for field in STORAGE_RESTART_FIELDS
+            if getattr(cfg, field) != getattr(self._cfg, field)
+        ]
 
     def load_initial_state(self) -> InitialState:
         """在写者线程启动**之前**调用：此时库里的内容就是上次退出时的样子。"""

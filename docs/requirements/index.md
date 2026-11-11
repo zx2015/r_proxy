@@ -38,3 +38,9 @@
 自动粘性有效期页面入口与空闲续期语义见 [WEBUI_SPEC §2.5.1](./WEBUI_SPEC.md#251-自动粘性映射有效期页面入口2026-10-24补充)。
 
 [WEBUI_SPEC §2.5.2](./WEBUI_SPEC.md#252-自动粘性有效期小时输入与提示取代251页面展示) — 小时输入与悬停tips，v2.4.2。
+
+- [0.3.3 全局熔断移除](../design/REMOVE_GLOBAL_CIRCUIT.md) — 保留负面记忆和统计；调研发现仅关闭开关不能清除已有状态，采用移除状态机并保留旧配置与数据兼容。
+
+- 2026-11-11：[Web 验收](WEBUI_SPEC.md)追加热重载和路由测试无副作用约束；SOCKS5_UPSTREAM、RULES_CONFIG 标注旧熔断过时。
+
+- 0.3.4：[跨平台验收](PRD_OVERVIEW.md#483-跨平台发布验收)补充相对库路径、WAL、Windows 停止与重定向编码、Web 实际端口。

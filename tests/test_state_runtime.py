@@ -78,14 +78,14 @@ class TestRuntimeState:
         assert state.memory.is_blocked("a.com", "gone", now=2.0) is False
 
     def test_reload_keeps_health_of_surviving_upstreams(self) -> None:
-        """热重载不该把仍在配置里的出口的熔断状态抹掉。"""
+        """热重载保留出口失败统计，健康状态不参与路由。"""
         state = RuntimeState.from_snapshot(make_snapshot(upstream("kept")))
         for i in range(5):
             state.health.record_result(
                 "kept", ok=False, kind=FailureKind.UPSTREAM_ERROR, now=float(i)
             )
         state.on_reload(make_snapshot(upstream("kept")))
-        assert state.health.is_available("kept", now=5.0) is False
+        assert state.health.is_available("kept", now=5.0) is True
 
     def test_reload_keeps_the_ipv6_capability_until_reprobed(self) -> None:
         state = RuntimeState.from_snapshot(make_snapshot())

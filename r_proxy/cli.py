@@ -8,7 +8,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import os
 import signal
 import sys
 from pathlib import Path
@@ -16,9 +15,12 @@ from typing import Any
 
 from r_proxy import __version__
 from r_proxy.app import Application, StartupError
-from r_proxy.config.loader import ENV_CONFIG_PATH
-
-DEFAULT_CONFIG_PATH = Path("~/.config/r-proxy/config.toml")
+from r_proxy.config.loader import (
+    ENV_CONFIG_PATH,
+    ConfigError,
+    default_config_path,
+    expand_user_path,
+)
 
 EXIT_OK = 0
 EXIT_CONFIG_ERROR = 2
@@ -33,7 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         type=Path,
         default=None,
-        help=f"配置文件路径（默认 ${ENV_CONFIG_PATH} 或 {DEFAULT_CONFIG_PATH}）",
+        help=f"配置文件路径（默认 ${ENV_CONFIG_PATH} 或平台用户配置目录）",
     )
     parser.add_argument("--host", default=None, help="覆盖 listen.host")
     parser.add_argument("--port", type=int, default=None, help="覆盖 listen.port")
@@ -72,28 +74,27 @@ def build_overrides(args: argparse.Namespace) -> dict[str, object]:
 def resolve_config_path(args: argparse.Namespace) -> Path:
     explicit: Path | None = args.config
     if explicit is not None:
-        return explicit
-    from_env = os.environ.get(ENV_CONFIG_PATH)
-    if from_env:
-        return Path(from_env)
-    return DEFAULT_CONFIG_PATH.expanduser()
+        return expand_user_path(explicit)
+    return default_config_path()
 
 
 def main(argv: list[str] | None = None) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="backslashreplace")
     args = parse_args(argv)
     logging.basicConfig(
         level=getattr(logging, args.log_level),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    app = Application(config_path=resolve_config_path(args), overrides=build_overrides(args))
-
-    if args.check:
-        return _run_check(app)
-
     try:
+        app = Application(config_path=resolve_config_path(args), overrides=build_overrides(args))
+        if args.check:
+            return _run_check(app)
         asyncio.run(_serve(app))
-    except StartupError as exc:
+    except (ConfigError, StartupError) as exc:
         print(str(exc), file=sys.stderr)
         return EXIT_CONFIG_ERROR
     except KeyboardInterrupt:
@@ -127,7 +128,7 @@ async def _serve(app: Application) -> None:
     previous: dict[int, Any] = {}
     if sys.platform == "win32":
         # Windows asyncio loops do not implement add_signal_handler.
-        for sig in (signal.SIGINT, signal.SIGTERM):
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGBREAK):
             previous[sig] = signal.getsignal(sig)
             signal.signal(sig, lambda _sig, _frame: loop.call_soon_threadsafe(app.request_stop))
     else:

@@ -17,6 +17,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from r_proxy.config.loader import E_LEGACY_DB_PATH
 from r_proxy.storage.rules_store import RulesConflict
 from r_proxy.web.config_writer import ConfigConflict, ConfigInvalid, RuleExists, issue_details
 
@@ -87,10 +88,15 @@ def invalid_config(exc: ConfigInvalid) -> HTTPException:
     用 `400` 而不是 `422`：`422` 在本项目里专指 FastAPI 的模型校验（§3.6），
     而这里的失败来自配置语义层——请求本身是合法的。
     """
+    code = (
+        E_LEGACY_DB_PATH
+        if any(issue.code == E_LEGACY_DB_PATH for issue in exc.issues)
+        else "CONFIG_INVALID"
+    )
     return HTTPException(
         400,
         detail={
-            "code": "CONFIG_INVALID",
+            "code": code,
             "message": "配置校验未通过，磁盘文件未改动",
             "details": issue_details(exc.issues),
         },

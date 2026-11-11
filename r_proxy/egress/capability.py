@@ -3,7 +3,7 @@
 对应设计：docs/design/ARCH_OVERVIEW.md §7。
 
 探测结果决定纯 IPv6 目标是否值得尝试 ``direct``：没有 IPv6 出口时直接跳过，
-既不写负面记忆也不计熔断（那是配置/环境问题，不是出口故障）。
+既不写负面记忆也不计出口级失败（那是配置/环境问题，不是出口故障）。
 """
 
 from __future__ import annotations

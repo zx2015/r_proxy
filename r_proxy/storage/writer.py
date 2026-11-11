@@ -16,6 +16,7 @@ import time
 from dataclasses import dataclass, field, replace
 
 from r_proxy.config.model import DatabaseConfig
+from r_proxy.storage.expiry import StickyExpiryPolicy
 from r_proxy.storage.queue import OpKind, WriteOp, WriteQueue
 from r_proxy.storage.retention import Retention
 from r_proxy.storage.schema import Database, StorageError, open_write
@@ -174,6 +175,10 @@ class WriterThread(threading.Thread):
         # 「某个时刻之前入队的写入是否都已落盘」，见 wait_until_drained。
         self._processed = 0
 
+    def reconfigure(self, cfg: DatabaseConfig, expiry: StickyExpiryPolicy) -> None:
+        self._retention.reconfigure(cfg, expiry)
+        self._cfg = cfg
+
     def run(self) -> None:
         try:
             connections = {
@@ -187,9 +192,10 @@ class WriterThread(threading.Thread):
         self._opened.set()
         try:
             while not self._stopping.is_set():
+                cfg = self._cfg
                 batch = self._queue.drain(
-                    max_items=self._cfg.flush_batch_size,
-                    timeout=self._cfg.flush_interval_ms / 1000,
+                    max_items=cfg.flush_batch_size,
+                    timeout=cfg.flush_interval_ms / 1000,
                 )
                 if batch:
                     self._flush(batch, connections)

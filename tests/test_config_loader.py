@@ -6,11 +6,14 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import pytest
 
-from r_proxy.config.loader import ConfigError, load
+from r_proxy.config.loader import ConfigError, load, load_text
 
 MINIMAL = """
 [[upstreams]]
@@ -253,3 +256,105 @@ class TestPathExpansion:
         snap = load(write(tmp_path, MINIMAL + '\n[database]\nstate_path = "~/x/state.db"\n'))
         assert not str(snap.database.state_path).startswith("~")
         assert snap.database.state_path.is_absolute()
+
+
+def test_legacy_enabled_circuit_config_is_accepted_but_cannot_enable_it(tmp_path: Path) -> None:
+    snap = load(
+        write(
+            tmp_path, MINIMAL + "\n[routing.circuit_breaker]\nenabled = true\nfail_threshold = 1\n"
+        )
+    )
+    assert snap.routing.circuit_breaker.enabled is False
+
+
+def test_relative_database_paths_use_the_config_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    text = (
+        MINIMAL
+        + """
+[database]
+state_path = "data/state.db"
+logs_path = "data/logs.db"
+rules_path = "data/rules.db"
+"""
+    )
+    path = write(config_dir, text)
+    for cwd in (tmp_path, config_dir):
+        monkeypatch.chdir(cwd)
+        for snapshot in (load(path), load_text(text, path)):
+            assert snapshot.database.state_path == config_dir / "data/state.db"
+            assert snapshot.database.logs_path == config_dir / "data/logs.db"
+            assert snapshot.database.rules_path == config_dir / "data/rules.db"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX rejects Windows drive paths")
+def test_windows_drive_paths_are_rejected_on_posix(tmp_path: Path) -> None:
+    path = write(tmp_path, MINIMAL + "\n[database]\nstate_path = 'C:\\r-proxy\\state.db'\n")
+    with pytest.raises(ConfigError, match="database.state_path.*Windows 盘符路径"):
+        load(path)
+
+
+def test_database_home_expansion_error_names_the_user_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = Path.expanduser
+
+    def unavailable(path: Path) -> Path:
+        if str(path).startswith("~unknownuser"):
+            raise RuntimeError("home unavailable")
+        return original(path)
+
+    monkeypatch.setattr(Path, "expanduser", unavailable)
+    config = write(tmp_path, MINIMAL + "\n[database]\nstate_path = '~unknownuser/state.db'\n")
+    with pytest.raises(ConfigError, match="无法展开用户目录.*~unknownuser"):
+        load(config)
+
+
+@pytest.mark.parametrize("candidate", ["missing", "empty", "foreign_schema", "valid", "unrelated"])
+def test_legacy_databases_are_classified_together(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    candidate: str,
+) -> None:
+    from r_proxy.storage.schema import Database, open_write
+
+    cwd = tmp_path / "cwd"
+    conf = tmp_path / "conf"
+    cwd.mkdir()
+    conf.mkdir()
+    text = MINIMAL + '\n[database]\nstate_path = "state.db"\nlogs_path = "logs.db"\n'
+    text += 'rules_path = "rules.db"\n'
+    for name, kind in (
+        ("state", Database.STATE),
+        ("logs", Database.LOGS),
+        ("rules", Database.RULES),
+    ):
+        old, new = cwd / f"{name}.db", conf / f"{name}.db"
+        if candidate == "unrelated":
+            old.write_text("not a database", encoding="utf-8")
+        else:
+            open_write(old, kind).close()
+        if candidate == "empty":
+            new.touch()
+        elif candidate == "foreign_schema":
+            with closing(sqlite3.connect(new)) as conn:
+                conn.execute("CREATE TABLE unrelated (value TEXT)")
+        elif candidate == "valid":
+            open_write(new, kind).close()
+    monkeypatch.chdir(cwd)
+    config = write(conf, text)
+    if candidate in {"missing", "empty", "foreign_schema"}:
+        with pytest.raises(ConfigError, match="E_LEGACY_DB_PATH") as exc:
+            load(config)
+        for name in ("state", "logs", "rules"):
+            assert f"database.{name}_path" in str(exc.value)
+            assert str(cwd / f"{name}.db") in str(exc.value)
+            assert str(conf / f"{name}.db") in str(exc.value)
+    else:
+        assert load(config).database.rules_path == conf / "rules.db"
+        warnings = [msg for msg in caplog.messages if "W_LEGACY_DB_PATH" in msg]
+        assert len(warnings) == (3 if candidate == "valid" else 0)

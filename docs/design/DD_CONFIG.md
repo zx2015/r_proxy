@@ -2,6 +2,12 @@
 
 | 版本 | 日期 | 变更说明 | 作者 |
 | :--- | :--- | :--- | :--- |
+| v0.3.4-legacy-review | 2026-11-11 | 汇总旧库冲突、识别项目库并警告双库并存 | Agent |
+| v0.3.4-upgrade | 2026-11-11 | 相对库路径升级保护及路径错误 | Agent |
+| v0.3.4-platform | 2026-11-11 | 跨平台路径、停止信号和配置原子替换 | Agent |
+| v0.3.4-review | 2026-11-11 | 只读路由预览与存储重启字段预校验 | Agent |
+| v0.3.3-review | 2026-11-11 | 热重载、只读路由测试与评审整改契约 | Agent |
+| v0.3.3-removal | 2026-11-04 | 移除全局熔断，保留负面记忆与统计；见末尾修订 | Agent |
 | v2.1.1 | 2026-11-10 | Web 配置原子写使用 UTF-8 二进制写入，确保 Windows 下 LF/CRLF 原样持久化，重载失败回滚逐字节还原 | Agent |
 | v1.0.0 | 2026-08-13 | 初始版本：不可变快照模型、启动校验清单、`config_version` 计算与并发修改检测、热重载引用替换 | Agent |
 | v1.1.0 | 2026-08-13 | 分歧定案：配置格式改为 TOML，读用标准库 `tomllib`、写用 `tomlkit`（§1.1 全面重写）；新增未知键拒绝（`E_UNKNOWN_KEY`）；`W_RULE_DISABLED_TARGET` 的降级理由改为「拆分条件」的正式表述并要求持续可见 | Agent |
@@ -637,9 +643,11 @@ class Application:
 | 上级代理增删改、优先级、启用状态 | 是 | 新快照生效；见 §6.3 状态保留规则 |
 | 规则（`rules.db`） | 是 | 重新读库并编译 `RuleSet` |
 | `[rules] enabled` | 是 | 由 `true` 改 `false` 时立即换成空规则集 |
-| 超时、`switch_on_status`、阈值、熔断参数 | 是 | 随快照替换 |
+| 超时、`switch_on_status`、阈值 | 是 | 随快照替换；旧熔断参数自 0.3.3 起仅兼容读取，不再生效 |
 | `limits.*` 各项容量 | 是 | LRU 容量变更时按新容量裁剪 |
-| 日志保留策略 | 是 | 下次清理任务生效 |
+| 日志保留策略、`routing.sticky_ttl` | 是 | 同步更新存储清理策略，下次清理任务生效 |
+| `database.state_path`、`database.logs_path`、`database.write_queue_size` | **否** | reload 拒绝变更并保留旧快照；需重启 |
+| `database.flush_interval_ms`、`database.flush_batch_size` | 是 | 后续写入轮次生效 |
 | `listen.*`、`webui.*` | **否** | 需重启；Web 界面标注「需重启生效」 |
 
 ### 6.3 重载时的运行时状态保留
@@ -734,8 +742,42 @@ load(path, cli_overrides) -> ConfigSnapshot
 | 重载期间持续请求 | 无请求读到半更新配置 | CC-05 |
 | `asdict()` 序列化上级代理 | 不含 `password` 明文 | — |
 
+## 0.3.3：全局熔断移除修订
+
+> ⚠️ 已过时：本文早期关于全局熔断、冷却、半开探针和相关界面的描述自0.3.3起由本节取代，其余有效内容保留。
+
+移除全局健康状态对路由的过滤，保留目标/出口负面记忆、失败切换与统计。旧配置/API/数据库字段仅兼容，不能重新开启功能。完整接口兼容、验收及实施计划见[移除设计](REMOVE_GLOBAL_CIRCUIT.md)。
+
 ## Linux 与 Windows 11 兼容（2026-11-10）
 
 Windows 下资源上限检测不依赖 resource 模块；无法获取 RLIMIT_NOFILE 时跳过相应告警。配置写入在两平台均使用 UTF-8 二进制临时文件、flush/fsync 与 os.replace。Linux 保留 fchmod(0600) 与父目录 fsync；Windows 跳过 Unix 专用调用，文件访问权限继承父目录 NTFS ACL，部署者须限制配置和备份目录仅服务账户与管理员可访问。Windows 不承诺 POSIX 父目录 fsync 的断电持久性。
 
-Linux 继续使用 asyncio 信号处理及 SIGHUP 重载；Windows 使用标准 SIGINT/SIGTERM 回调通过 call_soon_threadsafe 请求优雅停止，退出时恢复原处理器。Windows 热重载使用 WebUI/API；强制结束进程不保证优雅排空。
+Linux 继续使用 asyncio 信号处理及 SIGHUP 重载；Windows 使用标准 SIGINT/SIGTERM/SIGBREAK 回调通过 call_soon_threadsafe 请求优雅停止，退出时恢复原处理器。Windows 热重载使用 WebUI/API；强制结束进程不保证优雅排空。
+
+## 2026-11-11 热重载存储一致性修订
+
+0.3.4 将重启字段检查扩展到 Web 候选配置校验。配置保存和备份恢复在创建备份及写入前返回 E_STORAGE_RESTART，实际存储切换仍保留防御校验。
+
+日志保留天数、行数上限与 `routing.sticky_ttl` 必须同时传递到 StorageService 和 Retention，下次清理使用新策略。StorageService.reconfigure 更新配置、limits、StickyExpiryPolicy 与写者的批量参数；Retention 的锁串行化策略替换与整个清理轮次。重载通过 `asyncio.to_thread` 等待该锁，避免阻塞代理事件循环。清理已经开始时允许其按旧策略完成；reload 返回后不得再开始使用旧策略的轮次。
+
+`database.state_path`、`database.logs_path`、`database.write_queue_size` 绑定已打开的连接池、写者与队列，变更时拒绝整个 reload，保留原快照并返回包含字段名的需重启错误。`rules_path` 保持已有规则库热切换契约。批量大小和刷新间隔在后续写入轮次读取新配置；当前 drain 可按旧时间窗完成。
+
+兼容读取旧熔断配置，但 Web 提交 `circuit_breaker_enabled=true` 返回 400，不能把已移除的机制写成启用。其余历史参数仍可兼容写入且不参与路由。参见 [存储设计](DD_STORAGE.md)、[Web 设计](DD_WEB.md)。
+
+## 0.3.4 跨平台配置解析与写入
+
+`database.state_path`、`database.logs_path` 和 `database.rules_path` 的相对值以传入的配置文件路径所在目录为基准，包括 Web 的 `load_text` 预校验。先展开 `~`，保留绝对路径。Windows 带盘符但不完整的路径须改成完整绝对路径或普通相对路径。CLI 的显式 `--config` 优先于 `R_PROXY_CONFIG`。Linux/macOS 默认 `~/.config/r-proxy/config.toml`。Windows 默认 `%APPDATA%/r-proxy/config.toml`，旧位置存在而新位置不存在时继续使用旧文件。APPDATA 缺失或无效时使用旧位置。
+
+Windows 继续以二进制写入临时文件并 flush/fsync。原子替换遇到 Windows 共享冲突、锁冲突或拒绝访问时，有限退避后重试同一次替换，耗尽后返回原错误并清理临时文件。Linux/macOS 的原子替换与父目录同步契约继续适用。
+
+`config_version` 按原始字节哈希。Git autocrlf 等换行转换可能改变逻辑等价配置的版本。编辑时使用当前服务返回的版本。
+
+### 相对库路径升级保护
+
+对相对数据库路径，加载器只读检查当前 CWD 下按旧口径定位的普通文件。具有 `schema_meta` 和对应业务表的文件才作为旧库候选。若旧库有效而新位置缺失、是空文件或缺少对应表，启动与 `--check` 返回 `E_LEGACY_DB_PATH`，一次列出全部命中的字段和新旧路径。Web 候选配置保留同一错误码，先于备份与写盘拒绝。显式禁用规则时跳过规则库的旧路径检查。
+
+两处均为有效库且指向不同文件时记录 `W_LEGACY_DB_PATH`，继续使用配置目录中的库。同一个文件的别名不告警。检查只在配置加载时执行，服务的异步启动与重载在线程中完成。绝对路径及新部署相对路径继续支持。旧 CWD 与当前 CWD 不同时，程序无法推断旧库位置，升级前仍须核对实际旧库。
+
+离线规则审计复用相对路径解析及显式容器映射，跳过 CWD 旧库检测。盘点实际旧库时提供指向其绝对路径的配置副本。
+
+无法展开用户目录或确定默认配置位置时返回配置错误。POSIX 下拒绝 Windows 盘符路径，避免创建含盘符和反斜杠的意外文件。CLI 在所有平台使用 UTF-8 标准输出和错误流，兼容 C locale。

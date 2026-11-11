@@ -111,6 +111,8 @@ class AttemptExecutor:
         ``request_id`` 缺省时不记请求日志：这些行的全部价值在于能按请求归组
         成切换链，没有请求身份的调用方（测试）写下去也无从对应。
         """
+        if decision.relaxed:
+            logger.debug("relaxed_route request_id=%s：候选链忽略目标级负面记忆", request_id)
         attempts = 0
         last_outcome: AttemptOutcome | None = None
         last_verdict: SwitchVerdict | None = None
@@ -119,8 +121,6 @@ class AttemptExecutor:
             upstream = snapshot.upstream(name)
             if upstream is None:
                 # 候选链构造后配置被热重载删掉了这个出口。
-                continue
-            if not self._admit(name, decision):
                 continue
 
             tries = 0
@@ -280,7 +280,7 @@ class AttemptExecutor:
     ) -> None:
         """数据传输真正结束时调用一次（协议层：CONNECT 隧道关闭 / HTTP 响应体转发完）。
 
-        与熔断、粘性无关，只做两件事（DD_ROUTING §4.8、DD_STORAGE §4.3b）：
+        与粘性无关，只做两件事（DD_ROUTING §4.8、DD_STORAGE §4.3b）：
         出口维度的内存累计（供出口健康看板）、`traffic_log` 落一行（供主机
         流量榜）。跳过 Web UI 自身的轮询流量，理由与 `_log_attempt` 一致
         （DD_STORAGE §4.9）——否则仪表盘轮询会把这两份流量统计都搅乱。
@@ -319,7 +319,7 @@ class AttemptExecutor:
         """一次尝试一行。``verdict is None`` 表示这次尝试成功，无需判据。
 
         归类取 ``verdict.failure_kind`` 而非 ``outcome.kind``：前者是判据链的
-        结论，也是真正被用来记熔断与负面记忆的那一个。记另一个会让日志与系统
+        结论，也是真正被用来记录健康统计与负面记忆的那一个。记另一个会让日志与系统
         的实际行为对不上——而对不上的时候，用户信的是日志。
         """
         if self._sink is None or request_id is None or _is_webui_traffic(target, snapshot):
@@ -391,18 +391,6 @@ class AttemptExecutor:
             bytes_down=bytes_down,
             now_unix=int(self._unix_clock()),
         )
-
-    def _admit(self, name: str, decision: Decision) -> bool:
-        """尝试前重新检查健康，不在请求开始时固化（PRD §4.9.4）。
-
-        规则强制路由跳过这道闸门：熔断是自动路由避开坏出口的机制，而规则
-        表达的是用户的明确意图，因熔断拒绝执行会让用户认为规则失效了。
-        """
-        if not decision.switchable:
-            return True
-        if not decision.relaxed and not self._state.health.is_available(name, now=self._clock()):
-            return False
-        return self._state.health.acquire_probe(name, allow_open=decision.relaxed)
 
     def _record_success(
         self,

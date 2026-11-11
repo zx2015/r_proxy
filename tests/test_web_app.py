@@ -49,6 +49,7 @@ async def running(tmp_path: Path, *, token: str | None = None) -> Application:
 
 def client_for(web: FastAPI) -> httpx.AsyncClient:
     return httpx.AsyncClient(
+        trust_env=False,
         transport=httpx.ASGITransport(app=web, client=("127.0.0.1", 12345)),
         base_url="http://webui.test",
     )
@@ -367,7 +368,9 @@ class TestErrorEnvelope:
             raise RuntimeError("内部细节：/etc/r-proxy/config.toml 打不开")
 
         transport = httpx.ASGITransport(app=web, raise_app_exceptions=False)
-        async with httpx.AsyncClient(transport=transport, base_url="http://webui.test") as client:
+        async with httpx.AsyncClient(
+            trust_env=False, transport=transport, base_url="http://webui.test"
+        ) as client:
             response = await client.get("/api/boom")
         await app.stop()
 

@@ -201,7 +201,9 @@ class TestServedOverRealPort:
         host, port = runner.bound_address
         proxy_port = app.proxy_address[1]
         try:
-            async with httpx.AsyncClient(base_url=f"http://{host}:{port}") as client:
+            async with httpx.AsyncClient(
+                trust_env=False, base_url=f"http://{host}:{port}"
+            ) as client:
                 anonymous = await client.get("/api/status")
                 authorized = await client.get(
                     "/api/status", headers={"Authorization": f"Bearer {TOKEN}"}
@@ -225,7 +227,9 @@ class TestServedOverRealPort:
         await runner.wait_started()
         host, port = runner.bound_address
         try:
-            async with httpx.AsyncClient(base_url=f"http://{host}:{port}") as client:
+            async with httpx.AsyncClient(
+                trust_env=False, base_url=f"http://{host}:{port}"
+            ) as client:
                 codes = [
                     (await client.get("/api/status", headers={"X-Auth-Token": "wrong"})).status_code
                     for _ in range(11)
@@ -249,7 +253,7 @@ class TestServedOverRealPort:
         host, port = runner.bound_address
         try:
             async with httpx.AsyncClient(
-                base_url=f"http://{host}:{port}", headers={"X-Auth-Token": TOKEN}
+                trust_env=False, base_url=f"http://{host}:{port}", headers={"X-Auth-Token": TOKEN}
             ) as client:
                 oversized = await client.get("/api/logs?page_size=100000")
                 deep = await client.get("/api/logs?page=999999999")
@@ -300,6 +304,7 @@ class TestServedOverRealPort:
         host, port = runner.bound_address
         try:
             async with httpx.AsyncClient(
+                trust_env=False,
                 base_url=f"http://{host}:{port}",
                 headers={"X-Auth-Token": TOKEN},
                 timeout=30.0,
@@ -338,7 +343,7 @@ class TestServedOverRealPort:
         host, port = runner.bound_address
         try:
             async with httpx.AsyncClient(
-                base_url=f"http://{host}:{port}", headers={"X-Auth-Token": TOKEN}
+                trust_env=False, base_url=f"http://{host}:{port}", headers={"X-Auth-Token": TOKEN}
             ) as client:
                 response = await client.get("/api/upstreams")
         finally:

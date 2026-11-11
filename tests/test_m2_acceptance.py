@@ -390,10 +390,10 @@ class TestM2Acceptance:
         finally:
             await app.stop()
 
-    async def test_m2_11_upstream_opens_after_repeated_tcp_failures(
+    async def test_m2_11_upstream_stays_available_after_repeated_tcp_failures(
         self, tmp_path: Path, closed_port: int
     ) -> None:
-        """M2-11：上级代理连续 5 次 TCP 失败即熔断。"""
+        """0.3.3：上级代理连续失败只统计，不全局剔除。"""
         good = await start_server(responder(b"HTTP/1.1 200 OK"))
         app = await running_app(
             tmp_path,
@@ -405,7 +405,7 @@ class TestM2Acceptance:
         try:
             for i in range(5):
                 await get(app, f"h{i}.test")
-            assert app.state.health.is_available("dead", now=_now(app)) is False
+            assert app.state.health.is_available("dead", now=_now(app)) is True
         finally:
             await app.stop()
 
@@ -424,10 +424,10 @@ class TestM2Acceptance:
         finally:
             await app.stop()
 
-    async def test_m2_13_half_open_admits_a_single_probe(
+    async def test_m2_13_concurrent_requests_are_not_limited_by_old_probe_slots(
         self, tmp_path: Path, closed_port: int
     ) -> None:
-        """M2-13：``half_open`` 期间 10 个并发请求只有 1 个探测该出口。"""
+        """0.3.3：旧阈值与冷却配置不限制10个不同目标的并发尝试。"""
         good = await start_server(responder(b"HTTP/1.1 200 OK"))
         app = await running_app(
             tmp_path,
@@ -444,7 +444,7 @@ class TestM2Acceptance:
 
             await asyncio.gather(*(get(app, f"c{i}.test") for i in range(10)))
             attempts = app.state.health.snapshot_of("dead").total_failure - before
-            assert attempts <= 2
+            assert attempts == 10
         finally:
             await app.stop()
 

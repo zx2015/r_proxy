@@ -36,6 +36,7 @@ import os
 import re
 import time
 from collections.abc import Iterable, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -436,8 +437,16 @@ class ConfigWriter:
             candidate = load_text(text, self.path, self._app.cli_overrides)
         except ConfigError as exc:
             raise ConfigInvalid(
-                [ValidationIssue("error", "E_PARSE", _strip_path(str(exc), self.path))]
+                [ValidationIssue("error", exc.code, _strip_path(str(exc), self.path))]
             ) from exc
+        changed = self._app.storage.restart_required_fields(candidate.database)
+        if changed:
+            raise ConfigInvalid(
+                [
+                    ValidationIssue("error", "E_STORAGE_RESTART", f"{field} 变更需要重启", field)
+                    for field in changed
+                ]
+            )
         try:
             rows = self._app.rules_store.read_rules()
         except StorageError as exc:
@@ -545,7 +554,20 @@ class ConfigWriter:
             handle.write(text.encode("utf-8"))
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp, path)
+        try:
+            for delay in (0.02, 0.05, 0.10, None):
+                try:
+                    os.replace(tmp, path)
+                    break
+                except PermissionError as exc:
+                    winerror = getattr(exc, "winerror", None)
+                    if os.name != "nt" or delay is None or winerror not in {5, 32, 33}:
+                        raise
+                    time.sleep(delay)
+        except OSError:
+            with suppress(OSError):
+                tmp.unlink(missing_ok=True)
+            raise
         # 对父目录 fsync 容易被漏掉：`os.replace` 保证了替换的原子性，但目录项
         # 本身的落盘要单独同步，否则断电后可能「新内容已写入而目录仍指向旧
         # inode」。

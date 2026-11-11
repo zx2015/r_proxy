@@ -370,18 +370,26 @@ class TestSwitchVerdictControlsTheLoop:
 
 
 class TestRuleForcedRouting:
-    async def test_relaxed_admission_bypasses_open_circuit_but_reserves_one_probe(
-        self, clock: Clock
+    async def test_relaxed_decisions_do_not_reserve_a_probe(
+        self, clock: Clock, caplog: pytest.LogCaptureFixture
     ) -> None:
+        caplog.set_level("DEBUG", logger="r_proxy.egress.executor")
         snap = make_snapshot(upstream("a"), routing=ROUTING)
         state = RuntimeState.from_snapshot(snap)
-        for i in range(2):
+        for i in range(50):
             state.health.record_result("a", ok=False, kind=FailureKind.UPSTREAM_ERROR, now=float(i))
-        executor = build(clock, state)
-        decision = Decision(chain=("a",), source="priority", relaxed=True)
-        clock.now = 1.0
-        assert executor._admit("a", decision) is True
-        assert executor._admit("a", decision) is False
+        for _ in range(2):
+            fake = FakeAttempts({"a": [ok_result("a")]})
+            result = await build(clock, state).execute(
+                target(),
+                Decision(chain=("a",), source="priority", relaxed=True),
+                snap,
+                attempt=fake.attempt,
+                discard=fake.discard,
+            )
+            assert fake.tried == ["a"]
+            assert result.delivered is not None
+        assert "relaxed_route" in caplog.text
 
     async def test_unswitchable_decision_never_advances(self, clock: Clock) -> None:
         """规则强制路由失败不切换，原样返回错误。"""
@@ -406,7 +414,7 @@ class TestRuleForcedRouting:
         state = RuntimeState.from_snapshot(snap)
         for i in range(2):
             state.health.record_result("a", ok=False, kind=FailureKind.UPSTREAM_ERROR, now=float(i))
-        assert state.health.is_available("a", now=1.0) is False
+        assert state.health.is_available("a", now=1.0) is True
         fake = FakeAttempts({"a": [ok_result("a")]})
 
         clock.now = 1.0
@@ -422,16 +430,13 @@ class TestRuleForcedRouting:
         assert result.delivered is not None
 
 
-class TestHealthGates:
-    async def test_upstream_that_opened_mid_flight_is_skipped(self, clock: Clock) -> None:
-        """PRD §4.9.4：候选链每次尝试前重新检查健康，不在请求开始时固化。"""
+class TestHealthStatisticsDoNotGateAttempts:
+    async def test_failures_on_an_exit_do_not_prevent_switching_to_it(self, clock: Clock) -> None:
         snap = make_snapshot(upstream("a"), upstream("b"), routing=ROUTING)
         state = RuntimeState.from_snapshot(snap)
-        for i in range(2):
+        for i in range(50):
             state.health.record_result("b", ok=False, kind=FailureKind.UPSTREAM_ERROR, now=float(i))
         fake = FakeAttempts({"a": [transport_failure("a")], "b": [ok_result("b")]})
-
-        clock.now = 1.0
         result = await build(clock, state).execute(
             target(),
             Decision(chain=("a", "b"), source="priority"),
@@ -439,51 +444,10 @@ class TestHealthGates:
             attempt=fake.attempt,
             discard=fake.discard,
         )
-
-        assert fake.tried == ["a"]
-        assert result.delivered is None
-
-    async def test_skipping_is_not_a_failed_attempt(self, clock: Clock) -> None:
-        """跳过与终止的区别：跳过不算尝试，也不写任何失败记录。"""
-        snap = make_snapshot(upstream("a"), upstream("b"), routing=ROUTING)
-        state = RuntimeState.from_snapshot(snap)
-        for i in range(2):
-            state.health.record_result("a", ok=False, kind=FailureKind.UPSTREAM_ERROR, now=float(i))
-        before = state.health.snapshot_of("a").total_failure
-        fake = FakeAttempts({"b": [ok_result("b")]})
-
-        clock.now = 1.0
-        result = await build(clock, state).execute(
-            target(),
-            Decision(chain=("a", "b"), source="priority"),
-            snap,
-            attempt=fake.attempt,
-            discard=fake.discard,
-        )
-
-        assert result.attempts == 1
-        assert state.health.snapshot_of("a").total_failure == before
-
-    async def test_half_open_probe_slot_is_acquired_before_attempting(self, clock: Clock) -> None:
-        snap = make_snapshot(upstream("a"), routing=ROUTING)
-        state = RuntimeState.from_snapshot(snap)
-        for i in range(2):
-            state.health.record_result("a", ok=False, kind=FailureKind.UPSTREAM_ERROR, now=float(i))
-        clock.now = 100.0
-        assert state.health.state_of("a", now=100.0) is HealthState.HALF_OPEN
-        state.health.acquire_probe("a")  # 另一个请求已占用名额
-        fake = FakeAttempts({"a": [ok_result("a")]})
-
-        result = await build(clock, state).execute(
-            target(),
-            Decision(chain=("a",), source="priority"),
-            snap,
-            attempt=fake.attempt,
-            discard=fake.discard,
-        )
-
-        assert fake.tried == []
-        assert result.delivered is None
+        assert fake.tried == ["a", "b"]
+        assert result.delivered is not None
+        assert state.health.snapshot_of("b").total_failure == 50
+        assert state.health.snapshot_of("b").total_success == 1
 
 
 class TestStateRecording:
@@ -535,8 +499,8 @@ class TestStateRecording:
             )
         assert state.health.state_of("a", now=0.0) is HealthState.CLOSED
 
-    async def test_upstream_error_counts_toward_the_breaker(self, clock: Clock) -> None:
-        """M2-11：上级代理连续失败达阈值即熔断。"""
+    async def test_upstream_error_counts_without_excluding_the_exit(self, clock: Clock) -> None:
+        """0.3.3：上级代理连续失败仍保持可选。"""
         snap = make_snapshot(upstream("a"), upstream("b"), routing=ROUTING)
         state = RuntimeState.from_snapshot(snap)
         for _ in range(2):
@@ -553,7 +517,7 @@ class TestStateRecording:
                 attempt=fake.attempt,
                 discard=fake.discard,
             )
-        assert state.health.state_of("a", now=0.0) is HealthState.OPEN
+        assert state.health.state_of("a", now=0.0) is HealthState.CLOSED
 
     async def test_upstream_error_does_not_write_negative_memory(self, clock: Clock) -> None:
         """出口整体不可用与「经该出口到不了此目标」是两件事。"""
@@ -1277,7 +1241,7 @@ class TestNoteTraffic:
         state = RuntimeState.from_snapshot(snap)
         for _ in range(5):
             state.health.record_result("a", ok=False, kind=FailureKind.UPSTREAM_ERROR, now=0.0)
-        assert state.health.state_of("a", now=0.0) is HealthState.OPEN
+        assert state.health.state_of("a", now=0.0) is HealthState.CLOSED
 
         build(clock, state).note_traffic(
             target(host="example.com"), "a", snap, bytes_up=10, bytes_down=20, request_id="r1"

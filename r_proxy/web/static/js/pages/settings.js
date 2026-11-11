@@ -54,6 +54,7 @@ const AUDIT_ACTIONS = [
   "clear_sticky",
   "clear_sticky_batch",
   "clear_route_block",
+  "reset_health",
   "circuit.reset",
 ];
 
@@ -169,8 +170,6 @@ function renderForm(settings) {
     ["tunnel_probe_window", "隧道早夭窗口（秒）", { type: "number", step: "0.1", min: 0.1, max: 300 }, r.tunnel_probe_window],
     ["max_switches_per_host", "每 host 最大切换次数", { type: "number", min: 1, max: 1000 }, r.status_switch_rate_limit.max_switches_per_host],
     ["window_seconds", "切换限流窗口（秒）", { type: "number", min: 1, max: 3600 }, r.status_switch_rate_limit.window_seconds],
-    ["circuit_breaker_fail_threshold", "熔断失败阈值", { type: "number", min: 1, max: 1000 }, r.circuit_breaker.fail_threshold],
-    ["circuit_breaker_cooldown_seconds", "熔断冷却（秒）", { type: "number", min: 1, max: 86400 }, r.circuit_breaker.cooldown_seconds],
     ["retention_days", "日志保留天数", { type: "number", min: 1, max: 3650 }, d.retention_days],
     ["max_log_rows", "日志最大行数", { type: "number", min: 1000, max: 100000000 }, d.max_log_rows],
     ["backup_keep", "配置备份保留份数", { type: "number", min: 1, max: 100 }, d.backup_keep],
@@ -181,12 +180,6 @@ function renderForm(settings) {
     fields[name] = input(`set-${name}`, { ...attrs, value });
     grid.appendChild(name === "sticky_ttl" ? stickyTtlField(label, fields[name]) : field(label, fields[name], hint));
   }
-  fields.circuit_breaker_enabled = input("set-circuit_breaker_enabled", {
-    type: "checkbox",
-    checked: r.circuit_breaker.enabled,
-  });
-  grid.appendChild(field("启用熔断", fields.circuit_breaker_enabled, "只统计 upstream_error"));
-
   const form = clear(nodes.form);
   form.appendChild(grid);
   form.appendChild(

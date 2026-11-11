@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -39,8 +40,8 @@ class WebRunner:
     @property
     def bound_address(self) -> tuple[str, int]:
         for server in self._server.servers:
-            for socket in server.sockets:
-                host, port = socket.getsockname()[:2]
+            for listener in server.sockets:
+                host, port = listener.getsockname()[:2]
                 return str(host), int(port)
         raise RuntimeError("Web 界面尚未绑定端口")
 
@@ -96,7 +97,15 @@ async def start(application: Application) -> WebRunner:
         lifespan="off",  # 启停由 Application 统一编排
     )
     server = uvicorn.Server(config)
-    task = asyncio.create_task(server.serve(), name="webui")
+    # 先绑定，避免 uvicorn 把绑定错误转为 SystemExit，绕过应用启动诊断。
+    addresses = await asyncio.get_running_loop().getaddrinfo(
+        cfg.host, cfg.port, family=socket.AF_INET, type=socket.SOCK_STREAM
+    )
+    if not addresses:
+        raise OSError("未找到 Web 的 IPv4 监听地址")
+    listener = socket.create_server(addresses[0][4])
+    task = asyncio.create_task(server.serve(sockets=[listener]), name="webui")
+    task.add_done_callback(lambda _: listener.close())
     task.add_done_callback(_on_exit)
     return WebRunner(server, task)
 

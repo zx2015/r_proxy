@@ -245,16 +245,26 @@ def open_write(path: Path, database: Database) -> sqlite3.Connection:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(path, isolation_level=None)
-        if fresh:
-            # auto_vacuum 必须在建库时设置，对已有数据库无效。
-            conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
-        conn.execute("PRAGMA journal_mode=WAL")
-        # WAL 下 NORMAL 足够安全（崩溃不损坏，最多丢最后几个事务），
-        # 比 FULL 快一个数量级。
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("PRAGMA foreign_keys=ON")
-        migrate(conn, database)
+        try:
+            if fresh:
+                # auto_vacuum 必须在建库时设置，对已有数据库无效。
+                conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+            hint = f"{path.name} 无法启用 WAL，请检查本地文件系统及目录写权限"
+            try:
+                mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+            except sqlite3.Error as exc:
+                raise StorageError(f"{hint}: {exc}") from exc
+            if mode is None or mode[0].lower() != "wal":
+                raise StorageError(hint)
+            # WAL 下 NORMAL 足够安全（崩溃不损坏，最多丢最后几个事务），
+            # 比 FULL 快一个数量级。
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA foreign_keys=ON")
+            migrate(conn, database)
+        except BaseException:
+            conn.close()
+            raise
     except (sqlite3.Error, OSError) as exc:
         # 目录建不出来与库打不开是同一类故障：数据目录配错了。
         raise StorageError(f"打开数据库失败 {path.name}: {exc}") from exc

@@ -2,6 +2,7 @@
 
 | 版本 | 日期 | 变更说明 | 作者 |
 | :--- | :--- | :--- | :--- |
+| v0.3.3-review | 2026-11-11 | 标注全局熔断描述已过时 | Agent |
 | v1.0.0 | 2026-10-12 | 初始版本：SOCKS5 上游支持需求定义、协议规范、路由与故障切换契约、WebUI 交互规范 | Agent |
 
 ## 1. 背景与愿景
@@ -227,3 +228,5 @@ flowchart TD
 - [Web 管理界面规范 (WEBUI_SPEC.md)](./WEBUI_SPEC.md)
 - [SOCKS5 详细设计文档 (DD_SOCKS5.md)](../design/DD_SOCKS5.md)
 - [出口连接器设计 (DD_PROXY.md)](../design/DD_PROXY.md)
+
+> ⚠️ 全局熔断及半开探针相关描述已被 0.3.3 取代；保留目标/出口负面记忆，健康统计不阻断路由。见 [移除设计](../design/REMOVE_GLOBAL_CIRCUIT.md)。

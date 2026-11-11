@@ -133,7 +133,7 @@ class SwitchPolicy:
                     failure_kind=FailureKind.NOT_A_FAILURE,
                 )
 
-        # 407 是出口自身的凭据问题，计入全局熔断；其余状态码只怪这条路由。
+        # 407 是出口自身的凭据问题，记录出口级失败统计；其余状态码只怪这条路由。
         kind = FailureKind.UPSTREAM_ERROR if status == 407 else FailureKind.ROUTE_ERROR
 
         # 判据三：幂等性、可重放性、频率。归类与是否切换正交——以下每条

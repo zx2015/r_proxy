@@ -142,3 +142,29 @@ def test_legacy_analyzer_never_claims_exclusive_readiness(
     assert not report.ready
     assert not report.analysis_complete
     assert any(issue.code == "E_RULE_CHECK_INCOMPLETE" for issue in report.issues)
+
+
+def test_audit_resolves_relative_rules_path_from_config_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    config, database = fixture_config(config_dir, [(0, "a.test", "direct")])
+    config.write_text(f'[database]\nrules_path = "{database.name}"\n', encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    assert audit_config(config).rule_count == 1
+
+
+def test_audit_missing_database_does_not_infer_service_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conf = tmp_path / "conf"
+    conf.mkdir()
+    _, unrelated = fixture_config(tmp_path, [(0, "a.test", "direct")])
+    config = conf / "config.toml"
+    config.write_text(f'[database]\nrules_path = "{unrelated.name}"\n', encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(AuditError, match="规则数据库不存在") as exc:
+        audit_config(config)
+    assert str(conf / unrelated.name) in str(exc.value)
+    assert "E_LEGACY_DB_PATH" not in str(exc.value)
